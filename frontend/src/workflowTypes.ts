@@ -1,0 +1,11 @@
+import type { Case, Completeness } from './types';
+import type { PlatformPlan, PlatformStage, StageAccess } from './platformTypes';
+
+export interface SyncRun { id: string; state: string; started_at: string; finished_at: string | null; total: number; created_count: number; updated_count: number; error: string | null }
+export interface SyncStatus { latest: SyncRun | null; last_complete: SyncRun | null; lists: { run_id: string; read_at: string; counts: Record<string, number> } | null }
+export interface OnlinePhotoCount { state: 'known' | 'unread' | 'unlinked' | 'unsupported' | 'partial'; count: number | null; videos: number; other: number; unknown: number; note: string }
+export interface BoardCase extends Case { report_date: string | null; stage_label: string; form_stage: PlatformStage; action_label: string; photo_counts: Record<string, number>; shared_checkin_count?: number; work_visit_count?: number; online_photos: { read_at: string | null; groups: Record<string, OnlinePhotoCount> }; exception_count: number; platform_status: string; platform_missing: number; insurer_missing: number; insurer_status: string; next_action: string }
+export interface BoardData { items: BoardCase[]; total: number; source: 'platform' | 'local' | 'workflow'; source_total: number; page: number; page_size: number; counts: Record<string, number>; photo_groups: Record<string, string>; sync: SyncStatus }
+export interface CaseEvent { id: string; kind: string; from_stage: string | null; to_stage: string; source: string; event_at: string; created_at: string; detail: { note?: string } }
+export interface CaseDetailData { case: Case; events: CaseEvent[]; stage_label: string; form_stage: PlatformStage; stage_access: Record<PlatformStage, StageAccess>; watermark: { text: string; contents: string[] }; insurer: Completeness; reviews: { id: string; stage: string; state: string; created_at: string; confirmed_at: string | null; finished_at: string | null }[] }
+export interface ReviewBatch { id: string; case_id: string; stage: PlatformStage; state: string; fingerprint: string; snapshot: PlatformPlan; result: { error?: string; mismatches?: string[]; action?: 'save' | 'submit'; phase?: string; uploaded?: Record<string, unknown>; file_total?: number; current_file?: string }; write_enabled: boolean; connected: boolean; active: boolean; access: StageAccess; created_at: string }

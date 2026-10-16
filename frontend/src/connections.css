@@ -1,0 +1,14 @@
+.feishu-connector-form input:not([type=checkbox]),
+.feishu-connector-form select,
+.feishu-connector-form button,
+.modal:has(.feishu-connector-form) .modal-foot button,
+.modal:has(.feishu-connector-form) .modal-head button { min-height:44px; }
+.modal:has(.feishu-connector-form) .modal-head button { min-width:44px; }
+.feishu-connector-form .check { min-height:44px; align-items:center; }
+.status-listening { color:#267044; background:#e7f4ec; }
+.status-starting,.status-reconnecting { color:#8a5a13; background:#fff3dc; }
+.receipt-content { display:flex; align-items:center; gap:12px; min-width:200px; max-width:380px; }
+.receipt-content > div { min-width:0; overflow-wrap:anywhere; }
+.receipt-table .receipt-preview { width:64px; height:80px; flex:0 0 64px; padding:3px; overflow:hidden; background:var(--soft); }
+.receipt-preview img { display:block; width:100%; height:100%; object-fit:contain; }
+.receipt-table .receipt-actions button { min-height:44px; white-space:nowrap; }

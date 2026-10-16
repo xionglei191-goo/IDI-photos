@@ -1,0 +1,76 @@
+{
+  "verified_at": "2026-10-15",
+  "source": "https://gzzb2021.com/iidi/insurance/sysUcenterDict/list",
+  "items": {
+    "part_engineering": [
+      {
+        "code": "part_engineering_01",
+        "name": "地基基础和主体结构"
+      },
+      {
+        "code": "part_engineering_02",
+        "name": "保温和防水工程"
+      },
+      {
+        "code": "part_engineering_03",
+        "name": "装饰装修工程"
+      },
+      {
+        "code": "part_engineering_04",
+        "name": "建筑给水排水工程"
+      },
+      {
+        "code": "part_engineering_05",
+        "name": "通风与空调工程"
+      },
+      {
+        "code": "part_engineering_06",
+        "name": "建筑电气工程"
+      },
+      {
+        "code": "part_engineering_07",
+        "name": "智能建筑工程"
+      },
+      {
+        "code": "part_engineering_08",
+        "name": "建筑节能工程"
+      },
+      {
+        "code": "part_engineering_09",
+        "name": "电梯工程"
+      }
+    ],
+    "defect_type": [
+      {
+        "code": "defect_type_01",
+        "name": "堵"
+      },
+      {
+        "code": "defect_type_02",
+        "name": "漏"
+      },
+      {
+        "code": "defect_type_03",
+        "name": "裂"
+      },
+      {
+        "code": "defect_type_04",
+        "name": "臭"
+      },
+      {
+        "code": "defect_type_other",
+        "name": "其他"
+      }
+    ],
+    "estimate_restoration_cost": [
+      {
+        "code": "estimate_restoration_cost_01",
+        "name": "3万以下"
+      },
+      {
+        "code": "estimate_restoration_cost_02",
+        "name": "3万及以上"
+      }
+    ]
+  }
+}
