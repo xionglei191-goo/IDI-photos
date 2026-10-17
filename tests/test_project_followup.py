@@ -12,6 +12,15 @@ from idi.db import dump, now
 from idi.domain import DomainError
 
 
+def review_with_ai(followup):
+    """Exercise the independent worker before projecting its completed results."""
+    result = followup.review()
+    completed = False
+    while followup.photo_ai.run_one():
+        completed = True
+    return followup.review() if completed else result
+
+
 class FakeFeedback:
     def __init__(self):
         self.people = [{'open_id': 'ou_lead', 'name': '项目负责人'}]
@@ -76,7 +85,7 @@ def test_progress_comes_from_cases_not_finished_photo(services, followup, case, 
     stage(services, case, 'repair')
     picture = photo(stage='acceptance', role='finished')
     before = services['db'].one('SELECT * FROM cases WHERE id=?', (case['id'],))
-    followup.review()
+    review_with_ai(followup)
     summary = followup.summary()['projects'][0]
     assert summary['stages'] == {'repair': 1}
     assert summary['photos']['ai_checked'] == 0
@@ -86,17 +95,17 @@ def test_progress_comes_from_cases_not_finished_photo(services, followup, case, 
 
 def test_missing_photos_are_limited_to_current_stage_and_local_scope(services, followup, case):
     stage(services, case, 'survey')
-    followup.review()
+    review_with_ai(followup)
     missing = [i for i in followup.issues() if i['state'] == 'open' and i['kind'] == 'missing']
     assert missing
     assert all(i['evidence']['requirement']['stage'] == 'survey' for i in missing)
     assert all('官网或其他渠道' in i['detail'] for i in missing)
     stage(services, case, 'repair')
-    followup.review()
+    review_with_ai(followup)
     missing = [i for i in followup.issues() if i['state'] == 'open' and i['kind'] == 'missing']
     assert {i['evidence']['requirement']['stage'] for i in missing} == {'survey', 'work'}
     stage(services, case, 'closed')
-    followup.review()
+    review_with_ai(followup)
     assert not [i for i in followup.issues() if i['state'] == 'open']
 
 
@@ -105,7 +114,7 @@ def test_unassigned_photo_stays_in_archive_without_project_followup(services, fo
     raw = io.BytesIO()
     Image.new('RGB', (120, 80), 'black').save(raw, 'PNG')
     result = services['importer'].add_file(raw.getvalue(), '现场.png')
-    followup.review()
+    review_with_ai(followup)
     issues = followup.issues()
     assert not issues
     assessment = services['db'].one('SELECT * FROM photo_quality_reviews WHERE photo_id=?', (result['photo_id'],))
@@ -121,7 +130,7 @@ def test_bind_requires_real_member_and_historical_issues_do_not_auto_send(servic
     with pytest.raises(DomainError, match='成员名单'):
         followup.save_contact(project['id'], {'connector_id': channel[0]['id'], 'open_id': 'ou_unknown'})
     bind(followup, channel, project)
-    followup.review()  # First inspection after binding still must not notify old photos.
+    review_with_ai(followup)  # First inspection after binding still must not notify old photos.
     assert not followup.queue_feedback(project['id'], automatic=True)['queued']
     assert followup.preview_feedback(project['id'])['count'] == 0
     confirm_photo_issue(followup)
@@ -130,7 +139,7 @@ def test_bind_requires_real_member_and_historical_issues_do_not_auto_send(servic
 
 def test_feedback_routes_to_bound_account_and_is_idempotent(services, followup, channel, case, project, photo):
     photo()
-    followup.review()
+    review_with_ai(followup)
     bind(followup, channel, project)
     confirm_photo_issue(followup, detail='<at user_id="all">all</at> 主卧墙面起皮边缘无法辨认')
     preview = followup.preview_feedback(project['id'])
@@ -149,13 +158,13 @@ def test_feedback_routes_to_bound_account_and_is_idempotent(services, followup, 
 
 def test_dismissal_persists_and_stale_queued_message_is_cancelled(services, followup, channel, case, project, photo):
     photo()
-    followup.review()
+    review_with_ai(followup)
     bind(followup, channel, project)
     issue_id = confirm_photo_issue(followup)
     issue = next(i for i in followup.issues() if i['id'] == issue_id)
     delivery = followup.queue_feedback(project['id'])
     followup.dismiss(issue['id'], '核对原件后确认可用')
-    followup.review()
+    review_with_ai(followup)
     assert services['db'].one('SELECT state FROM followup_issues WHERE id=?', (issue['id'],))['state'] == 'dismissed'
     followup.deliver(delivery['id'])
     assert followup.feedback()[0]['state'] == 'cancelled'
@@ -163,7 +172,7 @@ def test_dismissal_persists_and_stale_queued_message_is_cancelled(services, foll
 
 
 def test_recipient_rechecked_before_send(services, followup, channel, case, project, photo):
-    photo(); followup.review(); bind(followup, channel, project)
+    photo(); review_with_ai(followup); bind(followup, channel, project)
     confirm_photo_issue(followup)
     delivery = followup.queue_feedback(project['id'])
     channel[1].people = []
@@ -173,7 +182,7 @@ def test_recipient_rechecked_before_send(services, followup, channel, case, proj
 
 
 def test_uncertain_delivery_needs_human_reconciliation(services, followup, channel, case, project, photo):
-    photo(); followup.review(); bind(followup, channel, project)
+    photo(); review_with_ai(followup); bind(followup, channel, project)
     confirm_photo_issue(followup)
     delivery = followup.queue_feedback(project['id'])
     channel[1].error = UncertainDelivery('模拟连接中断')
@@ -189,7 +198,7 @@ def test_uncertain_delivery_needs_human_reconciliation(services, followup, chann
 
 
 def test_restart_never_replays_a_send_in_progress(services, followup, channel, case, project, photo):
-    photo(); followup.review(); bind(followup, channel, project)
+    photo(); review_with_ai(followup); bind(followup, channel, project)
     confirm_photo_issue(followup)
     delivery = followup.queue_feedback(project['id'])
     with services['db'].tx() as con:
@@ -201,7 +210,7 @@ def test_restart_never_replays_a_send_in_progress(services, followup, channel, c
 
 def test_new_changes_wait_for_batch_and_obey_project_cooldown(services, followup, channel, case, project, photo):
     bind(followup, channel, project)
-    photo(); followup.review()
+    photo(); review_with_ai(followup)
     confirm_photo_issue(followup)
     past = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(timespec='milliseconds')
     older = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat(timespec='milliseconds')
@@ -238,9 +247,11 @@ def test_vision_schema_truncation_and_no_workflow_write(services, followup, phot
         assert 'tools' not in value
         return httpx.Response(200, json={'choices': [{'finish_reason': finish, 'message': {'content': json.dumps(payload)}}]})
     monkeypatch.setattr('idi.project_followup.httpx.Client', lambda **kw: original_client(transport=httpx.MockTransport(handle), **kw))
-    followup.review()
+    review_with_ai(followup)
     result = services['db'].one('SELECT * FROM photo_quality_reviews WHERE photo_id=?', (picture['id'],))
-    assert bool(result['error']) is not good
+    ai = services['db'].one('SELECT * FROM photo_ai_tasks WHERE photo_id=?', (picture['id'],))
+    assert (ai['state'] == 'completed') is good
+    assert result['error'] is None  # Local checks remain valid when AI fails.
     assert result['model'] == ('test-vision' if good else '')
     assert before == services['domain'].case(case['id'])
     if not good:
@@ -292,7 +303,7 @@ def test_routes_report_configuration_without_enabling_model_or_sending(client, s
 
 
 def test_feedback_preview_cannot_silently_change_recipient_or_issue_list(followup, channel, case, project, photo):
-    photo(); followup.review(); bind(followup, channel, project)
+    photo(); review_with_ai(followup); bind(followup, channel, project)
     issue_id = confirm_photo_issue(followup)
     preview = followup.preview_feedback(project['id'])
     followup.dismiss(issue_id, '已核对')
@@ -302,7 +313,7 @@ def test_feedback_preview_cannot_silently_change_recipient_or_issue_list(followu
 
 
 def test_source_change_before_send_requires_new_review(services, followup, channel, case, project, photo):
-    picture = photo(); followup.review(); bind(followup, channel, project)
+    picture = photo(); review_with_ai(followup); bind(followup, channel, project)
     confirm_photo_issue(followup)
     delivery = followup.queue_feedback(project['id'])
     with services['db'].tx() as con:
@@ -316,7 +327,7 @@ def test_source_change_before_send_requires_new_review(services, followup, chann
 def test_backup_restore_never_resumes_group_notifications(services, followup, channel, case, project, photo, tmp_path):
     from idi.cli import restore
     from idi.db import Database
-    photo(); followup.review(); bind(followup, channel, project)
+    photo(); review_with_ai(followup); bind(followup, channel, project)
     confirm_photo_issue(followup)
     followup.queue_feedback(project['id'])
     backup = services['reporter'].backup({'backup_id': 'followup-test'}, lambda *a: None)
@@ -336,7 +347,7 @@ def test_case_specific_requirements_take_precedence(services, followup, case):
         {'stage': 'survey', 'role': 'problem', 'minimum': 3, 'per_visit': False, 'part': '卫生间'}]})
     with services['db'].tx() as con:
         con.execute("UPDATE cases SET workflow_stage='survey',insurer_template_id=?,revision=revision+1 WHERE id=?", (template['id'], case['id']))
-    followup.review()
+    review_with_ai(followup)
     issues = followup.issues()
     assert len(issues) == 1
     assert issues[0]['evidence']['template_id'] == template['id']
@@ -344,7 +355,7 @@ def test_case_specific_requirements_take_precedence(services, followup, case):
 
 
 def test_cancelled_unsent_feedback_can_be_explicitly_regenerated(followup, channel, case, project, photo):
-    photo(); followup.review(); bind(followup, channel, project)
+    photo(); review_with_ai(followup); bind(followup, channel, project)
     confirm_photo_issue(followup)
     delivery = followup.queue_feedback(project['id'])
     bind(followup, channel, project, automatic=False)
@@ -360,9 +371,9 @@ def test_disabling_ai_does_not_claim_previous_model_issue_resolved(services, fol
     services['recognizer'].save_config({'vision_enabled': True, 'base_url': 'https://model.test/v1', 'model': 'vision'})
     followup.save_config({'ai_review': True})
     monkeypatch.setattr(followup, '_vision', lambda *args: [{'code': 'ai_subject', 'source': 'ai', 'title': '主体待核对', 'detail': '画面主体不完整', 'action': '补拍全景'}])
-    followup.review()
+    review_with_ai(followup)
     followup.save_config({'ai_review': False})
-    followup.review()
+    review_with_ai(followup)
     model_issue = next(i for i in followup.issues() if i['evidence']['source'] == 'ai')
     assert model_issue['state'] == 'open'
 
@@ -370,7 +381,7 @@ def test_disabling_ai_does_not_claim_previous_model_issue_resolved(services, fol
 def test_official_case_without_short_code_has_identity_and_never_sends_local_archive_gaps(services, followup, channel, case, project):
     with services['db'].tx() as con:
         con.execute("UPDATE cases SET short_code=NULL,report_number=NULL,platform_report_code='ZLBH209901010000000003',title='主卫柜门门铰损坏',building='',room='',location_detail='振业颐隽花园小区1/未划分/9F/901',workflow_stage='repair' WHERE id=?", (case['id'],))
-    followup.review(); bind(followup, channel, project)
+    review_with_ai(followup); bind(followup, channel, project)
     observations = followup.issues()
     assert observations and all(i['kind'] == 'missing' for i in observations)
     assert all(i['case_context']['code'] == 'ZLBH209901010000000003' and '901' in i['case_context']['location'] for i in observations)
@@ -386,7 +397,7 @@ def test_official_case_without_short_code_has_identity_and_never_sends_local_arc
 
 
 def test_image_metrics_are_not_automatically_treated_as_defects(services, followup, channel, case, project, photo):
-    bind(followup, channel, project); photo(color='black'); followup.review()
+    bind(followup, channel, project); photo(color='black'); review_with_ai(followup)
     older = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat(timespec='milliseconds')
     past = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(timespec='milliseconds')
     with services['db'].tx() as con:
@@ -407,7 +418,7 @@ def test_only_specific_ai_evidence_is_eligible(services, followup, channel, proj
     followup.save_config({'ai_review': True})
     monkeypatch.setattr(followup, '_vision', lambda *args: [{'code': 'ai_' + code, 'source': 'ai', 'certainty': certainty,
         'title': '墙面维修边缘被遮挡', 'detail': '画面右侧的柜体挡住了主卧墙面起皮边缘。', 'action': '请从柜体左侧拍摄墙面近照，完整露出起皮边缘。'}])
-    followup.review(); bind(followup, channel, project)
+    review_with_ai(followup); bind(followup, channel, project)
     preview = followup.preview_feedback(project['id'])
     assert preview['count'] == int(ready)
     if ready:
@@ -420,7 +431,7 @@ def test_feedback_groups_photo_problems_under_one_concrete_case(services, follow
         con.execute("UPDATE cases SET short_code=NULL,platform_report_code='ZLBH-TEST-901',title='主卫柜门门铰损坏',location_detail='1栋901' WHERE id=?", (case['id'],))
     first = photo(name='柜门近照.png')
     second = photo(name='柜门全景.png', color='black')
-    followup.review(); bind(followup, channel, project)
+    review_with_ai(followup); bind(followup, channel, project)
     confirm_photo_issue(followup, first['id'], title='门铰螺钉位置不清', detail='门铰与柜体连接处的螺钉在原图中无法辨认。', action='请重发柜门近照原图，保留螺钉位置细节。')
     confirm_photo_issue(followup, second['id'], title='柜门连接处过暗', detail='柜门内侧连接处处于阴影中，无法辨认连接状态。', action='请补光后拍摄柜门内侧门铰与柜体的连接处。')
     preview = followup.preview_feedback(project['id'])
@@ -432,25 +443,25 @@ def test_feedback_groups_photo_problems_under_one_concrete_case(services, follow
 
 
 def test_confirmation_is_invalidated_by_photo_or_case_changes(services, followup, channel, case, project, photo):
-    picture = photo(); followup.review(); bind(followup, channel, project)
+    picture = photo(); review_with_ai(followup); bind(followup, channel, project)
     issue_id = confirm_photo_issue(followup)
     assert followup.preview_feedback(project['id'])['count'] == 1
     old_issue = next(i for i in followup.issues() if i['id'] == issue_id)
     with services['db'].tx() as con:
         con.execute("UPDATE cases SET location_detail='另一位置',revision=revision+1 WHERE id=?", (case['id'],))
-    followup.review()
+    review_with_ai(followup)
     assert followup.preview_feedback(project['id'])['count'] == 0
     with pytest.raises(DomainError, match='重新打开原图'):
         followup.confirm_issue(issue_id, {'title': '门铰细节不清', 'detail': '连接处模糊', 'action': '补拍连接处', 'context_token': old_issue['feedback']['context_token']})
     confirm_photo_issue(followup)
     with services['db'].tx() as con:
         con.execute('UPDATE photos SET revision=revision+1 WHERE id=?', (picture['id'],))
-    followup.review()
+    review_with_ai(followup)
     assert followup.preview_feedback(project['id'])['count'] == 0
 
 
 def test_changed_human_action_cancels_queued_content_and_requires_new_preview(followup, channel, case, project, photo):
-    photo(); followup.review(); bind(followup, channel, project)
+    photo(); review_with_ai(followup); bind(followup, channel, project)
     confirm_photo_issue(followup)
     old_preview = followup.preview_feedback(project['id'])
     delivery = followup.queue_feedback(project['id'], preview_token=old_preview['preview_token'])
@@ -464,7 +475,7 @@ def test_changed_human_action_cancels_queued_content_and_requires_new_preview(fo
 
 
 def test_legacy_queued_feedback_is_not_delivered_after_upgrade(services, followup, channel, case, project, photo):
-    photo(); followup.review(); bind(followup, channel, project); confirm_photo_issue(followup)
+    photo(); review_with_ai(followup); bind(followup, channel, project); confirm_photo_issue(followup)
     delivery = followup.queue_feedback(project['id'])
     with services['db'].tx() as con:
         con.execute('UPDATE followup_feedback SET policy_version=1 WHERE id=?', (delivery['id'],))
@@ -477,7 +488,7 @@ def test_unlocated_case_cannot_produce_feedback(services, followup, channel, cas
     photo()
     with services['db'].tx() as con:
         con.execute("UPDATE cases SET building='',unit='',room='',location_detail='' WHERE id=?", (case['id'],))
-    followup.review(); bind(followup, channel, project)
+    review_with_ai(followup); bind(followup, channel, project)
     assert all(i['feedback']['state'] == ('blocked' if i['kind'] == 'photo' else 'internal') for i in followup.issues())
     assert followup.preview_feedback(project['id'])['count'] == 0
     with pytest.raises(DomainError, match='位置'):
@@ -490,7 +501,7 @@ def test_ai_generic_request_is_not_actionable_even_if_marked_clear(services, fol
     followup.save_config({'ai_review': True})
     monkeypatch.setattr(followup, '_vision', lambda *args: [{'code': 'ai_subject', 'source': 'ai', 'certainty': 'clear',
         'title': '资料需要核对', 'detail': '当前照片还需要进一步检查确认。', 'action': '请按要求补充相关资料'}])
-    followup.review(); bind(followup, channel, project)
+    review_with_ai(followup); bind(followup, channel, project)
     assert followup.preview_feedback(project['id'])['count'] == 0
     assert next(i for i in followup.issues() if i['evidence']['source'] == 'ai')['feedback']['state'] == 'review'
 
@@ -547,7 +558,7 @@ def test_scope_filters_projects_photos_and_ai_without_removing_archive_or_contac
     followup.save_config({'ai_review': True})
     checked = []
     monkeypatch.setattr(followup, '_vision', lambda p, c: checked.append(p['id']) or [])
-    result = followup.review()
+    result = review_with_ai(followup)
     assert checked == [picture['id']]
     assert result['cases'] == 1 and result['photos'] == 1
     summary = followup.summary()
@@ -564,7 +575,7 @@ def test_scope_filters_projects_photos_and_ai_without_removing_archive_or_contac
 def test_leaving_repair_scope_blocks_stale_confirmation_preview_and_delivery(services, followup, channel, case, project, photo):
     photo()
     set_official_lists(services, case, ['intake', 'repair'])
-    followup.review()
+    review_with_ai(followup)
     bind(followup, channel, project)
     issue_id = confirm_photo_issue(followup)
     issue = next(i for i in followup.issues() if i['id'] == issue_id)
@@ -582,7 +593,7 @@ def test_leaving_repair_scope_blocks_stale_confirmation_preview_and_delivery(ser
     followup.deliver(delivery['id'])
     assert followup.feedback()[0]['state'] == 'cancelled'
     assert '查勘维修' in followup.feedback()[0]['error']
-    followup.review()
+    review_with_ai(followup)
     assert services['db'].one('SELECT * FROM followup_issues WHERE id=?', (issue_id,)) == old_issue
     assert not channel[1].sent
 
@@ -592,8 +603,8 @@ def test_out_of_scope_photo_changes_do_not_trigger_followup_until_case_enters_re
     before = followup.signature()
     picture = photo()
     assert followup.signature() == before
-    assert followup.review()['photos'] == 0
+    assert review_with_ai(followup)['photos'] == 0
     stage(services, case, 'survey')
     assert followup.signature() != before
-    assert followup.review()['photos'] == 1
+    assert review_with_ai(followup)['photos'] == 1
     assert any(i['photo_id'] == picture['id'] for i in followup.issues())

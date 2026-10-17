@@ -1,0 +1,43 @@
+.case-agent { --muted: #536879; display: grid; gap: 18px; min-width: 0; color: var(--text); }
+.agent-heading, .agent-history { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; }
+.agent-heading h2 { display: flex; align-items: center; gap: 9px; margin: 0; font-size: 19px; }
+.agent-heading p, .agent-progress p { margin: 6px 0 0; color: var(--muted); line-height: 1.6; }
+.case-agent button, .agent-history select, .agent-choice { min-height: 44px; }
+.case-agent :is(button,a,input,select,summary):focus-visible { outline: 3px solid var(--primary); outline-offset: 3px; }
+.agent-progress { display: flex; align-items: center; gap: 12px; padding: 16px; background: var(--soft); border: 1px solid var(--line); border-radius: 8px; }
+.agent-history label { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.agent-history > span, .agent-summary small, .agent-trace p, .agent-trace small { color: var(--muted); font-size: 13px; }
+.agent-history select { max-width: 100%; }
+.agent-summary, .agent-finding { padding: 20px; border: 1px solid var(--line); background: var(--bg); border-radius: 8px; min-width: 0; }
+.agent-summary h3, .agent-findings h3 { margin: 0; font-size: 16px; }
+.agent-summary p, .agent-finding p { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.75; margin: 10px 0; }
+.agent-notice, .agent-stale { padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--soft); line-height: 1.7; font-size: 14px; }
+.agent-stale { border-left: 4px solid var(--primary); }
+.agent-notice ul { margin: 6px 0 0; padding-left: 20px; }
+.agent-findings { display: grid; gap: 14px; }
+.agent-finding header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
+.agent-finding h4 { font-size: 16px; margin: 8px 0; }
+.agent-kind { padding: 4px 9px; border: 1px solid var(--line); border-radius: 5px; background: var(--soft); font-size: 13px; }
+.agent-kind-visible_issue { color: var(--text); font-weight: 600; }
+.agent-choice { display: inline-flex; align-items: center; gap: 7px; font-size: 14px; cursor: pointer; }
+.agent-choice input { width: 18px; height: 18px; }
+.agent-evidence { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 210px)); gap: 10px; margin: 14px 0; }
+.agent-evidence a { display: flex; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 6px; color: inherit; text-decoration: none; overflow-wrap: anywhere; }
+.agent-evidence a:hover { border-color: var(--primary); }
+.agent-evidence img { width: 100%; height: 140px; object-fit: contain; background: var(--soft); }
+.agent-evidence span { font-size: 13px; }
+.agent-evidence small { display: block; margin-top: 3px; color: var(--muted); }
+.agent-finding details { margin-top: 12px; }
+.agent-finding blockquote { margin: 10px 0; padding: 10px 14px; border-left: 3px solid var(--line); background: var(--soft); }
+.agent-trace { border-top: 1px solid var(--line); padding-top: 16px; }
+.agent-trace summary, .agent-finding summary { cursor: pointer; min-height: 32px; }
+.agent-trace ol { padding-left: 24px; }
+.agent-trace li { padding: 5px 0; line-height: 1.6; }
+.agent-trace small { display: block; }
+.agent-preview { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.8; padding: 16px; background: var(--soft); border-radius: 8px; }
+.agent-case-picker { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-bottom: 20px; }
+.agent-case-picker label { display: grid; gap: 7px; min-width: 0; max-width: 100%; flex: 0 1 220px; }
+.agent-case-picker label:nth-child(2) { flex: 1 1 420px; }
+.agent-case-picker select { min-height: 44px; min-width: 0; max-width: 100%; width: 100%; }
+@media (max-width: 640px) { .agent-heading > div, .agent-history > label { width: 100%; } .agent-summary, .agent-finding { padding: 14px; } .agent-evidence { grid-template-columns: repeat(2, minmax(0, 1fr)); } .agent-evidence img { height: 110px; } }
+@media (prefers-reduced-motion: reduce) { .case-agent .spin { animation: none; } }

@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import shutil
 import subprocess
 import threading
+import time
+from contextlib import contextmanager
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -53,6 +58,23 @@ class PlatformWriteError(DomainError):
         self.rejected = rejected
 
 
+class PlatformReadPaused(DomainError):
+    def __init__(self, message, retry_after=60, status=503):
+        super().__init__(message, status)
+        self.retry_after = max(1, retry_after)
+
+
+class PlatformBudgetReached(DomainError):
+    def __init__(self):
+        super().__init__('本批官网请求已达上限，已保留进度等待继续', 429)
+
+
+class PlatformLoginError(DomainError):
+    def __init__(self, message, status=502, *, retryable=True):
+        super().__init__(message, status)
+        self.retryable = retryable
+
+
 class PlatformClient:
     """Read-only by default; reviewed writes require explicit runtime configuration."""
 
@@ -61,8 +83,61 @@ class PlatformClient:
         self._token = ""
         self._account = ""
         self._lock = threading.RLock()
+        self._login_lock = threading.Lock()
+        self._session_generation = 0
         self._connected_at = None
         self.write_enabled = bool(write_enabled)
+        self.request_interval = 0.0 if transport is not None else 1.0
+        self._next_request = 0.0
+        self._read_pause_until = 0.0
+        self._read_failures = 0
+        self._budget = threading.local()
+        self._closing = threading.Event()
+
+    @contextmanager
+    def request_budget(self, limit, on_request=None):
+        previous = getattr(self._budget, 'value', None)
+        value = {'limit': max(0, limit), 'used': 0, 'on_request': on_request}
+        self._budget.value = value
+        try:
+            yield value
+        finally:
+            self._budget.value = previous
+
+    def _before_request(self):
+        if self._closing.is_set():
+            raise PlatformReadPaused('服务正在停止，官网同步进度已保留', 30)
+        delay = self._read_pause_until - time.monotonic()
+        if delay > 0:
+            raise PlatformReadPaused('官网请求暂缓，稍后继续', delay)
+        budget = getattr(self._budget, 'value', None)
+        if budget is not None and budget['used'] >= budget['limit']:
+            raise PlatformBudgetReached()
+        delay = max(0, self._next_request - time.monotonic())
+        if delay and self._closing.wait(delay):
+            raise PlatformReadPaused('服务正在停止，官网同步进度已保留', 30)
+        if budget is not None:
+            if budget['on_request']:
+                budget['on_request']()
+            budget['used'] += 1
+        self._next_request = time.monotonic() + self.request_interval
+
+    def _pause_reads(self, response=None):
+        self._read_failures += 1
+        delay = min(300, 15 * 2 ** min(self._read_failures - 1, 5))
+        if response is not None and response.status_code == 429:
+            raw = response.headers.get('Retry-After', '')
+            try:
+                delay = max(1, float(raw))
+                if not math.isfinite(delay):
+                    raise ValueError()
+            except ValueError:
+                try:
+                    delay = max(1, (parsedate_to_datetime(raw) - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError, OverflowError):
+                    delay = max(delay, 60)
+        self._read_pause_until = time.monotonic() + delay
+        return PlatformReadPaused('官网限流或暂不可用，已暂停请求并保留同步进度', delay)
 
     def status(self):
         with self._lock:
@@ -79,7 +154,13 @@ class PlatformClient:
             if not self._token:
                 raise PlatformWriteError('请先连接官网', 401, rejected=True)
             try:
+                self._before_request()
                 response = self._http.post(path, headers={'Authorization': 'Bearer ' + self._token}, **kwargs)
+                if response.status_code == 429:
+                    paused = self._pause_reads(response)
+                    raise PlatformWriteError('官网限流，未继续操作，请稍后回读核对', 429, rejected=True) from paused
+                if response.status_code >= 500:
+                    self._pause_reads(response)
                 if response.status_code in (401, 403):
                     if response.status_code == 401:
                         self.logout()
@@ -113,6 +194,12 @@ class PlatformClient:
             raise DomainError('官网提交环节不存在')
         return self._write(STAGES[stage]['endpoint'], json=payload)
 
+    def save_draft_only(self, stage, payload):
+        """Capability used by the group Agent: no caller-selectable submit action."""
+        if stage not in ('survey', 'repair') or not isinstance(payload, dict) or type(payload.get('state')) is not int or payload['state'] != 0:
+            raise DomainError('Agent 仅可保存查勘或修复成果草稿，没有正式提交权限', 403)
+        return self._write(STAGES[stage]['endpoint'], json=payload)
+
     def login(self, username, password):
         if not isinstance(username, str) or not isinstance(password, str) or not username.strip() or not password:
             raise DomainError("请填写官网账号和密码")
@@ -120,9 +207,13 @@ class PlatformClient:
             raise DomainError("账号或密码过长")
         node = shutil.which("node")
         if not node or not (ROOT / "frontend/node_modules/playwright/index.mjs").is_file():
-            raise DomainError("官网登录需要 Node.js 和项目浏览器依赖，请先运行安装脚本", 503)
-        with self._lock:
+            raise PlatformLoginError("官网登录需要 Node.js 和项目浏览器依赖，请先运行安装脚本", 503, retryable=False)
+        with self._login_lock:
+            if self._closing.is_set():
+                raise DomainError('服务正在停止，未继续官网登录。', 409)
             self.logout()
+            with self._lock:
+                generation = self._session_generation
             try:
                 result = subprocess.run(
                     [node, str(ROOT / "scripts/platform-login.mjs")],
@@ -131,28 +222,52 @@ class PlatformClient:
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
                 response = json.loads(result.stdout)
-                if result.returncode or not isinstance(response.get("token"), str) or not response["token"]:
+                if not isinstance(response, dict):
+                    raise ValueError("invalid login receipt")
+                token = response.get("token")
+                if result.returncode or not isinstance(token, str) or not token.strip() or token.strip() in ("undefined", "null"):
+                    failure = 'login_failed'
                     phase = response.get("phase")
                     if phase in ("start", "browser", "page", "account_field", "login_response", "token_response"):
                         diagnostic = response.get("diagnostics", {})
-                        logging.getLogger(__name__).warning("Website login incomplete: phase=%s sent=%s http=%s script_error=%s failure=%s", phase,
-                            bool(diagnostic.get("requestSent")), diagnostic.get("httpStatus"), bool(diagnostic.get("scriptError")), diagnostic.get("failure"))
-                    raise ValueError("login failed")
-            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-                raise DomainError("官网登录未成功，请核对账号密码、网络或官网登录要求。", 502) from error
-            self._token = response["token"]
-            self._account = username.strip()
-            self._connected_at = now()
+                        diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
+                        failure = diagnostic.get("failure")
+                        failure = failure if failure in ("login_rejected", "http_rejected", "http_failure", "rate_limited", "browser_unavailable", "token_missing", "timeout", "ambiguous_login_control", "login_failed") else "login_failed"
+                        logging.getLogger(__name__).warning("Website login incomplete: phase=%s sent=%s http=%s code=%s script_error=%s failure=%s", phase,
+                            bool(diagnostic.get("requestSent")), diagnostic.get("httpStatus") if type(diagnostic.get("httpStatus")) is int else None,
+                            diagnostic.get("businessCode") if type(diagnostic.get("businessCode")) is int else None, bool(diagnostic.get("scriptError")), failure)
+                    status = response.get("status")
+                    status = status if type(status) is int and status in (400, 401, 403, 429, 502, 503, 504) else 502
+                    detail = response.get("error")
+                    detail = detail.replace(password, "[已隐藏]")[:400] if isinstance(detail, str) and detail.strip() else "官网登录未完成，请稍后重试或先在官网确认登录要求。"
+                    raise PlatformLoginError(detail, status, retryable=status not in (400, 401, 403)
+                                             and failure not in ('token_missing', 'browser_unavailable', 'ambiguous_login_control'))
+            except subprocess.TimeoutExpired as error:
+                raise DomainError("官网登录等待超时，请稍后重试或先打开官网检查网络。", 504) from error
+            except OSError as error:
+                raise PlatformLoginError("官网登录程序未能启动，请检查本机浏览器和运行环境。", 503, retryable=False) from error
+            except ValueError as error:
+                raise PlatformLoginError("官网登录程序未返回有效结果，请稍后重试。", 502, retryable=False) from error
+            with self._lock:
+                if self._closing.is_set() or generation != self._session_generation:
+                    raise DomainError('本次连接已取消，请按当前设置重新连接。', 409)
+                self._token = token
+                self._account = username.strip()
+                self._connected_at = now()
+                self._read_pause_until = 0.0
+                self._read_failures = 0
             return self.status()
 
     def logout(self):
         with self._lock:
+            self._session_generation += 1
             self._token = ""
             self._account = ""
             self._connected_at = None
         return self.status()
 
     def close(self):
+        self._closing.set()
         self.logout()
         self._http.close()
 
@@ -166,26 +281,30 @@ class PlatformClient:
             raise DomainError("只读请求参数不匹配")
         with self._lock:
             if not self._token:
-                raise DomainError("请先连接官网，连接信息仅在本次服务运行期间保留", 401)
+                raise DomainError("请先连接官网；可在系统设置中配置系统账号和自动连接。", 401)
             try:
+                self._before_request()
                 response = self._http.post(path, json=body or {}, headers={"Authorization": "Bearer " + self._token})
                 if response.status_code in (401, 403):
                     if response.status_code == 401:
                         self.logout()
                     raise DomainError("官网登录已失效或此账号没有查看权限", response.status_code)
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise self._pause_reads(response)
                 if response.status_code != 200 or len(response.content) > 8 * 1024 * 1024:
                     raise DomainError("官网查询未成功，请稍后重试", 502)
                 data = response.json()
             except (httpx.HTTPError, ValueError) as error:
-                raise DomainError("官网查询失败，请检查网络后重试", 502) from error
+                raise self._pause_reads() from error
             if not isinstance(data, dict) or data.get("code") != 0:
                 if isinstance(data, dict) and data.get("code") == 2:
                     self.logout()
                     raise DomainError("官网登录已过期，请重新连接", 401)
                 raise DomainError("官网未允许本次查询，或返回格式已变化", 502)
+            self._read_failures = 0
             return data
 
-    def search(self, query="", page=1, scope="repair", page_size=12, end_status=None):
+    def search(self, query="", page=1, scope="repair", page_size=12, end_status=None, report_start=None, report_end=None):
         if scope not in ("repair", "intake") or not isinstance(page, int) or not 1 <= page <= 10000:
             raise DomainError("官网查询范围或页码无效")
         if not isinstance(query, str) or len(query) > 200:
@@ -197,6 +316,15 @@ class PlatformClient:
             payload["reportSubmitState"] = 1
         if end_status is not None:
             payload["endStatus"] = end_status
+        if report_start is not None or report_end is not None:
+            try:
+                if (not isinstance(report_start, str) or not isinstance(report_end, str)
+                        or len(report_start) != 10 or len(report_end) != 10
+                        or date.fromisoformat(report_start) > date.fromisoformat(report_end)):
+                    raise ValueError()
+            except (TypeError, ValueError):
+                raise DomainError('官网报修日期范围无效')
+            payload.update(reportDateStart=report_start, reportDateEnd=report_end)
         if query.strip():
             payload["vagueSearch"] = query.strip()
         result = self.read(scope + "_list", payload)
@@ -209,6 +337,14 @@ class PlatformClient:
             if not isinstance(row, dict):
                 raise DomainError("官网列表行格式已变化", 502)
             external_id(row.get("reportReceivingId"))
+            if report_start is not None:
+                value = str(row.get('reportDate') or '')[:10]
+                if not report_start <= value <= report_end:
+                    raise DomainError('官网返回了日期范围之外的案件，日期筛选尚未通过核验，未扩大查询范围', 409)
+            # Repair-list rows do not always echo the archive flag. The actual
+            # filtered membership is persisted separately by the synchronizer.
+            if end_status is not None and row.get('endStatus') is not None and str(row['endStatus']) != end_status:
+                raise DomainError('官网返回了归档筛选之外的案件，未将本次清单标为完整', 409)
         return {"items": [pick(row, ROW_KEYS) for row in result["data"]], "total": int(total), "page": page, "page_size": page_size}
 
     def all_rows(self, scope, end_status, progress=None):
@@ -242,15 +378,23 @@ class PlatformClient:
             return self._snapshot(record_id, scope)
 
     def _snapshot(self, record_id, scope):
+        row = self.lookup_row(record_id, scope)
+        if row is None:
+            raise DomainError("此记录未在当前账号的对应列表中找到，请重新查询并选择案件", 404)
+        return self.snapshot_from_row(row, scope)
+
+    def lookup_row(self, record_id, scope):
         record_id = external_id(record_id)
         if scope not in ("repair", "intake"):
             raise DomainError("官网查询范围无效")
         result = self.read(scope + "_list", {"reportReceivingId": record_id, "page": 1, "limit": 12})
         rows = result.get("data")
-        row = next((v for v in rows if str(v.get("reportReceivingId")) == record_id), None) if isinstance(rows, list) else None
-        if not row:
-            raise DomainError("此记录未在当前账号的对应列表中找到，请重新查询并选择案件", 404)
-        return self.snapshot_from_row(row, scope)
+        if not isinstance(rows, list):
+            raise DomainError('官网单案查询格式已变化', 502)
+        if any(not isinstance(v, dict) or v.get('reportReceivingId') != record_id for v in rows):
+            raise DomainError('官网未按案件 ID 返回记录，未保存本次查询', 502)
+        row = next(iter(rows), None)
+        return pick(row, ROW_KEYS) if row else None
 
     def snapshot_from_row(self, row, scope):
         with self._lock:

@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import sqlite3
+import threading
 import zipfile
 from copy import deepcopy
 from datetime import datetime
@@ -13,7 +14,7 @@ from .db import Database, audit, dump, now, uid
 from .domain import Domain, DomainError
 from .platform_client import PlatformClient, external_id, unsubmitted_report
 from .platform_contract import STAGES, VERSION, contract, visible
-from .platform_prefill import survey_suggestions
+from .platform_prefill import canonical_value, input_signature, stage_suggestions, without_automatic_remote
 from .storage import Storage, safe_name
 from .stage_access import stage_access
 from .workflow import remote_stage
@@ -53,10 +54,30 @@ class PlatformPreparation:
     def __init__(self, db: Database, domain: Domain, storage: Storage, client: PlatformClient):
         self.db, self.domain, self.storage, self.client = db, domain, storage, client
         self.workflow = None
+        self.material_lock = threading.RLock()
 
     def dictionaries(self):
         initial = json.loads(Path(__file__).with_name("platform_dictionary.json").read_text(encoding="utf-8"))
         return self.db.setting("platform_dictionaries", initial)
+
+    def prefill_defaults(self):
+        return self.db.setting('platform_prefill_defaults', {})
+
+    def save_prefill_defaults(self, data):
+        key = 'estimateRestorationCostCode'
+        if not isinstance(data, dict) or set(data) - {key}:
+            raise DomainError('预填默认设置包含不支持的字段')
+        value = data.get(key)
+        if value not in (None, '') and (not isinstance(value, str) or
+                value not in {o['code'] for o in self.dictionaries()['items'].get('estimate_restoration_cost', [])}):
+            raise DomainError('请选择官网有效的修复预估档位')
+        with self.material_lock, self.db.tx() as con:
+            before = self.prefill_defaults()
+            after = {key: value} if value else {}
+            con.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                        ('platform_prefill_defaults', dump(after)))
+            audit(con, 'settings', 'platform_prefill_defaults', 'update', before, after)
+        return after
 
     def contract(self):
         data = self.dictionaries()
@@ -224,12 +245,71 @@ class PlatformPreparation:
             clean_files[key] = ids
         return clean_values, clean_files
 
-    def save_draft(self, case_id, stage, data):
+    def field_sources(self, case_id, stage):
+        result = {}
+        for row in self.db.all('SELECT * FROM platform_draft_field_sources WHERE case_id=? AND stage=?', (case_id, stage)):
+            result[row['field']] = {**row, 'photo_ids': json.loads(row['photo_ids']), 'needs_review': bool(row['needs_review'])}
+        return result
+
+    def prefill_draft(self, case_id, stage, allowed_photo_ids):
+        """Refresh automatic values from current evidence, retaining manual input."""
+        with self.material_lock:
+            plan = self.preview(case_id, stage)
+            if stage not in ('survey', 'repair') or not plan['access']['editable']:
+                return {'plan': plan, 'changed': False}
+            case, link, photos, draft = plan['case'], plan['link'], plan['photos'], plan['draft']
+            fields = {f['key']: f for f in plan['fields'] if f['kind'] not in ('files', 'readonly')}
+            sources = self.field_sources(case_id, stage)
+            values = deepcopy(draft['values'])
+            files = deepcopy(draft['files']) if draft['revision'] else {}
+            owned = {key: source for key, source in sources.items() if key in fields and source['origin'] == 'automatic'
+                     and canonical_value(fields[key], values.get(key)) == canonical_value(fields[key], source['value'])}
+            for key in owned:
+                values.pop(key, None)
+            evidence_link = without_automatic_remote(link, stage, owned, fields)
+            suggestions, notes = stage_suggestions(stage, case, evidence_link,
+                [p for p in photos if p['id'] in allowed_photo_ids], files, values, self.dictionaries()['items'], self.prefill_defaults())
+            signature = input_signature(case, photos, self.prefill_defaults())
+            automatic_sources = {}
+            for key, field in fields.items():
+                # Existing draft keys, including explicit blanks, are protected.
+                if key in values or sources.get(key, {}).get('origin') == 'manual' or not visible(field, values):
+                    continue
+                suggestion = suggestions.get(key)
+                if not suggestion:
+                    continue
+                values[key] = canonical_value(field, suggestion['value'])
+                automatic_sources[key] = {**suggestion, 'value': values[key], 'input_signature': signature}
+            old_sources = {key: {k: source[k] for k in ('value', 'source', 'photo_ids', 'needs_review', 'input_signature')}
+                           for key, source in sources.items() if source['origin'] == 'automatic'}
+            changed = values != draft['values'] or automatic_sources != old_sources
+            if changed:
+                plan = self.save_draft(case_id, stage, {'values': values, 'files': files, 'revision': draft['revision'], 'link_revision': link['revision']},
+                    actor='automatic_prefill', automatic_sources=automatic_sources,
+                    photo_set_guard=sorted((p['id'], p['revision'], p['blob_hash']) for p in photos),
+                    case_guard={k: case[k] for k in ('revision', 'project_id', 'platform_report_code', 'short_code', 'workflow_stage')})
+            # Explanations use the same allowed evidence as the automatic values.
+            plan['field_suggestion_notes'] = notes
+            return {'plan': plan, 'changed': changed}
+
+    def save_draft(self, case_id, stage, data, *, actor='local', photo_guards=None, case_guard=None, automatic_sources=None, photo_set_guard=None):
         with self.db.tx() as con:
             # Check under the write lock so a simultaneous stage advance cannot
             # leave a newly edited draft in a completed stage.
             self.require_editable(case_id, stage, con)
+            if case_guard:
+                current_case = con.execute('SELECT * FROM cases WHERE id=?', (case_id,)).fetchone()
+                if any(current_case[k] != value for k, value in case_guard.items()):
+                    raise DomainError('案件编号、项目或阶段已变化，未采用旧选材', 409)
+            if photo_set_guard is not None:
+                actual = sorted((p['id'], p['revision'], p['blob_hash']) for p in con.execute('SELECT id,revision,blob_hash FROM photos WHERE case_id=?', (case_id,)))
+                if actual != photo_set_guard:
+                    raise DomainError('自动填写时照片发生变化，等待重新核对', 409)
             values, selections = self._normalize(case_id, stage, data)
+            for photo in photo_guards or []:
+                current = con.execute('SELECT case_id,revision,blob_hash FROM photos WHERE id=?', (photo['id'],)).fetchone()
+                if not current or current['case_id'] != case_id or current['revision'] != photo['revision'] or current['blob_hash'] != photo['blob_hash']:
+                    raise DomainError('照片归属、用途或版本已变化，未采用旧选材', 409)
             current_link = con.execute("SELECT * FROM platform_links WHERE case_id=?", (case_id,)).fetchone()
             if data.get("link_revision") != (current_link["revision"] if current_link else 0):
                 raise DomainError("官网关联已变化，请刷新并核对后保存草稿", 409)
@@ -237,12 +317,39 @@ class PlatformPreparation:
             revision = before["revision"] if before else 0
             if data.get("revision") != revision:
                 raise DomainError("本地草稿已被修改，请刷新后重试", 409)
+            previous_files = json.loads(before['files_json']) if before else self.draft(case_id, stage)['files']
+            if actor == 'local':
+                for field, ids in previous_files.items():
+                    for photo_id in set(ids) - set(selections.get(field, [])):
+                        con.execute('INSERT OR IGNORE INTO platform_draft_exclusions VALUES(?,?,?,?,?)', (case_id, stage, field, photo_id, now()))
+                for field, ids in selections.items():
+                    for photo_id in ids:
+                        con.execute('DELETE FROM platform_draft_exclusions WHERE case_id=? AND stage=? AND field=? AND photo_id=?', (case_id, stage, field, photo_id))
+            else:
+                for field, ids in selections.items():
+                    for photo_id in set(ids) - set(previous_files.get(field, []) if before else []):
+                        if con.execute('SELECT 1 FROM platform_draft_exclusions WHERE case_id=? AND stage=? AND field=? AND photo_id=?', (case_id, stage, field, photo_id)).fetchone():
+                            raise DomainError('此附件已被人工排除，请刷新后核对', 409)
             con.execute("""INSERT INTO platform_drafts VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(case_id,stage) DO UPDATE SET values_json=excluded.values_json,files_json=excluded.files_json,
                 target_report_id=excluded.target_report_id,revision=excluded.revision,updated_at=excluded.updated_at""",
                 (case_id, stage, dump(values), dump(selections), current_link["report_receiving_id"] if current_link else "", revision + 1, now()))
+            if automatic_sources is not None:
+                con.execute("DELETE FROM platform_draft_field_sources WHERE case_id=? AND stage=? AND origin='automatic'", (case_id, stage))
+                for key, source in automatic_sources.items():
+                    if key not in values or values[key] != source['value']:
+                        raise DomainError('自动填写值与来源不一致，未保存草稿', 409)
+                    con.execute('INSERT INTO platform_draft_field_sources VALUES(?,?,?,?,?,?,?,?,?,?)',
+                        (case_id, stage, key, 'automatic', values[key], source['source'], dump(source['photo_ids']), int(source['needs_review']), source['input_signature'], now()))
+            elif actor == 'local':
+                # Saving the form explicitly preserves all current values and clears.
+                previous_values = json.loads(before['values_json']) if before else {}
+                for key in set(values) | set(previous_values):
+                    con.execute("INSERT INTO platform_draft_field_sources VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(case_id,stage,field) DO UPDATE SET origin='manual',value=excluded.value,source=excluded.source,photo_ids='[]',needs_review=0,input_signature='',updated_at=excluded.updated_at",
+                        (case_id, stage, key, 'manual', values.get(key, ''), '人工保存的字段', '[]', 0, '', now()))
             audit(con, "platform_draft", case_id, "local_save", after={"stage": stage, "revision": revision + 1,
-                "values": values, "files": selections, "remote_written": False})
+                "values": values, "files": selections, "remote_written": False,
+                **({'automatic_sources': automatic_sources} if automatic_sources is not None else {})}, actor=actor)
         return self.preview(case_id, stage)
 
     def _photos(self, case_id):
@@ -294,8 +401,8 @@ class PlatformPreparation:
         dictionaries = self.dictionaries()["items"]
         issues = []
 
-        def issue(key, message, severity="error"):
-            issues.append({"field": key, "message": message, "severity": severity})
+        def issue(key, message, severity="error", code="invalid"):
+            issues.append({"field": key, "message": message, "severity": severity, "code": code})
 
         if not link["report_receiving_id"]:
             issue("binding", "尚未关联官网案件，报修编号和保司报案编号不能代替官网记录 ID。")
@@ -313,7 +420,7 @@ class PlatformPreparation:
         if stage in ("repair", "acceptance") and row.get("repairMethod") in ("3", "4"):
             issue("node", "此案件处于零注拒流程，不能按普通维修成果准备。")
         if stage == "repair" and values.get("repairMethod") not in ("1", "2"):
-            issue("repairMethod", "维修方式尚未核实，补充材料栏是否适用仍待确认。")
+            issue("repairMethod", "维修方式尚未核实，补充材料栏是否适用仍待确认。", code="required" if not values.get('repairMethod') else "invalid")
         if stage == "acceptance" and not row.get("repairAcceptanceId"):
             issue("repairAcceptanceId", "缺少官网修复成果记录 ID，需先核对前一环节记录。")
 
@@ -324,7 +431,7 @@ class PlatformPreparation:
             value = values.get(key, "")
             if _empty(value):
                 if f["required"]:
-                    issue(key, "缺少" + f["label"])
+                    issue(key, "缺少" + f["label"], code="required")
                 continue
             if kind in ("select", "dictionary"):
                 options = f.get("options", dictionaries.get(f.get("dictionary", ""), []))
@@ -410,7 +517,7 @@ class PlatformPreparation:
                     if header != b"%PDF-":
                         issue(key, photo["original_name"] + "无法识别为 PDF，请检查原文件。")
             if f["required"] and not existing and not selected:
-                issue(key, "缺少" + f["label"])
+                issue(key, "缺少" + f["label"], code="required")
             suggest = f.get("suggest")
             suggested_ids = [p["id"] for p in photos if suggest and (p["stage"] == suggest[0] or (suggest[0] == 'work' and p.get('shared_checkin_visit_id'))) and p["role"] == suggest[1]
                              and self.db.one("SELECT extension FROM blobs WHERE hash=?", (p["blob_hash"],))["extension"] in f["extensions"]]
@@ -444,8 +551,16 @@ class PlatformPreparation:
                 for key in ("communityInfoId", "engineeringModelingParentId", "repairUnitId"):
                     if context.get(key):
                         business[key] = context[key]
+        sources = self.field_sources(case_id, stage)
+        evidence_signature = input_signature(case, photos, self.prefill_defaults())
+        fields_by_key = {f['key']: f for f in definition['fields']}
+        for key, source in sources.items():
+            source['current'] = key in fields_by_key and canonical_value(fields_by_key[key], values.get(key)) == canonical_value(fields_by_key[key], source['value'])
+            source['stale'] = source['origin'] == 'automatic' and source['input_signature'] != evidence_signature
+            if access['editable'] and source['current'] and source['stale']:
+                issue(key, fields_by_key[key]['label'] + '的自动填写依据已变化，等待重新填写或人工核对后保存。')
         errors = sum(i["severity"] == "error" for i in issues)
-        suggestions, suggestion_notes = survey_suggestions(case, link, photos, selections, values, dictionaries) if stage == 'survey' and access['editable'] else ({}, {})
+        suggestions, suggestion_notes = stage_suggestions(stage, case, link, photos, selections, values, dictionaries, self.prefill_defaults()) if access['editable'] else ({}, {})
         return {"case": case, "stage": stage, "label": definition["label"], "guide_page": definition["guide_page"],
                 "contract_version": VERSION, "mode": self.client.status()['mode'], "remote_written": False,
                 "link": link, "draft": saved, "values": values, "fields": definition["fields"], "access": access,
@@ -456,16 +571,24 @@ class PlatformPreparation:
                 "business_fields": business, "endpoint": definition["endpoint"], "actions": definition["actions"] if access['editable'] else [],
                 "personnel": link["snapshot"].get("personnel", []),
                 "field_suggestions": suggestions, "field_suggestion_notes": suggestion_notes,
+                "field_sources": sources,
                 "prepared_for_review": errors == 0 and access['editable'], "write_enabled": self.client.write_enabled}
 
-    def build_payload(self, plan, action, uploaded_records):
+    @staticmethod
+    def validation_errors(plan, *, allow_incomplete=False):
+        return [item for item in plan['issues'] if item['severity'] == 'error'
+                and not (allow_incomplete and item.get('code') == 'required')]
+
+    def build_payload(self, plan, action, uploaded_records, *, allow_incomplete=False):
         """Assemble parameters after checking the current stage. Never sends a request.
 
         `uploaded_records` must contain real file records; local hashes/IDs are never
         substituted for the platform's IDs. Existing remote records are retained.
         """
         self.require_editable(plan['case']['id'], plan['stage'])
-        if plan["contract_version"] != VERSION or plan["error_count"]:
+        if allow_incomplete and (action != 'save' or plan['stage'] not in ('survey', 'repair')):
+            raise DomainError('不完整资料只能保存查勘或修复成果草稿，不能正式提交', 403)
+        if plan["contract_version"] != VERSION or self.validation_errors(plan, allow_incomplete=allow_incomplete):
             raise DomainError("资料仍有待补或待核对项，不能组装完整接口参数")
         if action not in plan["actions"]:
             raise DomainError("此环节没有对应的官网保存或提交动作")

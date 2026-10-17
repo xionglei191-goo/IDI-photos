@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { AlertCircle, CheckCircle2, Download, ExternalLink, FileText, FolderOpen, Link2, LockKeyhole, RefreshCw, Save, Search, Unplug, X } from 'lucide-react';
-import { api, message, post, put, queryString } from './api';
+import { api, ApiError, message, post, put, queryString } from './api';
 import { bytes, dateTime, Empty, ErrorBox, Loading, Modal, place, PHOTO_GROUPS, ROLES, STAGES, useData, useDebounce } from './common';
 import type { Case, Notify, Photo } from './types';
 import type { PlatformContract, PlatformField, PlatformFileField, PlatformLink, PlatformPackage, PlatformPlan, PlatformSession, PlatformStage, RemoteCase } from './platformTypes';
@@ -8,16 +8,21 @@ import './platform.css';
 import ReviewBatchDialog from './ReviewBatchDialog';
 import type { ReviewBatch } from './workflowTypes';
 
-export function LoginDialog({ close, connected }: { close: () => void; connected: (session: PlatformSession) => void }) {
+export function LoginDialog({ close, connected, configure }: { close: () => void; connected: (session: PlatformSession) => void; configure?: () => void }) {
   const [username, setUsername] = useState(''), [password, setPassword] = useState(''), [busy, setBusy] = useState(false), [error, setError] = useState('');
   async function submit(e: FormEvent) {
     e.preventDefault(); setBusy(true); setError('');
     try { connected(await post<PlatformSession>('/api/platform/session', { username, password })); close(); }
-    catch (e) { setError(message(e)); }
+    catch (e) {
+      const detail = message(e);
+      setError(e instanceof ApiError && [502, 504].includes(e.status) && detail === `请求失败 (${e.status})`
+        ? `连接官网时网关未返回有效结果（${e.status}）。请稍后重试；也可先打开官网确认账号能否正常登录。` : detail);
+    }
     finally { setPassword(''); setBusy(false); }
   }
   return <Modal title="连接官网" close={() => { if (!busy) close(); }} footer={<><button disabled={busy} onClick={close}>关闭</button><button className="primary" type="submit" form="platform-login" disabled={busy || !username || !password}>{busy ? '正在通过官网正常登录…' : '连接官网'}</button></>}>
-    <p className="notice">连接后可查询案件，核对资料后可保存到官网或正式提交。密码和登录令牌仅用于本次连接，服务重启后需重新登录。</p>
+    <p className="notice">这里用于临时登录。需要重启后自动连接时，请在“系统设置 → 连接与收图”保存系统账号。临时登录会暂停已设置的自动连接。</p>
+    {configure && <button className="space-bottom" disabled={busy} onClick={configure}><LockKeyhole size={15} aria-hidden="true" />设置系统账号与自动连接</button>}
     <ErrorBox error={error} /><form id="platform-login" className="form-grid" onSubmit={submit} autoComplete="off">
       <label>官网账号<input value={username} onChange={e => setUsername(e.target.value)} disabled={busy} autoComplete="off" /></label>
       <label>官网密码<input type="password" value={password} onChange={e => setPassword(e.target.value)} disabled={busy} autoComplete="off" /></label>
@@ -74,6 +79,7 @@ function FilePicker({ field, photos, selected, close, apply, importFiles }: { fi
 
 const isVisible = (field: PlatformField, values: Record<string, string | number>) => Object.entries(field.when || {}).every(([key, allowed]) => allowed.includes(String(values[key] ?? '')));
 const displayValues = (plan: PlatformPlan) => plan.access.editable ? plan.draft.values : Object.fromEntries(Object.entries(plan.values).map(([key, value]) => [key, String(value ?? '')]));
+const sameFieldValue = (field: PlatformField, a: string, b: string) => field.kind === 'datetime' ? a.replace('T', ' ').slice(0, 16) === b.replace('T', ' ').slice(0, 16) : a.trim() === b.trim();
 
 export default function PlatformWorkspace({ cases, initialCaseId, initialStage = 'survey', embedded = false, revision, notify, importFiles, registerLeave, onChanged }: {
   cases: Case[]; initialCaseId: string; revision: number; notify: Notify; importFiles: (caseId: string) => void;
@@ -109,14 +115,36 @@ export default function PlatformWorkspace({ cases, initialCaseId, initialStage =
     return () => abort.abort();
   }, [caseId, reload]);
   useEffect(() => {
+    if (!caseId || loading || saving || dirty || picker) return;
+    const abort = new AbortController(); let fetching = false;
+    const timer = window.setInterval(async () => {
+      if (fetching) return;
+      fetching = true;
+      try {
+        const next = await api<PlatformPlan>(path, { signal: abort.signal });
+        if (abort.signal.aborted) return;
+        if (next.draft.revision !== currentRef.current?.draft.revision || next.link.revision !== currentRef.current?.link.revision || next.access.editable !== currentRef.current?.access.editable) {
+          setPlan(next); currentRef.current = next; setValues(displayValues(next)); setFiles(next.access.editable ? next.draft.files : {});
+        }
+      } catch { /* polling never replaces a user's visible operation error */ } finally { fetching = false; }
+    }, 3000);
+    return () => { abort.abort(); window.clearInterval(timer); };
+  }, [caseId, path, loading, saving, dirty, picker]);
+  useEffect(() => {
     if (loading || !currentRef.current || delayedSignature !== editSignature || saving) return;
     const abort = new AbortController();
     const editable = currentRef.current.access.editable;
-    api<PlatformPlan>(path + (editable ? '/preview' : ''), { method: editable ? 'POST' : 'GET', ...(editable ? { body: delayedSignature } : {}), signal: abort.signal }).then(p => {
+    const previewEdits = editable && dirty;
+    api<PlatformPlan>(path + (previewEdits ? '/preview' : ''), { method: previewEdits ? 'POST' : 'GET', ...(previewEdits ? { body: delayedSignature } : {}), signal: abort.signal }).then(p => {
+      if (abort.signal.aborted) return;
       if (!p.access.editable) {
         if (currentRef.current?.access.editable && dirty) notify('办理进度已变化，本环节已锁定，未保存的改动未写入。');
         setValues(displayValues(p)); setFiles({}); setDirty(false); setPicker(null);
+      } else if (!dirty) {
+        setValues(displayValues(p)); setFiles(p.draft.files);
       }
+      // Preview cannot grant an old editing form the revision of a newer draft.
+      if (dirty && p.access.editable && currentRef.current) p.draft = currentRef.current.draft;
       setPlan(p); currentRef.current = p;
     }).catch(e => { if (!abort.signal.aborted) setError(message(e)); });
     return () => abort.abort();
@@ -165,6 +193,7 @@ export default function PlatformWorkspace({ cases, initialCaseId, initialStage =
     setSaving(true); setError('');
     try {
       const fresh = await post<PlatformPlan>(path + '/preview', { values, files });
+      if (dirty && currentRef.current) fresh.draft = currentRef.current.draft;
       setPlan(fresh); currentRef.current = fresh;
       if (!fresh.access.editable) { setReload(v => v + 1); return; }
       const next = { ...values }; let count = 0;
@@ -203,13 +232,15 @@ export default function PlatformWorkspace({ cases, initialCaseId, initialStage =
     {!caseId ? <Empty>先建立本地案件，再准备官网资料。</Empty> : loading ? <Loading /> : plan && <div className="platform-body">
       <section className="platform-binding"><div><strong>{plan.case.project_name} · {place(plan.case)}</strong><p>{plan.case.title}</p><dl><dt>报修编号（平台）</dt><dd>{plan.link.platform_report_code || '未记录'}</dd><dt>报案编号（保司）</dt><dd>{plan.link.insurer_report_number || '未记录'}</dd><dt>官网节点</dt><dd>{plan.link.node}</dd></dl></div><div className="row wrap">{canEdit && <button disabled={saving} onClick={() => void openBinding()}><Link2 size={14} />关联 / 核对案件</button>}{session?.connected && plan.link.report_receiving_id && <button disabled={saving} onClick={() => void refreshLink()}><RefreshCw size={14} />刷新官网资料</button>}</div></section>
       {!canEdit && <div className="stage-lock-notice" role="status"><LockKeyhole size={18} aria-hidden="true" /><div><strong>{plan.access.reason}</strong><p>{plan.view_source === 'official' ? '显示官网已保存的信息与附件，历史本地草稿不会覆盖这些内容。' : '保留此前的办理内容，当前不能修改字段或附件。'}</p></div></div>}
-      <div className="platform-columns"><div className="platform-form"><section className="platform-card"><div className="row between wrap"><h2>{plan.label} · 业务信息</h2><div className="row wrap">{canEdit && stage === 'survey' && <button className="platform-prefill-button" disabled={saving || !Object.keys(plan.field_suggestions || {}).some(key => !String(values[key] ?? '').trim())} onClick={() => void prefill()}>根据资料预填</button>}{canEdit && Object.keys(plan.remote_values).length > 0 && stage !== 'survey' && <button className="text-button" disabled={saving} onClick={() => { setValues(prev => { const next = { ...prev }; for (const [key, value] of Object.entries(plan.remote_values)) if (!next[key]) next[key] = value; return next; }); setDirty(true); }}>带入官网空白字段</button>}{canEdit && session?.connected && <button className="text-button" disabled={saving} onClick={() => void refreshOptions()}>刷新官网选项</button>}</div></div><p className="muted">{canEdit ? '带 * 的字段为该环节必填项。时间按实际记录填写，不使用导入或上传时间替代。' : '当前表单仅供核对，不提供修改或重新提交操作。'}</p>{canEdit && stage === 'survey' && <p className="platform-prefill-intro">按案件记录和照片水印补充空栏，保留已有填写。预填内容可修改，请核对后保存。</p>}<fieldset disabled={saving || !canEdit} className="platform-fieldset"><div className="form-grid">{plan.fields.filter(f => f.kind !== 'files' && isVisible(f, displayedValues)).map(f => {
+      <div className="platform-columns"><div className="platform-form"><section className="platform-card"><div className="row between wrap"><h2>{plan.label} · 业务信息</h2><div className="row wrap">{canEdit && ['survey', 'repair'].includes(stage) && <button className="platform-prefill-button" disabled={saving || !Object.keys(plan.field_suggestions || {}).some(key => !String(values[key] ?? '').trim())} onClick={() => void prefill()}>根据资料预填</button>}{canEdit && Object.keys(plan.remote_values).length > 0 && !['survey', 'repair'].includes(stage) && <button className="text-button" disabled={saving} onClick={() => { setValues(prev => { const next = { ...prev }; for (const [key, value] of Object.entries(plan.remote_values)) if (!next[key]) next[key] = value; return next; }); setDirty(true); }}>带入官网空白字段</button>}{canEdit && session?.connected && <button className="text-button" disabled={saving} onClick={() => void refreshOptions()}>刷新官网选项</button>}</div></div><p className="muted">{canEdit ? '带 * 的字段为该环节必填项。时间按实际记录填写，不使用导入或上传时间替代。' : '当前表单仅供核对，不提供修改或重新提交操作。'}</p>{canEdit && ['survey', 'repair'].includes(stage) && <p className="platform-prefill-intro">自动上传会按案件记录和照片水印补充空栏，并保留人工填写。每项可查看依据，确认前仍可修改。</p>}<fieldset disabled={saving || !canEdit} className="platform-fieldset"><div className="form-grid">{plan.fields.filter(f => f.kind !== 'files' && isVisible(f, displayedValues)).map(f => {
         const value = values[f.key] ?? String(plan.values[f.key] ?? '');
         const options = f.options || schema.data?.dictionaries[f.dictionary || ''] || [];
         const suggestion = plan.field_suggestions?.[f.key];
         const suggestedValue = suggestion?.value || '';
-        const sameSuggestion = f.kind === 'datetime' ? value.replace('T', ' ').slice(0, 16) === suggestedValue.replace('T', ' ').slice(0, 16) : value.trim() === suggestedValue.trim();
-        const suggestionText = canEdit && suggestion && (!value.trim() || sameSuggestion) ? `${value.trim() ? '建议依据' : '可预填'}：${suggestion.source}${suggestion.needs_review && !suggestion.source.includes('核对') ? '；请核对' : ''}` : '';
+        const sameSuggestion = sameFieldValue(f, value, suggestedValue);
+        const source = plan.field_sources?.[f.key];
+        const automatic = canEdit && source?.origin === 'automatic' && sameFieldValue(f, value, source.value);
+        const suggestionText = automatic ? source.stale ? '自动填写的依据已变化，正在重新核对；也可手动修正后保存。' : `已自动填写：${source.source}${source.needs_review && !source.source.includes('核对') ? '；请核对' : ''}` : canEdit && suggestion && (!value.trim() || sameSuggestion) ? `${value.trim() ? '建议依据' : '可预填'}：${suggestion.source}${suggestion.needs_review && !suggestion.source.includes('核对') ? '；请核对' : ''}` : '';
         const suggestionNote = canEdit && !value.trim() ? plan.field_suggestion_notes?.[f.key] : '';
         const hintId = suggestionText || suggestionNote ? `prefill-${stage}-${f.key}` : undefined;
         return <label key={f.key} className={f.kind === 'textarea' || f.kind === 'personnel' ? 'full' : ''}><span>{f.label}{f.required && <b className="required-star"> *</b>}</span>

@@ -110,7 +110,7 @@ def test_full_pagination_requires_exact_complete_coverage(failure):
         seen.append(body)
         page = body['page']
         start = 0 if page == 1 or failure == 'repeated' else 40
-        items = [{'reportReceivingId': str(2100000000000000000 + i)} for i in range(start, 40 if page == 1 else start + 3)]
+        items = [{'reportReceivingId': str(2100000000000000000 + i), 'endStatus': '1'} for i in range(start, 40 if page == 1 else start + 3)]
         result = {'code': 0, 'data': [] if failure == 'early_empty' and page == 2 else items, 'count': 44 if failure == 'changing' and page == 2 else 43}
         if failure == 'missing_count':
             result.pop('count')

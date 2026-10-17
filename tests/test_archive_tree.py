@@ -37,10 +37,71 @@ def test_copies_originals_into_readable_folders_and_preserves_same_names(service
     blob = services["db"].one("SELECT b.* FROM blobs b JOIN photos p ON p.blob_hash=b.hash WHERE p.id=?", (first["photo_id"],))
     original = services["storage"].resolve(blob["stored_path"])
     assert os.stat(original).st_ino != os.stat(copied).st_ino
-    assert {p.name for p in copied.parent.parent.iterdir() if p.is_dir()} == {"查勘", "施工", "完工", "待分类", "报送资料"}
+    assert {p.name for p in copied.parent.parent.iterdir() if p.is_dir()} == {"查勘"}
     before = copied.stat().st_mtime_ns
     assert tree.sync()["state"] == "completed"
     assert copied.stat().st_mtime_ns == before
+
+
+def test_project_and_case_metadata_do_not_create_empty_folders(services, case, photo):
+    domain, tree = services['domain'], services['archive_tree']
+    other_project = domain.save_project({'name': '仅官网台账项目'})
+    domain.save_case({'project_id': other_project['id'], 'title': '尚无本地照片'})
+    domain.save_case({'project_id': case['project_id'], 'title': '同项目另一个空案件'})
+    assert tree.sync()['state'] == 'completed'
+    assert list(tree.root.iterdir()) == []
+    assert services['db'].one('SELECT COUNT(*) AS n FROM archive_tree_entries')['n'] == 0
+    p = photo(stage='work')
+    assert tree.sync()['state'] == 'completed'
+    copied = managed_file(services, 'photo:' + p['id'])
+    assert list(tree.root.iterdir()) == [copied.parent.parent.parent]
+    assert list(copied.parent.parent.parent.iterdir()) == [copied.parent.parent]
+    assert list(copied.parent.parent.iterdir()) == [copied.parent]
+    assert services['domain'].case(case['id'])['id'] == case['id']
+    assert tree.sync(force=True)['state'] == 'completed'
+    assert not (tree.root / '仅官网台账项目').exists()
+
+
+def test_legacy_empty_managed_directories_are_pruned_without_claiming_user_folders(services, photo):
+    p = photo(stage='survey')
+    tree = services['archive_tree']
+    tree.sync()
+    copied = managed_file(services, 'photo:' + p['id'])
+    before = copied.stat().st_mtime_ns
+    legacy = ['空项目', '空项目/空案件', '空项目/空案件/查勘', '待归档',
+              '手工资料项目', '手工资料项目/空案件',
+              copied.parent.parent.relative_to(tree.root).as_posix() + '/施工']
+    for path in sorted(legacy, key=lambda value: value.count('/')):
+        tree._directory(path, None)
+    manual = tree.root / '手工资料项目/交接说明.txt'
+    manual.write_text('保留人工文件', encoding='utf-8')
+    unregistered = tree.root / '人工创建的空目录'
+    unregistered.mkdir()
+    result = tree.sync(force=True)
+    assert result['state'] == 'completed' and result['file_count'] == 1
+    assert not (tree.root / '空项目').exists()
+    assert not (tree.root / '待归档').exists()
+    assert not (tree.root / '手工资料项目/空案件').exists()
+    assert not (copied.parent.parent / '施工').exists()
+    assert manual.read_text(encoding='utf-8') == '保留人工文件'
+    assert unregistered.is_dir()
+    assert copied.stat().st_mtime_ns == before and digest(copied) == p['blob_hash']
+    assert services['db'].one('SELECT * FROM archive_tree_entries WHERE path=?', ('人工创建的空目录',)) is None
+
+
+def test_reassigning_last_photo_removes_only_old_empty_project_folder(services, case, photo):
+    p = photo(stage='survey')
+    domain, tree = services['domain'], services['archive_tree']
+    tree.sync()
+    old_project = managed_file(services, 'photo:' + p['id']).parent.parent.parent
+    project = domain.save_project({'name': '实际归属项目'})
+    other = domain.save_case({'project_id': project['id'], 'title': '重新归档'})
+    domain.update_photo(p['id'], {'case_id': other['id'], 'stage': 'work'})
+    assert tree.sync()['state'] == 'completed'
+    current = managed_file(services, 'photo:' + p['id'])
+    assert current.parent.parent.parent.name == project['name']
+    assert digest(current) == p['blob_hash'] and not old_project.exists()
+    assert domain.case(case['id'])['id'] == case['id']
 
 
 def test_rename_and_reclassification_keep_user_files_and_separate_concurrent_cases(services, case, photo):

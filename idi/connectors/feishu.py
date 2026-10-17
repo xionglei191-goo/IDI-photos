@@ -81,7 +81,7 @@ class FeishuClient:
             if not token or token in seen:
                 raise DomainError("飞书群列表分页异常，请重试")
             seen.add(token)
-        return {"bot_name": bot.get("app_name", ""), "groups": groups}
+        return {"bot_name": bot.get("app_name", ""), "bot_open_id": bot.get("open_id", ""), "groups": groups}
 
     def history(self, chat_id, start, end):
         token, seen = "", set()
@@ -156,7 +156,9 @@ def normalize(value, *, chat_id=None):
     return {"message_id": message.get("message_id", ""), "chat_id": message.get("chat_id") or chat_id or "",
             "message_type": message.get("message_type") or message.get("msg_type") or "unknown",
             "create_time": message.get("create_time"), "content": message.get("content", message.get("body", {}).get("content", "{}")),
-            "sender": value.get("sender", message.get("sender", {})), "deleted": bool(message.get("deleted", False))}
+            "sender": value.get("sender", message.get("sender", {})), "deleted": bool(message.get("deleted", False)),
+            "mentions": message.get("mentions", []), "parent_id": message.get("parent_id", ""),
+            "root_id": message.get("root_id", ""), "thread_id": message.get("thread_id", "")}
 
 
 def content_parts(payload):
@@ -274,6 +276,7 @@ class FeishuCapture:
         base = {"group_name": self.connector["config"]["chat_name"], "sender": sender_id, "sent_at": sent_at,
                 "content": text, "context_text": text, "identity_scope": "feishu_message_resource",
                 "chat_id": payload["chat_id"], "feishu_message_id": payload["message_id"], "remote_message_type": payload["message_type"], 'captured_at': captured_at or now()}
+        base.update({key: payload.get(key) or '' for key in ('root_id', 'parent_id', 'thread_id')})
         if text or not resources:
             self.service.ingest(self.connector_id, {**base, "source_key": payload["message_id"] + ":text", "message_type": "text"})
         errors = []

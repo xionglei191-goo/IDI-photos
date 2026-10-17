@@ -171,7 +171,8 @@ def test_upgrade_repairs_prior_prefix_edits_keeps_suffixes_and_is_idempotent(tmp
     assert [domain.case(f'case{i}')['short_code'] for i in range(3)] == ['NEW-1-201-03', 'NEW-1-201-01', 'NEW-1-201-02']
     assert domain.case('case0')['short_code_aliases'] == ['OLD-1-201-01']
     assert domain.case('case2')['short_code_aliases'] == ['OLD-1-201-02']
-    assert db.one('SELECT MAX(version) AS version FROM schema_version')['version'] == 8
+    latest_version = max(int(p.name.split('_')[0]) for p in (Path(__file__).parents[1] / 'idi/migrations').glob('*.sql'))
+    assert db.one('SELECT MAX(version) AS version FROM schema_version')['version'] == latest_version
     before = {table: db.all(f'SELECT * FROM {table}') for table in ('cases', 'case_code_aliases', 'audit')}
     db.initialize()
     for table, rows in before.items():

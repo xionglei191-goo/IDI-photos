@@ -314,6 +314,7 @@ def test_backup_restore_verifies_originals_packages_and_disables_receivers(servi
     assert recovered["domain"].case(case["id"])["title"] == case["title"]
     assert recovered["domain"].summary()["total"] == 1
     assert not recovered["connectors"].get(feed["id"])["enabled"]
+    assert recovered['workflow'].synchronizer.policy()['enabled'] is False
     assert recovered["jobs"].list()[0]["state"] == "failed"
     blob = recovered["db"].one("SELECT * FROM blobs WHERE hash=?", (p["blob_hash"],))
     assert recovered["storage"].verify(blob)

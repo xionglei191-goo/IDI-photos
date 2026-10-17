@@ -10,11 +10,12 @@ test('project prefix updates existing cases and keeps historical code navigation
   await page.goto('/');
   await page.getByRole('button', { name: '本地案件', exact: true }).click();
   await page.getByRole('textbox', { name: '搜索案件', exact: true }).fill(oldCode);
+  await expect(page.getByRole('textbox', { name: '快速定位案件', exact: true })).toHaveValue(oldCode);
   await page.locator(`[data-case-id="${item.id}"] .case-link`).click();
   await expect(page.getByRole('heading', { name: oldCode, exact: true })).toBeVisible();
 
-  await page.locator('.utility-menu summary').click();
-  await page.locator('.utility-menu').getByRole('button', { name: '系统设置', exact: true }).click();
+  await page.getByRole('button', { name: '系统设置', exact: true }).click();
+  await page.getByRole('navigation', { name: '设置分类' }).getByRole('button', { name: '项目与资料', exact: true }).click();
   await page.getByRole('row').filter({ hasText: project.name }).getByRole('button', { name: '编辑', exact: true }).click();
   const editor = page.getByRole('dialog', { name: '编辑项目' });
   await expect(editor).toContainText('旧编号仍可用于照片识别与搜索');
@@ -31,11 +32,12 @@ test('project prefix updates existing cases and keeps historical code navigation
   await expect(watermark.locator('pre')).toContainText('编号：' + newCode);
   await watermark.getByRole('button', { name: '关闭', exact: true }).last().click();
   await page.getByRole('button', { name: '返回看板', exact: true }).click();
-  await page.getByRole('textbox', { name: '搜索案件', exact: true }).fill(oldCode);
+  await expect(page.getByRole('textbox', { name: '搜索案件', exact: true })).toHaveValue(oldCode);
   const row = page.locator(`.board-table [data-case-id="${item.id}"]`);
   await expect(row).toContainText(newCode);
   await expect(page.locator('.board-table [data-case-id]')).toHaveCount(1);
-  await page.getByRole('textbox', { name: '快速定位案件', exact: true }).fill(oldCode);
+  await page.getByRole('textbox', { name: '快速定位案件', exact: true }).fill(oldCode.toLowerCase());
+  await expect(page.getByRole('textbox', { name: '搜索案件', exact: true })).toHaveValue(oldCode.toLowerCase());
   await expect(page.locator('.case-tree button')).toHaveCount(1);
   await expect(page.locator('.case-tree button')).toContainText(newCode);
   await page.locator('.case-tree button').click();

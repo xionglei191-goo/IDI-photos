@@ -329,3 +329,55 @@ def test_login_uses_normal_browser_and_secrets_only_in_pipe(monkeypatch):
     assert json.loads(captured["input"])["password"] == "password-example"
     assert captured["capture_output"] and captured["timeout"] == 100
     client.close()
+
+
+@pytest.mark.parametrize("status,failure,detail", [
+    (401, "login_rejected", "官网登录未通过：账号或密码错误"),
+    (429, "rate_limited", "官网暂时限制登录请求，请稍后再试。"),
+    (504, "token_missing", "官网已响应，但未取得有效登录令牌或失败提示。"),
+    (503, "browser_unavailable", "官网登录浏览器未能启动。"),
+])
+def test_login_failure_preserves_reason_without_logging_credentials(monkeypatch, caplog, status, failure, detail):
+    receipt = {"error": detail, "status": status, "phase": "token_response", "diagnostics": {
+        "requestSent": True, "httpStatus": 200, "businessCode": 1, "failure": failure,
+        "private": "password-example", "response": {"token": "secret-token"}}}
+    monkeypatch.setattr("idi.platform_client.subprocess.run", lambda args, **kwargs: subprocess.CompletedProcess(args, 1, stdout=json.dumps(receipt), stderr=""))
+    monkeypatch.setattr("idi.platform_client.shutil.which", lambda _: "node")
+    client = PlatformClient(httpx.MockTransport(lambda _: pytest.fail("no direct login request")))
+    client._token = "previous-token"
+    try:
+        with pytest.raises(DomainError) as caught:
+            client.login("user-example", "password-example")
+        assert caught.value.status == status and str(caught.value) == detail
+        assert not client.status()["connected"]
+        assert "http=200 code=1" in caplog.text
+        assert all(secret not in caplog.text for secret in ("password-example", "secret-token", "previous-token", "user-example"))
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("output", ["not-json", "[]", "null", '{"token":"undefined"}', '{"token":"null"}'])
+def test_login_malformed_receipt_never_connects(monkeypatch, output):
+    monkeypatch.setattr("idi.platform_client.subprocess.run", lambda args, **kwargs: subprocess.CompletedProcess(args, 0, stdout=output, stderr=""))
+    monkeypatch.setattr("idi.platform_client.shutil.which", lambda _: "node")
+    client = PlatformClient()
+    try:
+        with pytest.raises(DomainError) as caught:
+            client.login("user-example", "password-example")
+        assert caught.value.status == 502 and not client.status()["connected"]
+    finally:
+        client.close()
+
+
+def test_login_subprocess_timeout_is_distinct_from_rejection(monkeypatch):
+    def run(args, **kwargs):
+        raise subprocess.TimeoutExpired(args, 100)
+    monkeypatch.setattr("idi.platform_client.subprocess.run", run)
+    monkeypatch.setattr("idi.platform_client.shutil.which", lambda _: "node")
+    client = PlatformClient()
+    try:
+        with pytest.raises(DomainError) as caught:
+            client.login("user-example", "password-example")
+        assert caught.value.status == 504 and "超时" in str(caught.value)
+    finally:
+        client.close()

@@ -17,6 +17,11 @@ export interface PlatformContract {
   stages: Record<PlatformStage, { label: string; guide_page: number; fields: PlatformField[] }>;
 }
 export interface PlatformSession { connected: boolean; account: string; mode: string; connected_at: string | null; write_enabled: boolean }
+export interface PlatformAccountStatus {
+  configured: boolean; username: string; password_stored: boolean; auto_connect: boolean; state: string;
+  last_attempt_at: string | null; last_success_at: string | null; next_retry_at: string | null; error: string;
+  session: PlatformSession;
+}
 export interface PlatformLink {
   case_id: string; report_receiving_id: string; platform_report_code: string; insurer_report_number: string;
   verified_at: string | null; revision: number; node: string; snapshot: { scope?: string; account?: string };
@@ -27,6 +32,7 @@ export interface PlatformFileField extends PlatformField {
   suggested_ids: string[]; count: number;
 }
 export interface PlatformFieldSuggestion { value: string; source: string; photo_ids: string[]; needs_review: boolean }
+export interface PlatformFieldSource extends PlatformFieldSuggestion { origin: 'automatic' | 'manual'; current: boolean; stale: boolean }
 export interface PlatformPlan {
   case: Case; stage: PlatformStage; label: string; guide_page: number; contract_version: string;
   link: PlatformLink; draft: PlatformDraft; values: Record<string, string | number>;
@@ -39,6 +45,7 @@ export interface PlatformPlan {
   write_enabled: boolean; remote_written: false; prepared_for_review: boolean;
   access: StageAccess; view_source: 'official' | 'local';
   field_suggestions?: Record<string, PlatformFieldSuggestion>; field_suggestion_notes?: Record<string, string>;
+  field_sources?: Record<string, PlatformFieldSource>;
 }
 export interface PlatformPackage { id: string; label: string; stage: string; created_at: string; file_count: number; error_count: number; download_url: string }
 export interface RemoteCase { reportReceivingId: string; reportCode: string; reportNumber: string | null; communityName: string; communityDesc: string; accidentDesc: string; issueDescription?: string }

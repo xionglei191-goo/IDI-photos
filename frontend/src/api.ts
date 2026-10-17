@@ -1,3 +1,8 @@
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) { super(message); this.status = status; }
+}
+
 export async function api<T = unknown>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
   headers.set('X-IDI-Request', '1');
@@ -6,7 +11,7 @@ export async function api<T = unknown>(path: string, options: RequestInit = {}):
   if (!response.ok) {
     let message = `请求失败 (${response.status})`;
     try { const error = await response.json(); message = typeof error.detail === 'string' ? error.detail : JSON.stringify(error.detail || error); } catch { /* retain status */ }
-    throw new Error(message);
+    throw new ApiError(message, response.status);
   }
   return response.json() as Promise<T>;
 }

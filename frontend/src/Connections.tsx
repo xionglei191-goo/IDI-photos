@@ -59,7 +59,7 @@ function ReceiptContent({ value, open }: { value: MessageRecord; open: (id: stri
   </div>;
 }
 
-export default function Connections({ projects, cases, revision, refresh, notify }: { projects: Project[]; cases: Case[]; revision: number; refresh: () => void; notify: Notify }) {
+export default function Connections({ projects, cases, revision, refresh, notify, embedded = false }: { projects: Project[]; cases: Case[]; revision: number; refresh: () => void; notify: Notify; embedded?: boolean }) {
   const [editor, setEditor] = useState<Connector | 'new' | 'feishu' | null>(null), [tab, setTab] = useState('connectors'), [failed, setFailed] = useState(false), [busy, setBusy] = useState(''), [tick, setTick] = useState(0);
   const [photoId, setPhotoId] = useState<string | null>(null);
   useEffect(() => { const timer = window.setInterval(() => setTick(t => t + 1), 5000); return () => window.clearInterval(timer); }, []);
@@ -70,7 +70,7 @@ export default function Connections({ projects, cases, revision, refresh, notify
   async function toggle(value: Connector) { setBusy(value.id); try { await put(`/api/connectors/${value.id}`, { ...value, enabled: !value.enabled }); refresh(); notify('入口状态已更新'); } catch (e) { notify(message(e), true); } finally { setBusy(''); } }
   async function retry(id: string, connector = false) { setBusy(id); try { const result = await post<{ media_state: string; error?: string }>(connector ? `/api/connectors/${id}/retry` : `/api/messages/${id}/retry`); notify(result.media_state === 'saved' ? '附件已重新归档' : result.media_state === 'pending' ? '已加入重试队列，将重新下载并归档' : result.error || '附件仍未保存', !['saved', 'pending'].includes(result.media_state)); refresh(); } catch (e) { notify(message(e), true); } finally { setBusy(''); } }
   return <section className="workspace">
-    <div className="page-heading"><div><h1>收图入口</h1><p>从飞书群或照片文件夹自动收集，识别水印并匹配案件</p></div><div className="row"><button onClick={refresh}><RefreshCw size={15} />刷新</button><button onClick={() => setEditor('new')}><FolderInput size={15} />新增文件夹</button><button className="primary" onClick={() => setEditor('feishu')}><Plus size={15} />接入飞书群</button></div></div>
+    <div className="page-heading"><div>{embedded ? <h2>收图入口</h2> : <h1>收图入口</h1>}<p>从飞书群或照片文件夹自动收集，识别水印并匹配案件</p></div><div className="row"><button onClick={refresh}><RefreshCw size={15} />刷新</button><button onClick={() => setEditor('new')}><FolderInput size={15} />新增文件夹</button><button className="primary" onClick={() => setEditor('feishu')}><Plus size={15} />接入飞书群</button></div></div>
     <div className="tabs"><button className={tab === 'connectors' ? 'active' : ''} onClick={() => setTab('connectors')}><FolderInput size={15} />收图入口</button><button className={tab === 'messages' ? 'active' : ''} onClick={() => setTab('messages')}><MessageSquare size={15} />接收记录</button></div><ErrorBox error={list.error || messages.error} />
     {tab === 'connectors' ? !visible.length ? <Empty>接入一个飞书群或照片文件夹，服务运行期间持续接收新增资料。</Empty> : <div className="table-wrap grow"><table style={{ minWidth: 1050 }}><thead><tr><th>入口 / 项目</th><th>连接状态</th><th>消息 / 附件</th><th>接收与补查</th><th>说明</th><th>操作</th></tr></thead><tbody>{visible.map(c => <tr key={c.id}>
       <td><strong>{c.name}</strong><small>{c.kind === 'feishu' ? '飞书群' : '文件夹'} · {projects.find(p => p.id === c.config.project_id)?.name || '按照片信息匹配'}</small></td>

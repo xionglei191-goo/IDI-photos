@@ -1,3 +1,4 @@
+import { PhotoProcessing } from './RuntimeStatus';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { ArrowDown, ArrowUp, CheckSquare, ChevronLeft, ChevronRight, Columns3, Download, FileImage, FolderOpen, RefreshCw, ScanText, Search, Upload } from 'lucide-react';
 import { api, message, post, queryString } from './api';
@@ -47,7 +48,7 @@ export default function PhotoWorkspace({ filter, cases, projects, revision, sele
       case 'part': return p.part || <span className="muted">待补充</span>;
       case 'time': return p.watermark_time ? <><span className="tabular">{p.watermark_time.slice(0, 10)}</span><small className="tabular">{p.watermark_time.slice(11)}</small></> : <span className="muted">未识别</span>;
       case 'process': return p.process || <span className="muted">待补充</span>;
-      case 'state': return <State value={p.recognition_state} />;
+      case 'state': return <><State value={p.recognition_state} /><PhotoProcessing photo={p} compact /></>;
       case 'report': return p.platform_report_code || <span className="muted">暂无</span>;
       case 'insurer': return p.insurer || '—';
       case 'filename': return <span className="file-name">{p.original_name}</span>;

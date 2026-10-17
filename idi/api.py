@@ -25,6 +25,7 @@ from .imports import Importer
 from .jobs import JobRunner
 from .platform import PlatformPreparation
 from .platform_client import PlatformClient
+from .platform_account import PlatformAccount
 from .platform_routes import platform_routes
 from .recognition import Recognizer
 from .project_followup import ProjectFollowup
@@ -34,6 +35,16 @@ from .storage import Storage, safe_name
 from .workflow import Workflow
 from .workflow_routes import workflow_routes
 from .review_batches import ReviewBatches
+from .case_agent import CaseAgent
+from .feishu_agent import FeishuAgent
+from .feishu_agent_routes import feishu_agent_routes
+from .agent_routes import agent_routes
+from .workspace_chat import WorkspaceChat
+from .workspace_chat_routes import workspace_chat_routes
+from .photo_ai import PhotoAI
+from .photo_workflow import PhotoWorkflow
+from .automatic_uploads import AutomaticUploads, automatic_upload_routes
+from .operations import Operations, operations_routes
 
 
 def create_app(settings: Settings | None = None):
@@ -48,12 +59,24 @@ def create_app(settings: Settings | None = None):
     recognizer = Recognizer(db, storage, domain)
     reporter = Reporter(db, storage, domain)
     platform = PlatformPreparation(db, domain, storage, PlatformClient(write_enabled=settings.platform_write_enabled))
+    platform.account = PlatformAccount(platform, settings.data_dir)
     jobs = JobRunner(db)
     workflow = Workflow(db, domain, platform, jobs)
     reviews = ReviewBatches(workflow)
     platform.workflow = workflow
     connectors = ConnectorService(settings, db, importer, jobs)
     followup = ProjectFollowup(settings, db, domain, storage, connectors, recognizer)
+    photo_ai = PhotoAI(db, domain, storage, recognizer, followup)
+    followup.photo_ai = photo_ai
+    case_agent = CaseAgent(settings, db, domain, storage, recognizer, followup)
+    followup.case_agent = case_agent
+    feishu_agent = FeishuAgent(settings, db, domain, storage, recognizer, connectors, followup, platform, workflow, reviews, case_agent)
+    feishu_agent.photo_ai = photo_ai
+    photo_workflow = PhotoWorkflow(db, domain, storage, recognizer, platform, feishu_agent)
+    feishu_agent.photo_workflow = photo_workflow
+    automatic_uploads = AutomaticUploads(workflow, reviews, photo_workflow)
+    reviews.automatic_uploads = automatic_uploads
+    workspace_chat = WorkspaceChat(feishu_agent)
 
     def import_job(payload, progress):
         result = importer.process(payload, progress)
@@ -73,12 +96,32 @@ def create_app(settings: Settings | None = None):
 
     @asynccontextmanager
     async def lifespan(app):
+        with db.tx() as con:
+            con.execute("UPDATE agent_maintenance_actions SET state='interrupted',error='服务中断；未自动重放，请查询当前状态后另行请求',updated_at=? WHERE state='running'", (now(),))
         if settings.worker_enabled:
+            platform.account.start()
             jobs.start()
+            workflow.synchronizer.start()
             connectors.start()
             archive_tree.start()
             followup.start()
+            photo_ai.start()
+            photo_workflow.start()
+            automatic_uploads.start()
+            case_agent.start()
+            feishu_agent.start()
+            workspace_chat.start()
         yield
+        platform.client._closing.set()
+        platform.account.stop()
+        workspace_chat.stop()
+        automatic_uploads.stop()
+        photo_workflow.stop()
+        photo_ai.stop()
+        workflow.synchronizer.stop()
+        platform.client._closing.set()
+        feishu_agent.stop()
+        case_agent.stop()
         followup.stop()
         connectors.stop()
         jobs.stop()
@@ -88,21 +131,48 @@ def create_app(settings: Settings | None = None):
     app = FastAPI(title="IDI 资料管理", version=__version__, lifespan=lifespan, docs_url="/api/docs", redoc_url=None)
     app.state.services = {"settings": settings, "db": db, "domain": domain, "storage": storage, "importer": importer, "recognizer": recognizer, "reporter": reporter, "jobs": jobs, "connectors": connectors, "archive_tree": archive_tree, "platform": platform, "workflow": workflow, "reviews": reviews}
     app.state.services['followup'] = followup
+    app.state.services['platform_account'] = platform.account
+    app.state.services['photo_ai'] = photo_ai
+    app.state.services['model_runtime'] = recognizer.runtime
+    app.state.services['photo_workflow'] = photo_workflow
+    app.state.services['automatic_uploads'] = automatic_uploads
+    app.include_router(automatic_upload_routes(automatic_uploads))
+    app.state.services['case_agent'] = case_agent
+    app.state.services['feishu_agent'] = feishu_agent
+    app.state.services['workspace_chat'] = workspace_chat
+    app.state.services['agent_memory'] = feishu_agent.memory
+    operations = Operations(app.state.services)
+    feishu_agent.operations = workspace_chat.operations = operations
+    app.state.services['operations'] = operations
+    app.include_router(operations_routes(operations))
+    app.include_router(workspace_chat_routes(workspace_chat))
+    app.include_router(feishu_agent_routes(feishu_agent))
+    app.include_router(agent_routes(case_agent))
     app.include_router(followup_routes(followup))
     app.include_router(platform_routes(platform))
     app.include_router(workflow_routes(workflow, reviews))
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.trusted_hosts)
 
     @app.middleware("http")
-    async def local_boundary(request: Request, call_next):
-        if request.client and request.client.host not in ("127.0.0.1", "::1", "testclient"):
-            return JSONResponse({"detail": "本版本仅允许本机访问"}, status_code=403)
+    async def network_boundary(request: Request, call_next):
+        if request.client and not settings.allows_client(request.client.host):
+            detail = "本版本仅允许本机访问" if settings.local_only else "仅允许本机及已配置局域网访问"
+            return JSONResponse({"detail": detail}, status_code=403)
+        host = request.headers.get("host", "")
+        if host.split(":", 1)[0].lower() in settings.public_hosts:
+            forwarded_origin = settings.proxy_origin(request.client.host if request.client else "", host,
+                                                     request.headers.get("x-forwarded-proto", ""))
+            if not forwarded_origin:
+                return JSONResponse({"detail": "公网入口仅允许通过已配置的 HTTPS 隧道访问"}, status_code=403)
+            # Trust only this proxy's scheme for this exact public hostname.
+            # Keep the TCP peer address; never trust X-Forwarded-For for access.
+            request.scope["scheme"] = "https"
         if request.url.path.startswith("/api/") and request.method not in ("GET", "HEAD", "OPTIONS"):
             if request.headers.get("X-IDI-Request") != "1":
                 return JSONResponse({"detail": "缺少本地工作台请求标识"}, status_code=403)
             origin = request.headers.get("Origin")
             allowed_dev = os.environ.get("IDI_DEV_ORIGIN", "")
-            if origin and urlsplit(origin).netloc != request.headers.get("host") and origin != allowed_dev:
+            if origin and (urlsplit(origin).netloc != request.headers.get("host") or urlsplit(origin).scheme != request.url.scheme) and origin != allowed_dev:
                 return JSONResponse({"detail": "不允许来自其他网站的写操作"}, status_code=403)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -155,7 +225,9 @@ def create_app(settings: Settings | None = None):
 
     @app.get("/api/system")
     def system():
-        return {"version": __version__, "data_dir": str(settings.data_dir), "local_only": True,
+        return {"version": __version__, "data_dir": str(settings.data_dir), "local_only": settings.local_only,
+                "listen_host": settings.host, "lan_urls": settings.lan_urls, "lan_subnets": list(settings.lan_subnets) if not settings.local_only else [],
+                "public_urls": list(settings.public_origins), "trusted_proxies": list(settings.trusted_proxies),
                 "stages": STAGES, "roles": ROLES, "photo_groups": PHOTO_GROUPS, "case_statuses": STATUSES, "workflow_stages": WORKFLOW_STAGES, "recognition": recognizer.status(),
                 "max_file_mb": settings.max_file_bytes // 1024 // 1024, "worker_enabled": settings.worker_enabled}
 
@@ -224,7 +296,11 @@ def create_app(settings: Settings | None = None):
     @app.get("/api/photos")
     def photos(project_id: str | None = None, case_id: str | None = None, stage: str | None = None, role: str | None = None,
                part: str | None = None, query: str | None = None, review: str | None = None, sort: str = "watermark_time", direction: str = "asc", page: int = 1, page_size: int = 30, photo_group: str | None = None, visit_id: str | None = None):
-        return domain.photos(project_id, case_id, stage, role, part, query, review, sort, direction, page, page_size, photo_group=photo_group, visit_id=visit_id)
+        result = domain.photos(project_id, case_id, stage, role, part, query, review, sort, direction, page, page_size, photo_group=photo_group, visit_id=visit_id)
+        states = operations.photos([p['id'] for p in result['items']])
+        for item in result['items']:
+            item['processing'] = states[item['id']]
+        return result
 
     @app.post("/api/photos/bulk")
     def bulk_photos(data: dict = Body(...)):
@@ -243,7 +319,7 @@ def create_app(settings: Settings | None = None):
 
     @app.get("/api/photos/{photo_id}")
     def photo(photo_id: str):
-        return domain.photo(photo_id)
+        return {**domain.photo(photo_id), 'processing': operations.photos([photo_id])[photo_id]}
 
     @app.patch("/api/photos/{photo_id}")
     def edit_photo(photo_id: str, data: dict = Body(...)):

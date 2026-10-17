@@ -39,7 +39,7 @@ def test_realistic_case_suggestions_have_sources_and_do_not_mutate_inputs(eviden
     assert suggested['siteSurveyDate']['photo_ids'] == ['building']
     assert suggested['defectDesc']['needs_review'] and '受理' in suggested['defectDesc']['source']
     assert all(v['source'] for v in suggested.values())
-    assert not notes and evidence == before
+    assert set(notes) == {'repairUserId', 'estimateRestorationCostCode'} and evidence == before
     # A sole personnel option and a low cost threshold do not establish actual staff or cost.
     assert not {'repairUserId', 'estimateRestorationCostCode'} & suggested.keys()
 

@@ -32,7 +32,7 @@ export default function WorkBoardTable({ items, openCase, showPhotos }: {
         <td rowSpan={2} className="report-date-cell">{c.report_date || '—'}</td>
         <td rowSpan={2} className="issue-cell" title={c.title}>{c.title}{c.responsible && <small>负责人：{c.responsible}</small>}</td>
         <td rowSpan={2}><span className={`workflow-status workflow-${c.workflow_stage}`}>{c.stage_label}</span>{!!c.work_visit_count && <small>{c.work_visit_count} 次施工进场</small>}</td>
-        <th scope="row" className="photo-source-cell official-source" title={c.online_photos?.read_at ? `官网快照最近同步：${dateTime(c.online_photos.read_at)}` : '尚无已核实的官网快照'}>官网<small>{c.online_photos?.read_at ? '最近同步' : '未关联 / 未读取'}</small></th>
+        <th scope="row" className="photo-source-cell official-source" title={c.online_photos?.read_at ? `官网照片实际核验：${dateTime(c.online_photos.read_at)}；检查列表不会更新此时间` : '尚无已核实的官网快照'}>官网<small>{c.online_photos?.read_at ? new Date(c.online_photos.read_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : '未关联 / 未读取'}</small></th>
         {Object.keys(PHOTO_GROUPS).map(group => <td className="photo-count-cell official-photo-cell" data-photo-group={group} key={group}><OnlineCount value={c.online_photos?.groups[group]} label={PHOTO_GROUPS[group]} /></td>)}
         <td rowSpan={2}><span className={c.platform_missing ? 'material-missing' : 'material-ready'}>{c.platform_status}</span></td>
         <td rowSpan={2}><button className={`text-button ${c.insurer_missing ? 'material-missing' : 'material-ready'}`} onClick={() => openCase(c)}>{c.insurer_status}</button></td>

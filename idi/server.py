@@ -23,6 +23,7 @@ def main():
     args = parser.parse_args()
     os.environ["IDI_PORT"] = str(args.port)
     settings = Settings.from_env()
+    local_url = f"http://{'127.0.0.1' if settings.host == '0.0.0.0' else settings.host}:{args.port}"
     settings.prepare()
     lock = (settings.data_dir / "service.lock").open("a+b")
     if lock.tell() == 0:
@@ -41,26 +42,26 @@ def main():
         raise SystemExit("This IDI archive already has a running service.")
     try:
         with socket.socket() as probe:
-            probe.bind(("127.0.0.1", args.port))
+            probe.bind((settings.host, args.port))
     except OSError:
         lock.close()
         raise SystemExit(f"Port {args.port} is already in use.")
     record = settings.data_dir / "service.json"
-    record.write_text(json.dumps({"pid": os.getpid(), "port": args.port, "data_dir": str(settings.data_dir), "executable": sys.executable, "base_executable": getattr(sys, "_base_executable", sys.executable), "started_at": now()}, indent=2), encoding="utf-8")
+    record.write_text(json.dumps({"pid": os.getpid(), "host": settings.host, "port": args.port, "data_dir": str(settings.data_dir), "executable": sys.executable, "base_executable": getattr(sys, "_base_executable", sys.executable), "started_at": now()}, indent=2), encoding="utf-8")
     if args.open_browser:
         def open_when_ready():
             for _ in range(100):
                 try:
-                    with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/api/health", timeout=1) as response:
+                    with urllib.request.urlopen(local_url + "/api/health", timeout=1) as response:
                         if json.loads(response.read()).get("application") == "IDI":
-                            webbrowser.open(f"http://127.0.0.1:{args.port}")
+                            webbrowser.open(local_url)
                             return
                 except (OSError, ValueError):
                     pass
                 time.sleep(.2)
         threading.Thread(target=open_when_ready, daemon=True).start()
     try:
-        uvicorn.run("idi.api:create_app", factory=True, host="127.0.0.1", port=args.port)
+        uvicorn.run("idi.api:create_app", factory=True, host=settings.host, port=args.port, proxy_headers=False)
     finally:
         if record.is_file() and json.loads(record.read_text(encoding="utf-8")).get("pid") == os.getpid():
             record.unlink()

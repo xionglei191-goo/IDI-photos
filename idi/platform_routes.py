@@ -15,17 +15,41 @@ def platform_routes(service):
     def contract():
         return service.contract()
 
+    @router.get('/prefill-defaults')
+    def prefill_defaults():
+        return service.prefill_defaults()
+
+    @router.put('/prefill-defaults')
+    def save_prefill_defaults(data: dict = Body(...)):
+        return service.save_prefill_defaults(data)
+
     @router.get("/session")
     def session():
         return service.client.status()
 
     @router.post("/session")
     def connect(data: dict = Body(...)):
-        return service.client.login(data.get("username"), data.get("password"))
+        return service.account.temporary_login(data.get("username"), data.get("password"))
 
     @router.delete("/session")
     def disconnect():
-        return service.client.logout()
+        return service.account.disconnect()
+
+    @router.get('/account')
+    def account():
+        return service.account.status()
+
+    @router.put('/account')
+    def save_account(data: dict = Body(...)):
+        return service.account.configure(data)
+
+    @router.post('/account/connect')
+    def connect_account():
+        return service.account.request_connect()
+
+    @router.delete('/account')
+    def forget_account():
+        return service.account.forget()
 
     @router.post("/dictionaries/refresh")
     def dictionaries():

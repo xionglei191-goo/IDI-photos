@@ -5,6 +5,12 @@ import path from 'node:path';
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAHgAAABkCAIAAADCEmNlAAAA80lEQVR4nO3SQQ3AMAADsazIC30oei+bQKRTvu2O906wgdAdj44IHRE6InRE6IjQEaEjQkeEjggdEToidEToiNARoSNCR4SOCB0ROiJ0ROiI0BGhI0JHhI4IHRE6InRE6IjQEaEjQkeEjggdEToidEToiNARoSNCR4SOCB0ROiJ0ROiI0BGhI0JHhI4IHRE6InRE6IjQEaEjQkeEjggdEToidEToiNARoSNCR4SOCB0ROiJ0ROiI0BGhI0JHhI4IHRE6InRE6IjQEaEjQkeEjggdEToidEToiNARoSNCR4SOCB0ROiJ0ROiI0BGhI0JHhF7jByp2AUhQ6fjGAAAAAElFTkSuQmCC', 'base64');
 const headers = { 'X-IDI-Request': '1' };
 async function utility(page: Page, name: string) {
+  if (['系统设置', '资料要求', '照片文件夹'].includes(name)) {
+    await page.getByRole('button', { name: '系统设置', exact: true }).click();
+    await page.getByRole('navigation', { name: '设置分类' }).getByRole('button', { name: name === '照片文件夹' ? '连接与收图' : '项目与资料', exact: true }).click();
+    if (name === '资料要求') await page.getByRole('button', { name: '资料要求', exact: true }).click();
+    return;
+  }
   await page.locator('.utility-menu summary').click();
   await page.locator('.utility-menu').getByRole('button', { name, exact: true }).click();
 }
@@ -105,6 +111,7 @@ test('create case, upload, review, select, export, receive, and restore saved vi
 test('site survey acceptance, ledger identifiers, visits, insurer requirements, and folder collection', async ({ page, request }, testInfo) => {
   const project = await (await request.post('/api/projects', { headers, data: { name: '流程验收项目' } })).json();
   await page.goto('/');
+  await expect(page.getByRole('button', { name: '流程验收项目 0', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '导入照片', exact: true }).click();
   let dialog = page.getByRole('dialog');
   await dialog.getByRole('button', { name: '案件台账', exact: true }).click();
@@ -127,12 +134,12 @@ test('site survey acceptance, ledger identifiers, visits, insurer requirements, 
   await expect(page.locator('.case-waiting')).toContainText('当前办理环节：现场查勘');
   await page.getByRole('button', { name: '前往查勘维修', exact: true }).click();
   await page.getByRole('button', { name: /^保司资料/ }).click();
-  await page.getByRole('button', { name: '到访批次', exact: true }).click();
+  await page.locator('.case-detail-heading').getByRole('button', { name: '进场与维修记录', exact: true }).click();
   dialog = page.getByRole('dialog');
-  await dialog.getByLabel('到访日期', { exact: true }).fill('2026-10-15');
-  await dialog.getByLabel('到访标记', { exact: true }).fill('第二次上门');
-  await dialog.getByRole('button', { name: '新建到访批次', exact: true }).click();
-  await expect(dialog.getByRole('cell', { name: '第二次上门', exact: true })).toBeVisible();
+  await dialog.getByLabel('进场日期', { exact: true }).fill('2026-10-15');
+  await dialog.getByLabel('本次标记', { exact: true }).fill('第二次上门');
+  await dialog.getByRole('button', { name: '建立进场记录', exact: true }).click();
+  await expect(dialog.locator('.visit-record-list').getByText('2026-10-15 · 第二次上门', { exact: true })).toBeVisible();
   await dialog.getByRole('button', { name: '关闭', exact: true }).last().click();
   await utility(page, '资料要求');
   await page.getByRole('button', { name: '新增资料要求' }).click();
@@ -143,8 +150,8 @@ test('site survey acceptance, ledger identifiers, visits, insurer requirements, 
   await dialog.locator('input[placeholder="例如：防水"]').fill('防水');
   await dialog.getByRole('button', { name: '保存要求' }).click();
   await expect(page.getByText('测试保司过程要求', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: '照片识别', exact: true }).click();
-  await expect(page.getByRole('checkbox', { name: '启用外部模型，允许手动识别时发送所选图片', exact: true })).not.toBeChecked();
+  await page.getByRole('navigation', { name: '设置分类' }).getByRole('button', { name: '识别与模型', exact: true }).click();
+  await expect(page.getByRole('checkbox', { name: '启用视觉模型接口，供照片识别和项目审核调用', exact: true })).not.toBeChecked();
   const inbox = path.resolve(testInfo.outputPath('folder-inbox'));
   await fs.mkdir(inbox, { recursive: true });
   await utility(page, '照片文件夹');

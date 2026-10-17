@@ -43,7 +43,7 @@ def classify_feedback(issue, context, photo, review, confirmation, context_signa
         return result('ready', '已人工核对原图，并记录具体问题和处理要求。', basis='human',
                       **{k: confirmation[k] for k in ('title', 'detail', 'action')})
     # Numerical heuristics and OCR failures cannot establish a defect in the actual photo.
-    if evidence.get('source') != 'ai':
+    if evidence.get('source') not in ('ai', 'agent'):
         return result('review', '图像指标只是线索；核对原图并填写具体问题与处理要求后，才能反馈。')
     generic_action = re.fullmatch(r'请?(?:按(?:要求|规定))?(?:补齐|补充|补拍)(?:相关|全部|所需)?(?:资料|照片|图片)[。.!！]?', issue['action'].strip())
     if (evidence.get('certainty') != 'clear' or issue['issue_key'].endswith(':ai_stage') or

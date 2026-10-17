@@ -19,6 +19,7 @@ from .connectors.secret_store import SecretStore
 from .db import audit, dump, now, uid
 from .domain import DomainError, PHOTO_GROUPS, ROLES, STAGES, WORKFLOW_STAGES
 from .followup_feedback_policy import FEEDBACK_POLICY_VERSION, case_context, classify_feedback
+from .model_runtime import ModelUnavailable
 
 log = logging.getLogger(__name__)
 PHOTO_STAGE_SCOPE = {'survey': {'survey'}, 'repair': {'survey', 'work'},
@@ -56,6 +57,9 @@ class ProjectFollowup:
         if value['ai_review'] and not self.recognizer.status()['vision_ready']:
             raise DomainError('请先在系统设置中配置视觉模型，再启用自动内容审核')
         self.db.set_setting('followup', value)
+        if current.get('ai_review') and not value['ai_review']:
+            with self.db.tx() as con:
+                con.execute("UPDATE photo_ai_tasks SET state='cancelled',error='用户已关闭自动内容检查',updated_at=? WHERE source='followup' AND state IN ('queued','waiting','running')", (now(),))
         return self.config()
 
     def client(self, connector_id):
@@ -101,21 +105,30 @@ class ProjectFollowup:
                        'cases': [{k: c[k] for k in ('id', 'project_id', 'revision', 'workflow_stage', 'workflow_verified_at')}
                                  for c in sorted(cases.values(), key=lambda c: c['id'])],
                        'photos': photos, 'visits': visits,
+                       'ai_tasks': self.db.all('SELECT id,state,updated_at FROM photo_ai_tasks ORDER BY id'),
                        'shared': [s for s in self.db.all('SELECT * FROM visit_shared_checkins ORDER BY photo_id,visit_id') if s['visit_id'] in visit_ids],
                        'templates': self.db.all('SELECT id,requirements FROM templates ORDER BY id')})
 
-    def request_review(self):
+    def request_review(self, automatic=False):
         with self.db.tx() as con:
             active = con.execute("SELECT * FROM followup_runs WHERE state IN ('queued','running') ORDER BY created_at LIMIT 1").fetchone()
             if active:
+                if not automatic:
+                    con.execute('INSERT INTO followup_run_requests VALUES(?,0) ON CONFLICT(run_id) DO UPDATE SET automatic=0', (active['id'],))
                 return dict(active)
             run_id = uid()
             con.execute('INSERT INTO followup_runs(id,created_at) VALUES(?,?)', (run_id, now()))
+            con.execute('INSERT INTO followup_run_requests VALUES(?,?)', (run_id, int(automatic)))
         return self.db.one('SELECT * FROM followup_runs WHERE id=?', (run_id,))
+
+    @staticmethod
+    def case_evidence(case):
+        return case_context(case)
 
     def _vision(self, photo, case):
         config = self.db.setting('recognition', {})
-        with Image.open(self.storage.resolve(photo['stored_path'])) as original:
+        blob = self.db.one('SELECT stored_path FROM blobs WHERE hash=?', (photo['blob_hash'],))
+        with Image.open(self.storage.resolve(blob['stored_path'])) as original:
             image = ImageOps.exif_transpose(original).convert('RGB')
             image.thumbnail((1600, 1600))
             stream = io.BytesIO()
@@ -132,108 +145,128 @@ class ProjectFollowup:
                   '检查清晰度、曝光、遮挡、主体、可读水印。仅当可读照片信息与提供的案件信息明确矛盾时报告位置冲突。'
                   '一张完工照片不能证明案件完工或验收通过。当前照片用途：' + PHOTO_GROUPS.get(photo.get('photo_group'), '待分类') + '\n案件参考：' + dump(expected))
         key = self.recognizer.api_key(config)
-        try:
-            with httpx.Client(timeout=90, follow_redirects=False) as client:
-                response = client.post(config['base_url'].rstrip('/') + '/chat/completions',
-                                       headers={'Authorization': 'Bearer ' + key} if key else {},
-                                       json={'model': config['model'], 'temperature': 0,
-                                             'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': prompt},
-                                               {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + base64.b64encode(stream.getvalue()).decode()}}]}]})
-                response.raise_for_status()
-                choice = response.json()['choices'][0]
-                if choice.get('finish_reason') not in (None, 'stop'):
-                    raise ValueError('incomplete response')
-                raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', str(choice['message']['content']).strip())
-                value = json.loads(raw)
-                findings = value['findings']
-                if not isinstance(findings, list) or len(findings) > 12:
-                    raise ValueError('invalid findings')
-                cleaned, codes = [], set()
-                for finding in findings:
-                    if not isinstance(finding, dict) or finding.get('code') not in AI_CODES:
-                        raise ValueError('invalid code')
-                    if finding['code'] in codes:
-                        raise ValueError('duplicate code')
-                    codes.add(finding['code'])
-                    if any(not isinstance(finding.get(k), str) or not finding[k].strip() for k in ('title', 'detail', 'action')):
-                        raise ValueError('missing evidence')
-                    certainty = finding.get('certainty', 'uncertain')
-                    if certainty not in ('clear', 'uncertain'):
-                        raise ValueError('invalid certainty')
-                    cleaned.append({'code': 'ai_' + finding['code'], 'source': 'ai', 'certainty': certainty,
-                                    **{k: plain(finding[k]) for k in ('title', 'detail', 'action')}})
-                return cleaned
-        except Exception as error:
-            raise DomainError('视觉审核未完成：' + type(error).__name__ + '；请检查模型连接后重新检查') from None
+        def parse(value):
+            choice = value['choices'][0]
+            if choice.get('finish_reason') not in (None, 'stop'):
+                raise ValueError('incomplete response')
+            raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', str(choice['message']['content']).strip())
+            value = json.loads(raw)
+            findings = value['findings']
+            if not isinstance(findings, list) or len(findings) > 12:
+                raise ValueError('invalid findings')
+            cleaned, codes = [], set()
+            for finding in findings:
+                if not isinstance(finding, dict) or finding.get('code') not in AI_CODES:
+                    raise ValueError('invalid code')
+                if finding['code'] in codes:
+                    raise ValueError('duplicate code')
+                codes.add(finding['code'])
+                if any(not isinstance(finding.get(k), str) or not finding[k].strip() for k in ('title', 'detail', 'action')):
+                    raise ValueError('missing evidence')
+                certainty = finding.get('certainty', 'uncertain')
+                if certainty not in ('clear', 'uncertain'):
+                    raise ValueError('invalid certainty')
+                cleaned.append({'code': 'ai_' + finding['code'], 'source': 'ai', 'certainty': certainty,
+                                **{k: plain(finding[k]) for k in ('title', 'detail', 'action')}})
+            return cleaned
+        return self.recognizer.runtime.request(config, key,
+            {'model': config['model'], 'temperature': 0,
+             'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': prompt},
+                {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + base64.b64encode(stream.getvalue()).decode()}}]}]},
+            90, capability='photo_quality', parse=parse)
 
-    def analyse_photo(self, photo, case, force=False):
+    def analyse_photo(self, photo, case, force=False, requested=False):
         config = self.config()
         signature = digest({'version': RULE_VERSION, 'blob': photo['blob_hash'], 'revision': photo['revision'],
-                            'case': case_context(case),
-                            'config': config, 'vision': self.db.setting('recognition', {})})
-        cached = self.db.one('SELECT * FROM photo_quality_reviews WHERE photo_id=?', (photo['id'],))
-        if cached and cached['signature'] == signature and not (force and cached['error']):
-            return {**cached, 'findings': json.loads(cached['findings']), 'metrics': json.loads(cached['metrics'])}
+                            'recognition_state': photo['recognition_state'], 'case': case_context(case)})
+        local_signature = digest([RULE_VERSION, photo['blob_hash'], photo['revision'], photo['recognition_state'], case_context(case)])
+        cached = self.db.one('SELECT * FROM photo_rule_reviews WHERE photo_id=?', (photo['id'],))
         findings, metrics, error, model = [], {}, None, ''
-        def finding(code, title, detail, action):
-            findings.append({'code': code, 'title': title, 'detail': detail, 'action': action, 'source': 'rule'})
         try:
-            if not self.storage.verify(photo):
-                raise DomainError('原件缺失或内容校验失败')
-            with Image.open(self.storage.resolve(photo['stored_path'])) as original:
-                image = ImageOps.exif_transpose(original).convert('L')
-                width, height = image.size
-                image.thumbnail((512, 512))
-                brightness = ImageStat.Stat(image).mean[0]
-                edge = ImageStat.Stat(image.filter(ImageFilter.FIND_EDGES).crop((2, 2, image.width - 2, image.height - 2))).stddev[0] if min(image.size) > 5 else 0
-                metrics = {'width': width, 'height': height, 'brightness': round(brightness, 2), 'edge_stddev': round(edge, 2), 'min_short_side': 720}
-                if min(width, height) < 720:
-                    finding('resolution', '照片分辨率偏低', f'原件 {width} × {height} 像素，短边低于建议值 720 像素。', '请核对细节是否可辨，优先补充未经压缩的原图。')
-                if brightness < 25 or brightness > 240:
-                    finding('lighting', '照片疑似过暗或过亮', f'整图平均亮度 {brightness:.1f}/255；此项为图像指标提示。', '请检查主体和水印是否清楚，必要时调整光线补拍。')
-                if edge < 4:
-                    finding('detail', '照片细节需要核对', f'边缘细节指标偏低（{edge:.1f}）；纯色墙面也可能触发，不能据此判定模糊。', '请核对原图中的维修主体和文字是否清晰。')
-            if photo['recognition_state'] not in ('pending', 'running'):
-                if photo['recognition_state'] in ('failed', 'conflict'):
-                    finding('recognition', '照片识别失败或存在冲突', '当前识别状态：' + photo['recognition_state'], '请核对原图和识别结果，确认案件及照片用途。')
-                if not photo['watermark_time']:
-                    finding('watermark', '水印时间尚未识别', '系统未取得可用的照片水印时间，并不表示原图没有水印。', '请核对水印是否完整可读，必要时补充带时间的原图。')
-                if photo.get('photo_group') not in PHOTO_GROUPS:
-                    finding('classification', '照片用途待确认', '尚未确认查勘、施工或完工验收用途。', '请说明该照片的案件编号、拍摄阶段和维修部位。')
-            if not photo['case_id']:
-                finding('association', '照片所属案件待确认', '尚未关联具体案件，上传者身份不会自动决定所属案件。', '请补充完整报修编号或项目、楼栋及房号。')
-            state = 'local_checked'
-            if config.get('ai_review') and config['vision_ready']:
-                findings += self._vision(photo, case)
-                model = self.db.setting('recognition', {}).get('model', '')
-                state = 'ai_checked'
-            if findings:
-                state = 'needs_review'
+            if cached and cached['signature'] == local_signature and not (force and cached['error']):
+                findings, metrics, error = json.loads(cached['findings']), json.loads(cached['metrics']), cached['error']
+                state = cached['state']
+            else:
+                findings, metrics = self._local_photo_check(photo)
+                state = 'needs_review' if findings else 'local_checked'
         except Exception as exc:
             state, error = 'failed', str(exc)[:600]
-        stamp = now()
+        stamp = cached['reviewed_at'] if cached and cached['signature'] == local_signature and not (force and cached['error']) else now()
+        with self.db.tx() as con:
+            con.execute('INSERT INTO photo_rule_reviews VALUES(?,?,?,?,?,?,?) ON CONFLICT(photo_id) DO UPDATE SET signature=excluded.signature,state=excluded.state,metrics=excluded.metrics,findings=excluded.findings,error=excluded.error,reviewed_at=excluded.reviewed_at',
+                        (photo['id'], local_signature, state, dump(metrics), dump(findings), error, stamp))
+        rule_error, rule_state, ai_error, ai_state = error, state, None, 'disabled'
+        if config.get('ai_review'):
+            ai_state = 'waiting' if not config['vision_ready'] else 'not_requested'
+            job = self.photo_ai.quality(photo, case, signature, requested=requested) if config['vision_ready'] and not rule_error else None
+            if job:
+                ai_state, ai_error = job['state'], job['error']
+                if job['state'] == 'completed':
+                    try:
+                        self.photo_ai.eligible(job)
+                        findings += json.loads(job['result_json']).get('findings', [])
+                        model = json.loads(job['context_json'])['model']
+                        state = 'needs_review' if findings else 'ai_checked'
+                    except DomainError:
+                        ai_state = 'stale'
         with self.db.tx() as con:
             con.execute('INSERT INTO photo_quality_reviews VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(photo_id) DO UPDATE SET signature=excluded.signature,state=excluded.state,metrics=excluded.metrics,findings=excluded.findings,model=excluded.model,error=excluded.error,reviewed_at=excluded.reviewed_at',
                         (photo['id'], signature, state, dump(metrics), dump(findings), model, error, stamp))
-        return {'photo_id': photo['id'], 'signature': signature, 'state': state, 'metrics': metrics, 'findings': findings, 'model': model, 'error': error, 'reviewed_at': stamp}
+        return {'photo_id': photo['id'], 'signature': signature, 'state': state, 'metrics': metrics, 'findings': findings, 'model': model,
+                'error': error, 'reviewed_at': stamp, 'rule_state': rule_state, 'rule_error': rule_error, 'ai_state': ai_state, 'ai_error': ai_error}
+
+    def _local_photo_check(self, photo):
+        findings = []
+        def finding(code, title, detail, action):
+            findings.append({'code': code, 'title': title, 'detail': detail, 'action': action, 'source': 'rule'})
+        if not self.storage.verify(photo):
+            raise DomainError('原件缺失或内容校验失败')
+        with Image.open(self.storage.resolve(photo['stored_path'])) as original:
+            image = ImageOps.exif_transpose(original).convert('L')
+            width, height = image.size
+            image.thumbnail((512, 512))
+            brightness = ImageStat.Stat(image).mean[0]
+            edge = ImageStat.Stat(image.filter(ImageFilter.FIND_EDGES).crop((2, 2, image.width - 2, image.height - 2))).stddev[0] if min(image.size) > 5 else 0
+            metrics = {'width': width, 'height': height, 'brightness': round(brightness, 2), 'edge_stddev': round(edge, 2), 'min_short_side': 720}
+            if min(width, height) < 720:
+                finding('resolution', '照片分辨率偏低', f'原件 {width} × {height} 像素，短边低于建议值 720 像素。', '请核对细节是否可辨，优先补充未经压缩的原图。')
+            if brightness < 25 or brightness > 240:
+                finding('lighting', '照片疑似过暗或过亮', f'整图平均亮度 {brightness:.1f}/255；此项为图像指标提示。', '请检查主体和水印是否清楚，必要时调整光线补拍。')
+            if edge < 4:
+                finding('detail', '照片细节需要核对', f'边缘细节指标偏低（{edge:.1f}）；纯色墙面也可能触发，不能据此判定模糊。', '请核对原图中的维修主体和文字是否清晰。')
+        if photo['recognition_state'] not in ('pending', 'running'):
+            if photo['recognition_state'] in ('failed', 'conflict'):
+                finding('recognition', '照片识别失败或存在冲突', '当前识别状态：' + photo['recognition_state'], '请核对原图和识别结果，确认案件及照片用途。')
+            if not photo['watermark_time']:
+                finding('watermark', '水印时间尚未识别', '系统未取得可用的照片水印时间，并不表示原图没有水印。', '请核对水印是否完整可读，必要时补充带时间的原图。')
+            if photo.get('photo_group') not in PHOTO_GROUPS:
+                finding('classification', '照片用途待确认', '尚未确认查勘、施工或完工验收用途。', '请说明该照片的案件编号、拍摄阶段和维修部位。')
+        if not photo['case_id']:
+            finding('association', '照片所属案件待确认', '尚未关联具体案件，上传者身份不会自动决定所属案件。', '请补充完整报修编号或项目、楼栋及房号。')
+        return findings, metrics
 
     def review(self, run_id=None):
         if not self._review_lock.acquire(blocking=False):
             raise DomainError('项目检查正在进行，请等待完成', 409)
         run_id = run_id or self.request_review()['id']
         try:
+            origin = self.db.one('SELECT automatic FROM followup_run_requests WHERE run_id=?', (run_id,))
+            requested = bool(origin and not origin['automatic'])
             signature, stamp = self.signature(), now()
             with self.db.tx() as con:
                 con.execute("UPDATE followup_runs SET state='running',signature=?,error=NULL WHERE id=?", (signature, run_id))
             cases = self.followup_cases()
             photos = [p for p in self.db.all('SELECT p.*,b.hash,b.stored_path,b.media_type FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE b.media_type=\'image\'') if p['case_id'] in cases]
-            observed, failed = [], []
+            observed, failed, rule_failed, ai_states = [], [], set(), Counter()
             ai_reviewed = set()
             for photo in photos:
                 if self._stop.is_set():
                     raise DomainError('服务停止，检查将在重启后恢复')
                 case = cases.get(photo['case_id'])
-                assessment = self.analyse_photo(photo, case, force=True)
+                assessment = self.analyse_photo(photo, case, force=True, requested=requested)
+                ai_states[assessment['ai_state']] += 1
+                if assessment['rule_error']:
+                    rule_failed.add(photo['id'])
                 if assessment['model'] and not assessment['error']:
                     ai_reviewed.add(photo['id'])
                 if assessment['error']:
@@ -246,7 +279,7 @@ class ProjectFollowup:
                     observed.append({'issue_key': 'photo:' + photo['id'] + ':' + item['code'], 'project_id': case['project_id'] if case else photo['project_id'],
                                      'case_id': photo['case_id'], 'photo_id': photo['id'], 'kind': 'photo',
                                      'title': item['title'], 'detail': item['detail'], 'action': item['action'],
-                                     'evidence': {'source': item['source'], 'certainty': item.get('certainty'), 'photo_id': photo['id'], 'blob_hash': photo['blob_hash'], 'photo_revision': photo['revision'], 'metrics': assessment['metrics'], 'model': assessment['model'], 'trigger_at': photo['updated_at']},
+                                     'evidence': {'source': item['source'], 'certainty': item.get('certainty'), 'photo_id': photo['id'], 'blob_hash': photo['blob_hash'], 'photo_revision': photo['revision'], 'metrics': assessment['metrics'], 'model': assessment['model'], 'trigger_at': photo['updated_at'], 'recovered_analysis': bool(item.get('recovered_analysis'))},
                                      'signature': digest([photo['blob_hash'], photo['case_id'], photo['project_id'], item])})
             for case in cases.values():
                 applicable = PHOTO_STAGE_SCOPE.get(case['workflow_stage'], set())
@@ -280,16 +313,21 @@ class ProjectFollowup:
                                     (uid(), item['issue_key'], item['project_id'], item['case_id'], item['photo_id'], item['kind'], item['title'], item['detail'], item['action'], dump(item['evidence']), item['signature'], stamp, stamp, stamp))
                     counters[item['kind']] += 1
                 for old in con.execute("SELECT id,issue_key,photo_id,case_id,evidence FROM followup_issues WHERE state='open'").fetchall():
+                    if json.loads(old['evidence']).get('source') == 'agent':
+                        # A single-photo rule scan cannot resolve a joint case review.
+                        continue
                     # Leaving this workspace does not prove an old photo issue was fixed.
                     if old['case_id'] not in cases:
                         continue
                     # A failed model check cannot establish that an earlier issue disappeared.
                     closed = cases.get(old['case_id'], {}).get('workflow_stage') in ('closed', 'direct_payment', 'noncoverage')
                     unreviewed_ai = json.loads(old['evidence']).get('source') == 'ai' and old['photo_id'] not in ai_reviewed and not closed
-                    if old['issue_key'] not in seen and old['photo_id'] not in {v['photo_id'] for v in failed} and not unreviewed_ai:
+                    if old['issue_key'] not in seen and old['photo_id'] not in rule_failed and not unreviewed_ai:
                         con.execute("UPDATE followup_issues SET state='resolved',resolution='复查时该问题已不再满足触发条件',changed_at=? WHERE id=?", (stamp, old['id']))
-                result = {'scope': 'repair', 'photos': len(photos), 'cases': len(cases), 'issues': dict(counters), 'failed': failed, 'completed_at': now()}
-                con.execute('UPDATE followup_runs SET state=?,result=?,finished_at=? WHERE id=?', ('partial' if failed else 'completed', dump(result), now(), run_id))
+                result = {'scope': 'repair', 'photos': len(photos), 'cases': len(cases), 'issues': dict(counters), 'failed': failed,
+                          'rule_failed': len(rule_failed), 'ai_states': dict(ai_states), 'completed_at': now()}
+                incomplete = any(ai_states.get(v) for v in ('queued','running','waiting','failed','stale','not_requested'))
+                con.execute('UPDATE followup_runs SET state=?,result=?,finished_at=? WHERE id=?', ('partial' if failed or incomplete else 'completed', dump(result), now(), run_id))
             return result
         except Exception as exc:
             with self.db.tx() as con:
@@ -306,6 +344,7 @@ class ProjectFollowup:
         reviews = {q['photo_id']: q for q in self.db.all('SELECT photo_id,error,model FROM photo_quality_reviews')}
         confirmations = {c['issue_id']: c for c in self.db.all('SELECT * FROM followup_issue_confirmations')}
         sources = {s['photo_id']: s for s in self.db.all('SELECT photo_id,original_name,message_time FROM photo_sources ORDER BY received_at,id')}
+        agent_reviews = {}
         for row in rows:
             row['evidence'] = json.loads(row['evidence'])
             row['case_context'] = case_context(cases.get(row['case_id']))
@@ -313,7 +352,14 @@ class ProjectFollowup:
             photo = photos.get(row['photo_id'])
             token = digest({'case': row['case_context'], 'photo': photo, 'source': row['photo_source'],
                             'issue': [row['id'], row['generation'], row['signature']]})
-            row['feedback'] = classify_feedback(row, row['case_context'], photo, reviews.get(row['photo_id']),
+            review = reviews.get(row['photo_id'])
+            if row['evidence'].get('source') == 'agent':
+                run_id = row['evidence'].get('run_id', '')
+                if run_id not in agent_reviews:
+                    agent_reviews[run_id] = self.case_agent.evidence_review(run_id) if hasattr(self, 'case_agent') else {'error': '案件审阅服务不可用', 'model': ''}
+                review = agent_reviews[run_id]
+                token = digest({'token': token, 'agent': row['evidence'].get('run_signature'), 'current': not review['error']})
+            row['feedback'] = classify_feedback(row, row['case_context'], photo, review,
                                                 confirmations.get(row['id']), token)
         return rows
 
@@ -375,7 +421,7 @@ class ProjectFollowup:
         return {'scope': 'repair', 'case_count': len(cases), 'projects': projects, 'latest': latest,
                 'config': self.config(), 'unassigned_issues': 0,
                 'source': '查勘维修案件；办理阶段来自案件记录，资料检查仅包含相关本机归档原件',
-                'platform_sync': self.db.one("SELECT finished_at,state FROM platform_sync_runs ORDER BY started_at DESC LIMIT 1")}
+                'platform_sync': self.db.one("SELECT finished_at,state,mode FROM platform_sync_runs WHERE mode<>'single' ORDER BY started_at DESC LIMIT 1")}
 
     def _feedback_candidates(self, project_id, automatic):
         contact = self.db.one('SELECT * FROM followup_contacts WHERE project_id=?', (project_id,))
@@ -388,7 +434,8 @@ class ProjectFollowup:
         if automatic:
             cutoff = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat(timespec='milliseconds')
             # Give OCR and batches time to settle, and never notify historical gaps on binding.
-            issues = [i for i in issues if i['evidence'].get('trigger_at', '') > contact['enabled_at'] and contact['enabled_at'] < i['changed_at'] <= cutoff]
+            issues = [i for i in issues if i['evidence'].get('trigger_at', '') > contact['enabled_at'] and contact['enabled_at'] < i['changed_at'] <= cutoff
+                      and (not i['evidence'].get('recovered_analysis') or i['feedback'].get('basis') == 'human')]
             last = self.db.one("SELECT sent_at FROM followup_feedback WHERE project_id=? AND state='sent' ORDER BY sent_at DESC LIMIT 1", (project_id,))
             if last and last['sent_at'] and datetime.fromisoformat(last['sent_at']) > datetime.now(timezone.utc) - timedelta(minutes=5):
                 issues = []
@@ -474,10 +521,16 @@ class ProjectFollowup:
                     with self.db.tx() as con:
                         con.execute("UPDATE followup_feedback SET state='cancelled',error='案件已不在查勘维修跟进范围，已取消反馈' WHERE id=?", (delivery_id,))
                     return
-                latest = self.db.one("SELECT signature FROM followup_runs WHERE state IN ('completed','partial') ORDER BY created_at DESC LIMIT 1")
-                if not latest or latest['signature'] != self.signature():
-                    self.request_review()
-                    raise DomainError('资料发生变化，已安排重新检查；检查后再反馈')
+                agent_issues = [current_issues[i] for i in versions if current_issues[i]['evidence'].get('source') == 'agent']
+                if any(i['feedback']['state'] != 'ready' or digest(i['feedback']) != contexts.get(i['id']) for i in agent_issues):
+                    with self.db.tx() as con:
+                        con.execute("UPDATE followup_feedback SET state='cancelled',error='案件联合审阅依据已变化，请重新审阅并预览' WHERE id=?", (delivery_id,))
+                    return
+                if len(agent_issues) != len(versions):
+                    latest = self.db.one("SELECT signature FROM followup_runs WHERE state IN ('completed','partial') ORDER BY created_at DESC LIMIT 1")
+                    if not latest or latest['signature'] != self.signature():
+                        self.request_review()
+                        raise DomainError('资料发生变化，已安排重新检查；检查后再反馈')
                 for issue_id, generation in versions.items():
                     issue = self.db.one('SELECT * FROM followup_issues WHERE id=?', (issue_id,))
                     if not issue or issue['state'] != 'open' or issue['generation'] != generation or issue['feedback_generation'] >= generation:
@@ -491,7 +544,8 @@ class ProjectFollowup:
                         return
                     if issue['photo_id']:
                         photo = self.db.one('SELECT revision,case_id FROM photos WHERE id=?', (issue['photo_id'],))
-                        assessment = self.db.one('SELECT error FROM photo_quality_reviews WHERE photo_id=?', (issue['photo_id'],))
+                        evidence = json.loads(issue['evidence'])
+                        assessment = self.case_agent.evidence_review(evidence['run_id']) if evidence.get('source') == 'agent' else self.db.one('SELECT error FROM photo_quality_reviews WHERE photo_id=?', (issue['photo_id'],))
                         if not photo or photo['revision'] != json.loads(issue['evidence']).get('photo_revision') or photo['case_id'] != issue['case_id'] or not assessment or assessment['error']:
                             raise DomainError('所选照片的审核依据尚未核实，请先完成照片复查')
                 client = self.client(row['connector_id'])
@@ -572,7 +626,7 @@ class ProjectFollowup:
                 pending = self.db.one("SELECT * FROM followup_runs WHERE state='queued' ORDER BY created_at LIMIT 1")
                 latest = self.db.one("SELECT signature FROM followup_runs WHERE state IN ('completed','partial') ORDER BY created_at DESC LIMIT 1")
                 if not pending and self.config().get('auto_review') and (not latest or latest['signature'] != self.signature()):
-                    pending = self.request_review()
+                    pending = self.request_review(automatic=True)
                 if pending:
                     self.review(pending['id'])
                 for contact in self.db.all('SELECT project_id FROM followup_contacts WHERE auto_feedback=1'):

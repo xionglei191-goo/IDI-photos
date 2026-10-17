@@ -121,8 +121,10 @@ def save_visit(domain, case_id, data, visit_id=None):
                 target = visit_id if photo_id in ids else None
                 con.execute('UPDATE photos SET visit_id=?,revision=revision+1,updated_at=? WHERE id=?', (target, stamp, photo_id))
                 audit(con, 'photo', photo_id, 'assign_visit', old, {'visit_id': target})
-            con.execute('DELETE FROM visit_shared_checkins WHERE visit_id=?', (visit_id,))
-            con.executemany('INSERT INTO visit_shared_checkins VALUES(?,?,?)', [(pid, visit_id, stamp) for pid in shared_ids])
+            con.executemany('DELETE FROM visit_shared_checkins WHERE photo_id=? AND visit_id=?',
+                            [(pid, visit_id) for pid in set(previous_shared) - set(shared_ids)])
+            con.executemany('INSERT INTO visit_shared_checkins VALUES(?,?,?)',
+                            [(pid, visit_id, stamp) for pid in set(shared_ids) - set(previous_shared)])
             audit(con, 'visit', visit_id, 'create' if created else 'update', before,
                   {**fields, 'photo_ids': ids, 'shared_checkin_ids': shared_ids})
     except sqlite3.IntegrityError as error:

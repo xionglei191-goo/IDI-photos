@@ -17,12 +17,15 @@ def workflow_routes(workflow, reviews):
 
     @router.post('/sync')
     def sync(data: dict = Body(default={})):
-        if not workflow.platform.client.status()['connected']:
-            raise DomainError('请先连接官网再同步台账', 401)
-        active = workflow.db.one("SELECT id FROM jobs WHERE kind='platform_sync' AND state IN ('queued','running')")
-        if active:
-            return workflow.jobs.get(active['id'])
-        return workflow.jobs.enqueue('platform_sync', {'refresh_details': bool(data.get('refresh_details', False))})
+        return workflow.synchronizer.enqueue('full')
+
+    @router.put('/sync/policy')
+    def sync_policy(data: dict = Body(...)):
+        return workflow.synchronizer.configure(data)
+
+    @router.post('/sync/recent')
+    def sync_recent():
+        return workflow.synchronizer.enqueue('incremental')
 
     @router.get('/cases/{case_id}')
     def detail(case_id: str):

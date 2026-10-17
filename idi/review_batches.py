@@ -18,6 +18,7 @@ class ReviewBatches:
         self.db, self.platform = workflow.db, workflow.platform
         self._active = set()
         self._active_lock = threading.Lock()
+        self.automatic_uploads = None
 
     @contextmanager
     def _execution(self, review_id):
@@ -31,12 +32,14 @@ class ReviewBatches:
             with self._active_lock:
                 self._active.discard(review_id)
 
-    def snapshot(self, case_id, stage):
+    def snapshot(self, case_id, stage, *, save_only=False):
         plan = self.platform.preview(case_id, stage)
         case = plan['case']
         if not plan['access']['editable']:
             raise DomainError(plan['access']['reason'] + '请先刷新案件进度。', 409)
-        if plan['error_count']:
+        if save_only and stage not in ('survey', 'repair'):
+            raise DomainError('当前环节不支持逐步保存官网草稿', 409)
+        if self.platform.validation_errors(plan, allow_incomplete=save_only):
             raise DomainError(f"当前环节还有 {plan['error_count']} 项资料待补或待核对", 409)
         selected = []
         for field in plan['file_fields']:
@@ -53,18 +56,21 @@ class ReviewBatches:
                             'existing_files': {f['key']: f['existing'] for f in plan['file_fields']},
                             'draft_revision': plan['draft']['revision'], 'target': plan['link']['report_receiving_id'],
                             'link_revision': plan['link']['revision']}
+        if save_only:
+            fingerprint_data['save_only'] = True
+            plan = {**plan, 'actions': ['save'], 'save_only': True}
         fingerprint = hashlib.sha256(dump(fingerprint_data).encode()).hexdigest()
         return plan, fingerprint
 
-    def prepare(self, case_id, stage, expected_revision):
-        plan, fingerprint = self.snapshot(case_id, stage)
+    def prepare(self, case_id, stage, expected_revision, *, save_only=False):
+        plan, fingerprint = self.snapshot(case_id, stage, save_only=save_only)
         if expected_revision != plan['draft']['revision']:
             raise DomainError('草稿已经修改，请重新打开审核预览', 409)
         review_id = uid()
         with self.db.tx() as con:
             self.platform.require_editable(case_id, stage, con)
-            con.execute('INSERT INTO platform_review_batches(id,case_id,stage,fingerprint,snapshot,created_at) VALUES(?,?,?,?,?,?)',
-                        (review_id, case_id, stage, fingerprint, dump(plan), now()))
+            con.execute('INSERT INTO platform_review_batches(id,case_id,stage,fingerprint,snapshot,created_at,save_only) VALUES(?,?,?,?,?,?,?)',
+                        (review_id, case_id, stage, fingerprint, dump(plan), now(), int(save_only)))
         return self.get(review_id)
 
     def get(self, review_id):
@@ -80,12 +86,38 @@ class ReviewBatches:
         return row
 
     def confirm(self, review_id, fingerprint, local_only=False, action='submit'):
-        with self._execution(review_id):
+        with self._execution(review_id), self.platform.material_lock:
             self._confirm(review_id, fingerprint, local_only, action)
         return self.get(review_id)
 
-    def _confirm(self, review_id, fingerprint, local_only, action):
+    def save_for_agent(self, review_id, fingerprint, check_permission=None):
+        with self._execution(review_id), self.platform.material_lock:
+            self._confirm(review_id, fingerprint, False, 'save', draft_only=True, check_permission=check_permission)
+        return self.get(review_id)
+
+    def _verified_uploads(self, plan):
+        selected = {p['id']: p['blob_hash'] for field in plan['file_fields'] for p in field['selected']}
+        remote_ids = {str(f['id']) for field in plan['file_fields'] for f in field['existing'] if f.get('id')}
+        receipts = {}
+        for row in self.db.all("SELECT snapshot,result FROM platform_review_batches WHERE case_id=? AND stage=? AND state IN ('save_verified','verified') ORDER BY created_at", (plan['case']['id'], plan['stage'])):
+            snapshot, result = json.loads(row['snapshot']), json.loads(row['result'])
+            if snapshot['link']['report_receiving_id'] != plan['link']['report_receiving_id']:
+                continue
+            originals = {p['id']: p['blob_hash'] for field in snapshot['file_fields'] for p in field['selected']}
+            for photo_id, receipt in result.get('uploaded', {}).items():
+                if photo_id in selected and originals.get(photo_id) == selected[photo_id] and str(receipt.get('id')) in remote_ids:
+                    receipts[photo_id] = receipt
+        return receipts
+
+    def _confirm(self, review_id, fingerprint, local_only, action, draft_only=False, check_permission=None):
+        if check_permission:
+            check_permission()
         record = self.get(review_id)
+        save_only = bool(record.get('save_only'))
+        if save_only and action != 'save':
+            raise DomainError('本记录仅用于逐步保存草稿，请重新核对完整资料后提交', 403)
+        if draft_only and (action != 'save' or record['stage'] not in ('survey', 'repair')):
+            raise DomainError('Agent 没有此环节的正式提交权限', 403)
         if action not in ('save', 'submit') or action not in record['snapshot']['actions']:
             raise DomainError('此环节不支持所选官网操作')
         if record['fingerprint'] != fingerprint:
@@ -94,8 +126,10 @@ class ReviewBatches:
             raise DomainError('此记录已用于另一项官网操作，请重新打开审核预览', 409)
         if record['state'] in ('verified', 'submitted', 'saved', 'save_verified'):
             return record
+        if self.automatic_uploads and action == 'submit' and not local_only:
+            self.automatic_uploads.validate_submission(record)
         try:
-            plan, current = self.snapshot(record['case_id'], record['stage'])
+            plan, current = self.snapshot(record['case_id'], record['stage'], save_only=save_only)
         except DomainError:
             with self.db.tx() as con:
                 con.execute("UPDATE platform_review_batches SET state='stale' WHERE id=? AND state IN ('prepared','reviewed','failed')", (review_id,))
@@ -124,18 +158,21 @@ class ReviewBatches:
         if local_only:
             return self.get(review_id)
         uploaded = record['result'].get('uploaded', {})
+        reused = {}
         payload, response, attempted = None, None, False
         total = len({p['id'] for f in plan['file_fields'] for p in f['selected']})
         def progress(phase, **extra):
             self._result(review_id, {'action': action, 'phase': phase, 'uploaded': uploaded, 'file_total': total,
-                                    'remote_written': bool(uploaded), 'business_submitted': False, **extra})
+                                    'reused_uploads': list(reused), 'remote_written': bool(uploaded), 'business_submitted': False, **extra})
         try:
             progress('checking')
             # Re-read immediately before uploading. Never submit against a stale official stage.
             self.workflow.refresh_case(record['case_id'])
-            fresh_plan, fresh_fingerprint = self.snapshot(record['case_id'], record['stage'])
+            fresh_plan, fresh_fingerprint = self.snapshot(record['case_id'], record['stage'], save_only=save_only)
             if fresh_fingerprint != fingerprint:
                 raise DomainError('官网最新资料发生变化，请重新审核后提交', 409)
+            reused = self._verified_uploads(fresh_plan)
+            uploaded = {**reused, **uploaded}
             for field in plan['file_fields']:
                 for photo in field['selected']:
                     if photo['id'] in uploaded:
@@ -143,23 +180,33 @@ class ReviewBatches:
                     blob = self.db.one('SELECT * FROM blobs WHERE hash=?', (photo['blob_hash'],))
                     if not self.platform.storage.verify(blob):
                         raise DomainError('上传前原文件校验失败', 409)
+                    if check_permission:
+                        check_permission()
+                    if self.automatic_uploads and action == 'submit':
+                        self.automatic_uploads.validate_submission(record)
                     progress('uploading', current_file=photo['original_name'])
                     uploaded[photo['id']] = self.platform.client.upload(self.platform.storage.resolve(blob['stored_path']), photo['original_name'], blob['mime_type'])
                     progress('uploading')
             # Local edits during an upload invalidate the business submission, retaining upload receipts.
-            _, check = self.snapshot(record['case_id'], record['stage'])
+            _, check = self.snapshot(record['case_id'], record['stage'], save_only=save_only)
             if check != fingerprint:
                 raise DomainError('上传期间资料发生变化，已停止业务提交；已上传文件回执保留', 409)
-            payload = self.platform.build_payload(plan, action, uploaded)
+            payload = self.platform.build_payload(plan, action, uploaded, allow_incomplete=save_only)
             progress('saving' if action == 'save' else 'submitting', payload=payload, business_submitted='sending')
             # Freeze local edits through the final check and business request.
             with self.db.tx() as con:
-                _, final_fingerprint = self.snapshot(record['case_id'], record['stage'])
+                _, final_fingerprint = self.snapshot(record['case_id'], record['stage'], save_only=save_only)
                 if final_fingerprint != fingerprint:
                     raise DomainError('提交前资料发生变化，请重新审核', 409)
+                if check_permission:
+                    check_permission()
+                if self.automatic_uploads and action == 'submit':
+                    self.automatic_uploads.validate_submission(record)
                 attempted = True
-                response = self.platform.client.submit(record['stage'], payload)
+                response = (self.platform.client.save_draft_only(record['stage'], payload) if draft_only
+                            else self.platform.client.submit(record['stage'], payload))
                 result = {'action': action, 'phase': 'readback', 'file_total': total, 'uploaded': uploaded, 'payload': payload,
+                          'reused_uploads': list(reused),
                           'response_code': response.get('code'), 'remote_written': True, 'business_submitted': action == 'submit', 'operation_confirmed': True}
                 con.execute('UPDATE platform_review_batches SET result=?,state=?,finished_at=? WHERE id=?', (dump(result), 'saved' if action == 'save' else 'submitted', now(), review_id))
         except Exception as error:
@@ -184,7 +231,7 @@ class ReviewBatches:
                 con.execute('UPDATE platform_review_batches SET result=? WHERE id=?', (dump(result), review_id))
 
     def reconcile(self, review_id):
-        with self._execution(review_id):
+        with self._execution(review_id), self.platform.material_lock:
             self._reconcile(review_id)
         return self.get(review_id)
 

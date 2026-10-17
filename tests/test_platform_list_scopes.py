@@ -31,7 +31,11 @@ def test_independent_official_lists_exclude_local_sample_and_keep_stage_filters(
     repair = deepcopy(platform.test_row)
     platform.test_claim.update(flowStatus='9', endStatus='0')
     lists = {'intake': [intake], 'repair': [repair]}
-    monkeypatch.setattr(platform.client, 'all_rows', lambda scope, archived: deepcopy(lists[scope]) if archived is None else pytest.fail('Must read unfiltered website list'))
+    def search(**args):
+        assert args.get('end_status') is None
+        values = deepcopy(lists[args['scope']])
+        return {'items': values, 'total': len(values)}
+    monkeypatch.setattr(platform.client, 'search', search)
     result = workflow.sync({}, lambda *_: None)
     assert result['state'] == 'completed'
     assert domain.case(case['id'])['workflow_stage'] == 'repair'
@@ -65,7 +69,7 @@ def test_incomplete_sync_keeps_previous_published_lists(platform, services, case
 def test_completed_empty_official_lists_do_not_fall_back_to_old_local_workflow(platform, services, case, monkeypatch):
     workflow = services['workflow']
     workflow.sync({}, lambda *_: None)
-    monkeypatch.setattr(platform.client, 'all_rows', lambda *_: [])
+    monkeypatch.setattr(platform.client, 'search', lambda **_: {'items': [], 'total': 0})
     assert workflow.sync({}, lambda *_: None)['state'] == 'completed'
     assert workflow.board('intake')['source'] == 'platform'
     assert workflow.board('work')['total'] == 0

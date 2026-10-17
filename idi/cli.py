@@ -54,8 +54,32 @@ def restore(source: Path, target: Path, resume=False):
         if con.execute("PRAGMA foreign_key_check").fetchone():
             raise ValueError("恢复数据库关联检查失败")
         if not resume:
+            con.execute("INSERT INTO settings VALUES('automatic_upload_policy',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps({'enabled': False, 'activated_at': ''}),))
+            policy = con.execute("SELECT value FROM settings WHERE key='workflow_policy'").fetchone()
+            value = json.loads(policy[0]) if policy else {}
+            value.update(rules_enabled=False, auto_drafts=False)
+            con.execute("INSERT INTO settings VALUES('workflow_policy',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(value),))
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='photo_ai_tasks'").fetchone():
+                con.execute("UPDATE photo_ai_tasks SET state='cancelled',error='从备份恢复，请核对资料后重新分析' WHERE state IN ('queued','waiting','running')")
+                con.execute("UPDATE rule_draft_intents SET state='needs_check',error='从备份恢复，需核对原审核批次' WHERE state='running'")
+                con.execute("UPDATE rule_draft_intents SET state='cancelled',error='从备份恢复，未继续官网保存' WHERE state IN ('queued','awaiting_login','read_only')")
+            schedule = con.execute("SELECT value FROM settings WHERE key='platform_sync_policy'").fetchone()
+            value = json.loads(schedule[0]) if schedule else {}
+            value['enabled'] = False
+            con.execute("INSERT INTO settings VALUES('platform_sync_policy',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(value),))
+            if con.execute("SELECT 1 FROM pragma_table_info('platform_sync_runs') WHERE name='retry_at'").fetchone():
+                con.execute("UPDATE platform_sync_runs SET state='cancelled',retry_at=NULL,error='从备份恢复，自动同步暂停' WHERE state IN ('running','queued','partial')")
             con.execute("UPDATE connectors SET enabled=0,status='disabled',error='从备份恢复，等待重新启用'")
             con.execute("UPDATE jobs SET state='failed',error='从备份恢复，等待手动重试' WHERE state IN ('queued','running')")
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='case_agent_runs'").fetchone():
+                con.execute("UPDATE case_agent_runs SET state='cancelled',error='从备份恢复，请重新发起审阅' WHERE state IN ('queued','running')")
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_chat_turns'").fetchone():
+                con.execute("UPDATE workspace_chat_turns SET state='cancelled',progress='已停止',error='从备份恢复，请重新发送问题' WHERE state IN ('queued','running')")
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feishu_agent_bindings'").fetchone():
+                con.execute('UPDATE feishu_agent_bindings SET enabled=0,revision=revision+1')
+                con.execute("UPDATE feishu_agent_tasks SET state='cancelled',error='从备份恢复，请核对原任务后重新启用群助手' WHERE state IN ('queued','running')")
+                con.execute("UPDATE feishu_agent_outbox SET state='cancelled',error='从备份恢复，未自动发送' WHERE state IN ('queued','failed')")
+                con.execute("UPDATE feishu_agent_outbox SET state='unknown',error='恢复前发送结果需人工核对' WHERE state='sending'")
             if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='followup_contacts'").fetchone():
                 con.execute('UPDATE followup_contacts SET auto_feedback=0')
                 con.execute("UPDATE followup_feedback SET state='cancelled',error='从备份恢复，需重新确认反馈' WHERE state IN ('queued','failed')")

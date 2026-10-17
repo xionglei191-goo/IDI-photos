@@ -70,9 +70,10 @@ class Storage:
                     out = io.BytesIO()
                     preview.save(out, "JPEG", quality=82)
                     thumb = f"thumbnails/{digest[:2]}/{digest}.jpg"
-                    self._atomic(self.resolve(thumb), out.getvalue())
             except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as error:
                 raise ValueError("文件无法解码为图片") from error
+            # Filesystem failures are archive failures, not invalid image data.
+            self._atomic(self.resolve(thumb), out.getvalue())
         stored = f"originals/{digest[:2]}/{digest}{suffix}"
         self._atomic(self.resolve(stored), data)
         blob = {"hash": digest, "stored_path": stored, "thumbnail_path": thumb, "extension": suffix,
@@ -105,6 +106,10 @@ class Storage:
         return None
 
     def verify(self, blob: dict) -> bool:
+        if 'stored_path' not in blob and blob.get('blob_hash'):
+            blob = self.db.one('SELECT * FROM blobs WHERE hash=?', (blob['blob_hash'],))
+            if not blob:
+                return False
         path = self.resolve(blob["stored_path"])
         if not path.is_file():
             return False

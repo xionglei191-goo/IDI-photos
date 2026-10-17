@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import re
+import hashlib
+import json
+from copy import deepcopy
 from datetime import datetime
 
 from .platform_contract import STAGES
@@ -41,6 +44,36 @@ def _stamp(value):
 
 def _unique(values):
     return list(dict.fromkeys(v.strip() for v in values if isinstance(v, str) and v.strip()))
+
+
+def canonical_value(field, value):
+    value = '' if value is None else str(value).strip()
+    if field['kind'] == 'datetime' and (stamp := _stamp(value)):
+        return stamp.strftime('%Y-%m-%d %H:%M:%S')
+    if field['kind'] == 'integer' and value.isdigit():
+        return str(int(value))
+    return value
+
+
+def input_signature(case, photos, defaults=None):
+    # An added or reclassified photo invalidates an automatic draft value even
+    # before the queue has processed the photo. Manual values have no such guard.
+    data = {'case': {k: case.get(k) for k in ('id', 'project_id', 'platform_report_code', 'short_code', 'workflow_stage', 'title', 'repair_parts')},
+            'photos': sorted((p['id'], p['revision'], p['blob_hash']) for p in photos)}
+    if defaults:
+        data['defaults'] = defaults
+    return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def without_automatic_remote(link, stage, sources, fields):
+    link = deepcopy(link)
+    remote = link.get('snapshot', {}).get(stage, {})
+    for key, source in sources.items():
+        if source['origin'] == 'automatic' and key in fields and key in remote and canonical_value(fields[key], remote[key]) == canonical_value(fields[key], source['value']):
+            # A draft previously saved by this queue is not independent evidence
+            # for the value that the queue is currently deriving.
+            remote.pop(key)
+    return link
 
 
 def _sites(texts):
@@ -106,6 +139,8 @@ def survey_suggestions(case, link, photos, selections, values, dictionaries):
             ('最早查勘打卡' if checkins else '查勘问题照片') + '水印：' + photo['original_name'] + '；请核对实际到场时间', [photo['id']])
     elif len(dates) > 1:
         notes['siteSurveyDate'] = '所选查勘照片来自多个日期，请选择本次照片或填写实际查勘时间。'
+    elif 'siteSurveyDate' not in suggestions:
+        notes['siteSurveyDate'] = '没有本次查勘打卡或问题照片的有效水印时间；维修打卡时间不能直接当作查勘时间。'
 
     problem = [p for p in survey if p['photo_group'] == 'survey_problem']
     descriptions = _unique([case.get('title', ''), *[p.get('process', '') for p in problem]])
@@ -151,4 +186,65 @@ def survey_suggestions(case, link, photos, selections, values, dictionaries):
         add('repairMethod', '1', '同案施工照片水印与本次查勘在同一天；请核对实际维修安排', [p['id'] for p in work])
         if str(values.get('repairMethod') or suggestions.get('repairMethod', {}).get('value')) == '1':
             add('planRepairDate', survey_at.strftime('%Y-%m-%d'), '同日施工照片水印日期', [p['id'] for p in work])
+    if 'repairMethod' not in suggestions and not values.get('repairMethod'):
+        notes['repairMethod'] = '尚未确认查勘与维修的实际安排，无法自动选择当天维修、计划维修或零注拒。'
+    if not values.get('repairUserId') and 'repairUserId' not in suggestions:
+        notes['repairUserId'] = '请确认本次实际维修人员；官网候选人员列表本身不能证明谁已到场。'
+    if not values.get('estimateRestorationCostCode') and 'estimateRestorationCostCode' not in suggestions:
+        notes['estimateRestorationCostCode'] = '现有资料没有明确的费用预估范围，请按实际核价选择。'
     return suggestions, notes
+
+
+def repair_suggestions(case, link, photos, selections, values, dictionaries):
+    suggestions, notes = {}, {}
+    remote = link.get('snapshot', {}).get('repair', {}) if link.get('verified_at') else {}
+    for key in ('approachStartWorkDate', 'finishWorkDate'):
+        if stamp := _stamp(remote.get(key)):
+            suggestions[key] = {'value': stamp.strftime('%Y-%m-%d %H:%M:%S'), 'source': '官网已保存的修复成果记录', 'photo_ids': [], 'needs_review': False}
+    valid = [p for p in photos if p.get('case_id') == case['id'] and p.get('media_type') == 'image'
+             and p.get('recognition_state') in ('recognized', 'confirmed')]
+    chosen_checkins = {pid for key in ('buildingFileInfoList', 'houseFileInfoList') for pid in selections.get(key, [])}
+    chosen_finished = set(selections.get('recoveredFileInfo', []))
+    groups = {
+        'approachStartWorkDate': [p for p in valid if (p.get('photo_group') == 'work_checkin' or p.get('shared_checkin_visit_id'))
+                                  and (not chosen_checkins or p['id'] in chosen_checkins)],
+        'finishWorkDate': [p for p in valid if p.get('photo_group') == 'completion' and (not chosen_finished or p['id'] in chosen_finished)],
+    }
+    for key, candidates in groups.items():
+        if key in suggestions:
+            continue
+        timed = [(p, stamp) for p in candidates if (stamp := _stamp(p.get('watermark_time')))]
+        dates = {stamp.date() for _, stamp in timed}
+        if not timed:
+            notes[key] = '没有本次' + ('施工打卡' if key == 'approachStartWorkDate' else '完工照片') + '的有效水印时间，请核对实际时间。'
+        elif len(dates) > 1:
+            notes[key] = '照片来自多个日期，请选定本次' + ('进场打卡' if key == 'approachStartWorkDate' else '完工') + '资料后再填写。'
+        elif len(timed) != len(candidates):
+            notes[key] = '部分照片缺少有效水印时间，请核对本次资料。'
+        else:
+            photo, stamp = (min if key == 'approachStartWorkDate' else max)(timed, key=lambda pair: (pair[1], pair[0]['id']))
+            suggestions[key] = {'value': stamp.strftime('%Y-%m-%d %H:%M:%S'),
+                'source': ('最早施工打卡' if key == 'approachStartWorkDate' else '最后一张完工照片') + '水印：' + photo['original_name'] + '；请核对实际时间',
+                'photo_ids': [p['id'] for p in candidates], 'needs_review': True}
+    start = _stamp(values.get('approachStartWorkDate') or suggestions.get('approachStartWorkDate', {}).get('value'))
+    end = _stamp(values.get('finishWorkDate') or suggestions.get('finishWorkDate', {}).get('value'))
+    if start and end and end < start:
+        suggestions.pop('finishWorkDate', None)
+        notes['finishWorkDate'] = '完工照片时间早于进场时间，请核对是否混入其他次维修资料。'
+    return suggestions, notes
+
+
+def stage_suggestions(stage, case, link, photos, selections, values, dictionaries, defaults=None):
+    if stage == 'survey':
+        suggestions, notes = survey_suggestions(case, link, photos, selections, values, dictionaries)
+        key = 'estimateRestorationCostCode'
+        default = (defaults or {}).get(key)
+        option = next((o for o in dictionaries.get('estimate_restoration_cost', []) if o['code'] == default), None)
+        if key not in suggestions and option:
+            suggestions[key] = {'value': option['code'], 'source': '按已确认的预填默认设置：修复预估 ' + option['name'],
+                                'photo_ids': [], 'needs_review': False}
+            notes.pop(key, None)
+        return suggestions, notes
+    if stage == 'repair':
+        return repair_suggestions(case, link, photos, selections, values, dictionaries)
+    return {}, {}

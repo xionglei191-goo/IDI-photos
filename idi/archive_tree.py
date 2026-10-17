@@ -117,12 +117,9 @@ class ArchiveTree:
         project_dirs = distinct_names(projects, lambda r: r["name"], 36, reserved=("待归档",))
         case_names = distinct_names(cases, case_caption, 56, always_suffix=True)
         case_dirs = {r["id"]: project_dirs[r["project_id"]] + "/" + case_names[r["id"]] for r in cases}
-        directories, files, used_paths = {"待归档"}, {}, set()
-        for folder in project_dirs.values():
-            directories.update((folder, folder + "/待归档"))
-        for folder in case_dirs.values():
-            directories.add(folder)
-            directories.update(folder + "/" + stage for stage in (*TREE_STAGES.values(), "报送资料"))
+        # Metadata alone must not create folders. Each local file adds only the
+        # project, case and stage directories needed to expose that file.
+        directories, files, used_paths = set(), {}, set()
 
         def add(key, relative, source, expected):
             if relative.casefold() in used_paths:

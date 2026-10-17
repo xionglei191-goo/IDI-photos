@@ -76,76 +76,14 @@ class Workflow:
     def __init__(self, db, domain, platform, jobs=None):
         self.db, self.domain, self.platform, self.jobs = db, domain, platform, jobs
         self._sync_lock = threading.Lock()
+        from .platform_sync import PlatformSync
+        self.synchronizer = PlatformSync(self)
 
     def sync_status(self):
-        return {'latest': self.db.one('SELECT * FROM platform_sync_runs ORDER BY started_at DESC LIMIT 1'),
-                'last_complete': self.db.one("SELECT * FROM platform_sync_runs WHERE state='completed' ORDER BY finished_at DESC LIMIT 1"),
-                'lists': self.db.setting('platform_lists')}
+        return self.synchronizer.status()
 
     def sync(self, payload, progress):
-        if not self._sync_lock.acquire(blocking=False):
-            raise DomainError('官网台账正在同步，请等待本次完成', 409)
-        run_id, stamp = uid(), now()
-        created, updated, errors, scopes, merged, lists = 0, 0, [], [], {}, {}
-        try:
-            session = self.platform.client.status()
-            if not session['connected']:
-                raise DomainError('请先连接官网再同步台账', 401)
-            with self.db.tx() as con:
-                con.execute('INSERT INTO platform_sync_runs(id,state,account,started_at) VALUES(?,?,?,?)',
-                            (run_id, 'running', session.get('account', ''), stamp))
-            # Keep both unfiltered website lists. List membership and current
-            # workflow stage are independent, and a case may occur in both lists.
-            for scope in ('intake', 'repair'):
-                rows = self.platform.client.all_rows(scope, None)
-                lists[scope] = rows
-                scopes.append({'scope': scope, 'archived': 'all', 'count': len(rows)})
-                for row in rows:
-                    key = row['reportReceivingId']
-                    previous = merged.get(key)
-                    # A pending insurer audit still blocks business submission,
-                    # without removing the case from either official list.
-                    if previous and str(previous['row'].get('flowStatus')) == '3' and str(row.get('flowStatus')) not in ('2', '9'):
-                        continue
-                    merged[key] = {'row': row, 'scope': scope}
-            progress(0, len(merged))
-            for index, (record_id, entry) in enumerate(merged.items(), 1):
-                try:
-                    if self.platform.client.status() != session:
-                        raise DomainError('官网连接在同步期间发生变化，请重新同步台账', 409)
-                    link = self.db.one('SELECT * FROM platform_links WHERE report_receiving_id=?', (record_id,))
-                    previous = json.loads(link['snapshot']) if link else {}
-                    changed = previous.get('row') != entry['row'] or previous.get('scope') != entry['scope']
-                    if changed or not previous.get('claim') or payload.get('refresh_details'):
-                        snapshot = self.platform.client.snapshot_from_row(entry['row'], entry['scope'])
-                    else:
-                        snapshot = {**previous, 'row': entry['row'], 'scope': entry['scope'], 'fetched_at': now()}
-                    if self.platform.client.status() != session or snapshot.get('account') != session.get('account'):
-                        raise DomainError('官网连接在回读期间发生变化，本案未更新', 409)
-                    result = self.apply_snapshot(snapshot)
-                    created += result['created']
-                    updated += not result['created']
-                except Exception as error:
-                    errors.append({'record_id': record_id, 'error': str(error)[:350]})
-                progress(index, len(merged))
-            state = 'partial' if errors else 'completed'
-            if self.platform.client.status() != session:
-                raise DomainError('官网连接在同步期间发生变化，本次未更新看板范围', 409)
-            result = {'state': state, 'run_id': run_id, 'total': len(merged), 'created': created, 'updated': updated,
-                      'errors': errors, 'scopes': scopes, 'list_counts': {k: len(v) for k, v in lists.items()}, 'remote_written': False}
-            with self.db.tx() as con:
-                if state == 'completed':
-                    self.publish_lists(con, lists, run_id, now())
-                con.execute('UPDATE platform_sync_runs SET state=?,finished_at=?,total=?,created_count=?,updated_count=?,error=?,details=? WHERE id=?',
-                            (state, now(), len(merged), created, updated, f'{len(errors)} 个案件未完成回读' if errors else None, dump(result), run_id))
-            return result
-        except Exception as error:
-            with self.db.tx() as con:
-                con.execute("UPDATE platform_sync_runs SET state='failed',finished_at=?,error=?,details=? WHERE id=?",
-                            (now(), str(error)[:1000], dump({'scopes': scopes, 'remote_written': False}), run_id))
-            raise
-        finally:
-            self._sync_lock.release()
+        return self.synchronizer.run(payload, progress)
 
     def publish_lists(self, con, lists, run_id, read_at):
         """Publish only a fully read, fully linked pair of official lists."""
@@ -166,7 +104,7 @@ class Workflow:
         con.execute('DELETE FROM platform_list_entries')
         con.executemany('INSERT INTO platform_list_entries VALUES(?,?,?,?,?,?,?)', entries)
         con.execute("INSERT INTO settings VALUES('platform_lists',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (dump({'run_id': run_id, 'read_at': read_at, 'counts': {k: len(v) for k, v in lists.items()}}),))
+                    (dump({'run_id': run_id, 'read_at': read_at, 'coverage': 'full', 'counts': {k: len(v) for k, v in lists.items()}}),))
 
     def apply_snapshot(self, snapshot, case_id=None):
         row = {**snapshot.get('claim', {}), **snapshot.get('row', {})}
@@ -181,6 +119,10 @@ class Workflow:
         stamp = now()
         read_at = snapshot.get('fetched_at') or stamp
         with self.db.tx() as con:
+            current_link = con.execute('SELECT case_id,verified_at FROM platform_links WHERE report_receiving_id=?', (record_id,)).fetchone()
+            if current_link and current_link['verified_at'] and current_link['verified_at'] > read_at:
+                current = con.execute('SELECT workflow_stage FROM cases WHERE id=?', (current_link['case_id'],)).fetchone()
+                return {'case_id': current_link['case_id'], 'created': False, 'stage': current['workflow_stage'], 'stale_ignored': True}
             linked = con.execute('SELECT case_id FROM platform_links WHERE report_receiving_id=?', (record_id,)).fetchone()
             by_code = con.execute('SELECT id FROM cases WHERE platform_report_code=?', (code,)).fetchone()
             matches = {v for v in (case_id, linked['case_id'] if linked else None, by_code['id'] if by_code else None) if v}
@@ -378,7 +320,9 @@ class Workflow:
         return {'items': items, 'total': total, 'page': page, 'page_size': page_size, 'counts': counters,
                 'source': source, 'source_total': source_total, 'photo_groups': PHOTO_GROUPS, 'sync': self.sync_status()}
 
-    def refresh_case(self, case_id):
+    def refresh_case(self, case_id, check_permission=None):
+        if check_permission:
+            check_permission()
         link = self.platform.link(case_id)
         if not link['report_receiving_id']:
             raise DomainError('请先关联官网案件')
@@ -398,5 +342,11 @@ class Workflow:
             except DomainError as error:
                 if error.status != 404:
                     raise
-        self.apply_snapshot(snapshot, case_id)
+        if check_permission:
+            check_permission()
+            current_link = self.platform.link(case_id)
+            if current_link['report_receiving_id'] != link['report_receiving_id'] or current_link['revision'] != link['revision']:
+                raise DomainError('官网关联已变化，请重新查询后刷新', 409)
+        result = self.apply_snapshot(snapshot, case_id)
+        self.synchronizer.record_single(snapshot, result['case_id'])
         return self.detail(case_id)
