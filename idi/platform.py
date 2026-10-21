@@ -15,6 +15,7 @@ from .domain import Domain, DomainError
 from .platform_client import PlatformClient, external_id, unsubmitted_report
 from .platform_contract import STAGES, VERSION, contract, visible
 from .platform_prefill import canonical_value, input_signature, stage_suggestions, without_automatic_remote
+from .platform_photos import active_attachment
 from .storage import Storage, safe_name
 from .stage_access import stage_access
 from .workflow import remote_stage
@@ -55,6 +56,10 @@ class PlatformPreparation:
         self.db, self.domain, self.storage, self.client = db, domain, storage, client
         self.workflow = None
         self.material_lock = threading.RLock()
+        from .platform_media import PlatformMedia
+        self.media = PlatformMedia(self)
+        from .attachment_removals import AttachmentRemovals
+        self.removals = AttachmentRemovals(self)
 
     def dictionaries(self):
         initial = json.loads(Path(__file__).with_name("platform_dictionary.json").read_text(encoding="utf-8"))
@@ -95,7 +100,7 @@ class PlatformPreparation:
             return {"case_id": case_id, "report_receiving_id": "", "platform_report_code": "", "insurer_report_number": "",
                     "snapshot": {}, "verified_at": None, "revision": 0, "updated_at": None, "node": "尚未核对官网案件"}
         row["snapshot"] = json.loads(row["snapshot"])
-        row["node"] = node_hint(row["snapshot"]) if row["verified_at"] else "编号已记录，尚未在线核对"
+        row["node"] = node_hint(row["snapshot"]) if row["verified_at"] or row["snapshot"].get('list_verified_at') else "编号已记录，尚未在线核对"
         return row
 
     def save_link(self, case_id, data, snapshot=None):
@@ -188,6 +193,11 @@ class PlatformPreparation:
             return result
         return dict(repair)
 
+    def removed_files(self, link, stage):
+        snapshot = {**link['snapshot'], **{section: link['snapshot'].get('removed_attachments', {}).get(section, {})
+                                          for section in ('claim', 'survey', 'repair')}}
+        return self._remote({**link, 'snapshot': snapshot}, stage)
+
     def draft(self, case_id, stage):
         definition = self._stage(stage)
         link = self.link(case_id)
@@ -204,7 +214,7 @@ class PlatformPreparation:
             # the crew count already returned by the official record.
             values.setdefault("repairCrewNumber", "1")
         candidates = self._photos(case_id)
-        selections = {f['key']: [p['id'] for p in candidates if (p['stage'] == f['suggest'][0] or (f['suggest'][0] == 'work' and p.get('shared_checkin_visit_id'))) and p['role'] == f['suggest'][1]
+        selections = {f['key']: [p['id'] for p in candidates if (p['stage'] == f['suggest'][0] or (f['suggest'][0] == 'work' and p.get('shared_checkin_visit_id') and not p.get('reuse_copy_id'))) and p['role'] == f['suggest'][1]
                                  and p['recognition_state'] != 'conflict' and ('.' + p['original_name'].rsplit('.', 1)[-1].lower()) in f['extensions']]
                       for f in definition['fields'] if f.get('suggest') and not f.get('readonly')}
         return {"case_id": case_id, "stage": stage, "values": values, "files": selections, "revision": 0,
@@ -250,6 +260,18 @@ class PlatformPreparation:
         for row in self.db.all('SELECT * FROM platform_draft_field_sources WHERE case_id=? AND stage=?', (case_id, stage)):
             result[row['field']] = {**row, 'photo_ids': json.loads(row['photo_ids']), 'needs_review': bool(row['needs_review'])}
         return result
+
+    def manual_file_selections(self, case_id, stage):
+        """Return current, field-scoped choices without changing photo labels."""
+        return {(r['field'], r['photo_id']) for r in self.db.all(
+            'SELECT m.field,m.photo_id FROM platform_manual_file_selections m '
+            'JOIN photos p ON p.id=m.photo_id AND p.case_id=m.case_id '
+            'AND p.revision=m.photo_revision AND p.blob_hash=m.blob_hash '
+            'JOIN platform_drafts d ON d.case_id=m.case_id AND d.stage=m.stage '
+            'AND d.target_report_id=m.target_report_id '
+            'JOIN platform_links l ON l.case_id=m.case_id AND l.report_receiving_id=m.target_report_id '
+            'WHERE m.case_id=? AND m.stage=? AND m.target_report_id<>\'\'',
+            (case_id, stage))}
 
     def prefill_draft(self, case_id, stage, allowed_photo_ids):
         """Refresh automatic values from current evidence, retaining manual input."""
@@ -319,21 +341,49 @@ class PlatformPreparation:
                 raise DomainError("本地草稿已被修改，请刷新后重试", 409)
             previous_files = json.loads(before['files_json']) if before else self.draft(case_id, stage)['files']
             if actor == 'local':
+                if stage == 'repair':
+                    from .checkin_copies import CHECKIN_FIELDS, copy_for_work
+                    remote = self._remote(self.link(case_id), stage)
+                    repair_date = values.get('approachStartWorkDate') or remote.get('approachStartWorkDate')
+                    for field, role in CHECKIN_FIELDS.items():
+                        copied = []
+                        for photo_id in selections.get(field, []):
+                            source = con.execute('SELECT stage,photo_group,role FROM photos WHERE id=?', (photo_id,)).fetchone()
+                            if source['stage'] == 'survey' and source['photo_group'] == 'survey_checkin' and source['role'] == role:
+                                photo_id, _ = copy_for_work(con, photo_id, case_id, repair_date=repair_date)
+                            copied.append(photo_id)
+                        if field in selections:
+                            selections[field] = list(dict.fromkeys(copied))
                 for field, ids in previous_files.items():
                     for photo_id in set(ids) - set(selections.get(field, [])):
                         con.execute('INSERT OR IGNORE INTO platform_draft_exclusions VALUES(?,?,?,?,?)', (case_id, stage, field, photo_id, now()))
                 for field, ids in selections.items():
                     for photo_id in ids:
                         con.execute('DELETE FROM platform_draft_exclusions WHERE case_id=? AND stage=? AND field=? AND photo_id=?', (case_id, stage, field, photo_id))
+                        con.execute('DELETE FROM platform_attachment_blocks WHERE case_id=? AND stage=? AND field=? '
+                                    'AND blob_hash=(SELECT blob_hash FROM photos WHERE id=?)', (case_id, stage, field, photo_id))
             else:
                 for field, ids in selections.items():
                     for photo_id in set(ids) - set(previous_files.get(field, []) if before else []):
                         if con.execute('SELECT 1 FROM platform_draft_exclusions WHERE case_id=? AND stage=? AND field=? AND photo_id=?', (case_id, stage, field, photo_id)).fetchone():
                             raise DomainError('此附件已被人工排除，请刷新后核对', 409)
+                        if con.execute('SELECT 1 FROM platform_attachment_blocks WHERE case_id=? AND stage=? AND field=? '
+                                       'AND blob_hash=(SELECT blob_hash FROM photos WHERE id=?)', (case_id, stage, field, photo_id)).fetchone():
+                            raise DomainError('此照片已被人工撤回，不能自动重新加入', 409)
             con.execute("""INSERT INTO platform_drafts VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(case_id,stage) DO UPDATE SET values_json=excluded.values_json,files_json=excluded.files_json,
                 target_report_id=excluded.target_report_id,revision=excluded.revision,updated_at=excluded.updated_at""",
                 (case_id, stage, dump(values), dump(selections), current_link["report_receiving_id"] if current_link else "", revision + 1, now()))
+            if actor == 'local':
+                for field, ids in selections.items():
+                    for photo_id in ids:
+                        photo = con.execute('SELECT revision,blob_hash FROM photos WHERE id=?', (photo_id,)).fetchone()
+                        con.execute('INSERT INTO platform_manual_file_selections VALUES(?,?,?,?,?,?,?,?) '
+                                    'ON CONFLICT(case_id,stage,field,photo_id) DO UPDATE SET '
+                                    'photo_revision=excluded.photo_revision,blob_hash=excluded.blob_hash,'
+                                    'target_report_id=excluded.target_report_id,created_at=excluded.created_at',
+                                    (case_id, stage, field, photo_id, photo['revision'], photo['blob_hash'],
+                                     current_link['report_receiving_id'] if current_link else '', now()))
             if automatic_sources is not None:
                 con.execute("DELETE FROM platform_draft_field_sources WHERE case_id=? AND stage=? AND origin='automatic'", (case_id, stage))
                 for key, source in automatic_sources.items():
@@ -406,12 +456,14 @@ class PlatformPreparation:
 
         if not link["report_receiving_id"]:
             issue("binding", "尚未关联官网案件，报修编号和保司报案编号不能代替官网记录 ID。")
-        elif not link["verified_at"]:
+        elif not link["verified_at"] and not link['snapshot'].get('list_verified_at'):
             issue("binding", "官网编号尚未在线核对，请连接官网查询并关联真实案件。")
         if saved["revision"] and saved["target_report_id"] != link["report_receiving_id"]:
             issue("binding", "官网关联已变更，请核对本环节内容后重新保存本地草稿。")
         if link["verified_at"]:
             issue("snapshot", "官网信息读取于 " + link["verified_at"] + "；办理前需刷新节点和已有资料。", "warning")
+        elif link['snapshot'].get('list_verified_at'):
+            issue('snapshot', '已核对官网列表状态；详情和附件尚未读取，可按需手动刷新。', 'warning')
         row = link["snapshot"].get("row", {})
         if case['workflow_stage'] not in ('historical_unverified', 'insurer_intake') and unsubmitted_report(row, link['snapshot'].get('scope')):
             issue("node", "官网报案仍为保存状态，请先完成官网报案提交后再办理受理。")
@@ -482,6 +534,7 @@ class PlatformPreparation:
 
         photos = self._photos(case_id)
         photo_map = {p["id"]: p for p in photos}
+        removed_files = self.removed_files(link, stage)
         field_files, assigned = [], set()
         for f in definition["fields"]:
             if f["kind"] != "files" or not visible(f, values):
@@ -492,7 +545,7 @@ class PlatformPreparation:
                 existing = []
                 issue(key, f["label"] + "的官网已有文件格式异常，请刷新核对。")
             # Blank optional rows on the website are placeholders, not uploaded files.
-            existing = [r for r in existing if isinstance(r, dict) and r.get("id") and r.get("fileUrl")]
+            existing = [r for r in existing if active_attachment(r)]
             selected = []
             for photo_id in selections.get(key, []):
                 photo = photo_map.get(photo_id)
@@ -519,9 +572,10 @@ class PlatformPreparation:
             if f["required"] and not existing and not selected:
                 issue(key, "缺少" + f["label"], code="required")
             suggest = f.get("suggest")
-            suggested_ids = [p["id"] for p in photos if suggest and (p["stage"] == suggest[0] or (suggest[0] == 'work' and p.get('shared_checkin_visit_id'))) and p["role"] == suggest[1]
+            suggested_ids = [p["id"] for p in photos if suggest and (p["stage"] == suggest[0] or (suggest[0] == 'work' and p.get('shared_checkin_visit_id') and not p.get('reuse_copy_id'))) and p["role"] == suggest[1]
                              and self.db.one("SELECT extension FROM blobs WHERE hash=?", (p["blob_hash"],))["extension"] in f["extensions"]]
             field_files.append({**f, "readonly": bool(f.get('readonly')) or not access['editable'], "selected": selected, "existing": existing,
+                                "removed": [r for r in removed_files.get(key, []) if str(r['id']) not in {str(v['id']) for v in existing}],
                                 "suggested_ids": suggested_ids if access['editable'] else [], "count": len(existing) + len(selected)})
         if any(p["stage"] == "work" and p["role"] == "construction" for p in photos) and stage == "repair":
             issue("construction", "施工过程照片已保留在保司资料中；验收阶段可补充相应 PDF。", "warning")
@@ -572,6 +626,7 @@ class PlatformPreparation:
                 "personnel": link["snapshot"].get("personnel", []),
                 "field_suggestions": suggestions, "field_suggestion_notes": suggestion_notes,
                 "field_sources": sources,
+                "attachment_removals": self.removals.pending(case_id, stage),
                 "prepared_for_review": errors == 0 and access['editable'], "write_enabled": self.client.write_enabled}
 
     @staticmethod

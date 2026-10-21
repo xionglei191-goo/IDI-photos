@@ -7,6 +7,7 @@ from typing import Callable
 
 from .db import Database, dump, now, uid
 from .domain import DomainError
+from .identity import acting_as, current
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ class JobRunner:
         self._wake = threading.Event()
         self._thread = None
         self._network_thread = None
+        self.access = None
 
     def register(self, kind: str, handler: Callable):
         self.handlers[kind] = handler
@@ -27,8 +29,9 @@ class JobRunner:
         if kind not in self.handlers:
             raise DomainError("任务类型未注册")
         job_id = uid()
+        person = current()
         with self.db.tx() as con:
-            con.execute("INSERT INTO jobs(id,kind,payload,created_at) VALUES(?,?,?,?)", (job_id, kind, dump(payload), now()))
+            con.execute("INSERT INTO jobs(id,kind,payload,created_at,user_id) VALUES(?,?,?,?,?)", (job_id, kind, dump(payload), now(), person.id if person else None))
         self._wake.set()
         return self.get(job_id)
 
@@ -36,14 +39,20 @@ class JobRunner:
         row = self.db.one("SELECT * FROM jobs WHERE id=?", (job_id,))
         if not row:
             raise DomainError("任务不存在", 404)
+        if current() and not current().admin and row['user_id'] != current().id:
+            raise DomainError('没有此任务的访问权限', 403)
         row["payload"] = json.loads(row["payload"])
         row["result"] = json.loads(row["result"]) if row["result"] else None
         return row
 
     def list(self):
-        return [self.get(row["id"]) for row in self.db.all("SELECT id FROM jobs ORDER BY created_at DESC LIMIT 100")]
+        person = current()
+        own = person is not None and not person.admin
+        return [self.get(row["id"]) for row in self.db.all("SELECT id FROM jobs" +
+            (" WHERE user_id=?" if own else "") + " ORDER BY created_at DESC LIMIT 100", (person.id,) if own else ())]
 
     def retry(self, job_id):
+        self.get(job_id)
         with self.db.tx() as con:
             row = con.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not row:
@@ -86,7 +95,11 @@ class JobRunner:
                 con.execute("UPDATE jobs SET progress=?,total=? WHERE id=?", (done, total, row["id"]))
         try:
             handler = self.handlers[row["kind"]]
-            result = handler(json.loads(row["payload"]), progress) or {}
+            person = self.access.principal(row['user_id']) if row.get('user_id') and self.access else None
+            if row.get('user_id') and person is None:
+                raise DomainError('任务人员身份无法恢复', 403)
+            with acting_as(person):
+                result = handler(json.loads(row["payload"]), progress) or {}
             state = result.get("state", "completed")
             if state not in ("completed", "failed", "partial"):
                 state = "completed"

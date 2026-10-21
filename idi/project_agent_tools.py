@@ -19,6 +19,7 @@ from .db import dump, now
 from .domain import DomainError, GROUP_FIELDS, PHOTO_GROUPS, WORKFLOW_STAGES
 from .platform_contract import STAGES as OFFICIAL_STAGES
 from .recognition import extract_fields
+from .agent_dates import AgentDates, CASE_DATE_LABELS, local_date
 from .agent_capabilities import (AgentCapabilities, CAPABILITY_TOOLS, CAPABILITY_READS, CAPABILITY_NAMES,
                                  PAGE, DATES, date_bounds, page_result, validate_value)
 
@@ -28,9 +29,10 @@ TOOLS = [
     tool('list_projects', '列出本群授权查询的项目引用、名称和案件数。'),
     tool('read_project_summary', '读取指定项目的案件阶段、今日收图、待核对事项和官网草稿统计；多项目群请先选择项目引用。',
          {'project_ref': {**TEXT, 'description': '项目清单中的 J001 等引用；单项目群可省略'}}),
-    tool('search_cases', '在当前群项目内按案件号、报案号、短编号、楼栋房号或问题分页查找案件，可筛选阶段与台账更新日期；query 空串列出全部候选。',
+    tool('search_cases', '在当前群项目内按案件号、报案号、短编号、楼栋房号或问题分页查找案件，可筛选阶段与日期。新增报案按 report_at，新增入库按 created_at，台账变化按 updated_at；query 空串列出全部候选。',
          {'query': {**TEXT, 'maxLength': 160}, 'project_ref': {**TEXT, 'description': '可选，限定本群 J001 等项目引用'},
-          **PAGE, **DATES, 'workflow_stage': {'type': 'string', 'enum': list(WORKFLOW_STAGES)}}, ['query']),
+          **PAGE, **DATES, 'date_basis': {'type': 'string', 'enum': list(CASE_DATE_LABELS)},
+          'workflow_stage': {'type': 'string', 'enum': list(WORKFLOW_STAGES)}}, ['query']),
     tool('read_case', '读取一个案件的编号、位置、记录阶段和最多60项本机资料清单。', CASE, ['case_ref']),
     tool('read_case_records', '读取本案最近的进场记录、办理记录与智能审阅建议。', CASE, ['case_ref']),
     tool('read_requirements', '读取当前阶段的本机资料要求，不把未归档认定为未施工。', CASE, ['case_ref']),
@@ -68,7 +70,7 @@ def contains_code(text, code):
 def case_public(case, ref):
     return {'case_ref': ref, **{k: case.get(k) for k in ('project_name', 'short_code', 'platform_report_code', 'report_number',
             'title', 'description', 'building', 'unit', 'room', 'location_detail', 'repair_parts', 'workflow_stage',
-            'workflow_source', 'workflow_verified_at')}, 'stage_label': WORKFLOW_STAGES.get(case['workflow_stage'], case['workflow_stage'])}
+            'workflow_source', 'workflow_verified_at', 'report_at', 'created_at', 'updated_at')}, 'stage_label': WORKFLOW_STAGES.get(case['workflow_stage'], case['workflow_stage'])}
 
 
 class ProjectAgentTools:
@@ -88,6 +90,7 @@ class ProjectAgentTools:
         for photo_id in task['input'].get('photo_ids', []):
             self.add_photo(photo_id)
         self.calls = set()
+        self.dates = AgentDates(task)
         self.capabilities = AgentCapabilities(self)
 
     def definitions(self):
@@ -139,7 +142,7 @@ class ProjectAgentTools:
         text = self.task['input'].get('text', '')
         matches = [case_public(c, ref) for ref, c in self.cases.items()
                    if any(contains_code(text, code) for code in self.codes(c))]
-        return {'message': text[:6000], 'case_matches': matches[:12],
+        return {'message': text[:6000], 'time_context': self.dates.public(), 'case_matches': matches[:12],
                 'conversation': self.task['input'].get('conversation', {'mode': 'member'}),
                 'incoming_images': [self.photo_public(self.photo(ref)) for ref in list(self.photos)],
                 'excluded_images': len(self.mutable) - len(self.photos),
@@ -172,7 +175,7 @@ class ProjectAgentTools:
         if name == 'finish_reply':
             if not args['text'].strip():
                 raise DomainError('请提供答复内容')
-            return {'text': args['text'].strip()}, []
+            return {'text': self.dates.finish(args['text'].strip())}, []
         if name == 'list_projects':
             return {'items': self.project_list(), 'scope': '仅本群明确授权的项目'}, []
         if name in ('read_memories', 'propose_memory'):
@@ -202,25 +205,50 @@ class ProjectAgentTools:
                 raise DomainError('请使用本群项目清单中的项目引用')
             return self.service.project_snapshot(self.projects[ref]['id'], followup_only=self.task['kind'] == 'brief'), []
         if name == 'search_cases':
+            args = self.dates.resolve(name, args)
             query = normalize_code(args['query'].strip())
             if len(query) > 160:
                 raise DomainError('查询条件过长')
             project_ref = args.get('project_ref')
             if project_ref and project_ref not in self.projects:
                 raise DomainError('请使用本群清单中的项目引用')
-            start, end = date_bounds(args)
+            date_bounds(args)  # Validate explicit ranges as strictly as photo queries.
             current = [(self.case_refs[c['id']], c) for c in self.domain.cases() if c['id'] in self.case_refs]
             candidates = [(ref, c) for ref, c in current if c['project_id'] in self.project_ids
                           and (not project_ref or c['project_id'] == self.projects[project_ref]['id'])
-                          and (not args.get('workflow_stage') or c['workflow_stage'] == args['workflow_stage'])
-                          and (not start or c['updated_at'] >= start) and (not end or c['updated_at'] < end)]
+                          and (not args.get('workflow_stage') or c['workflow_stage'] == args['workflow_stage'])]
             exact = [(ref, c) for ref, c in candidates if query and query in {normalize_code(v) for v in self.codes(c) if v}]
             matches = exact or [(ref, c) for ref, c in candidates if not query or query in normalize_code(' '.join(
                 str(c.get(k) or '') for k in ('title', 'description', 'building', 'unit', 'room', 'location_detail', 'short_code', 'platform_report_code', 'report_number')))
                 or query in normalize_code(f"{c.get('building', '')}栋{c.get('unit', '')}单元{c.get('room', '')}室")]
-            result = page_result(sorted(matches, key=lambda row: (row[1]['updated_at'], row[1]['id']), reverse=True), args, 12)
-            result['items'] = [case_public(self.case(ref), ref) for ref, c in result['items']]
-            result['scope'] = '仅当前群绑定项目；日期按北京时间台账更新日期；未找到不代表其他项目或官网不存在'
+            basis = args['date_basis']
+            links = {}
+            if basis == 'report_at':
+                marks = ','.join('?' for _ in self.project_ids)
+                links = {r['case_id']: r for r in self.db.all(f'SELECT l.case_id,l.verified_at,l.snapshot FROM platform_links l JOIN cases c ON c.id=l.case_id WHERE c.project_id IN ({marks})', self.project_ids)}
+            dates = {}
+            for ref, case in matches:
+                value, source, verified_at = local_date(case.get(basis)), 'local_ledger', None
+                if basis == 'report_at' and case['id'] in links:
+                    link = links[case['id']]
+                    snapshot = json.loads(link['snapshot'])
+                    reported = local_date(snapshot.get('row', {}).get('reportDate')) or local_date(snapshot.get('claim', {}).get('reportDate'))
+                    if reported:
+                        value, source, verified_at = reported, 'official_snapshot', link['verified_at']
+                dates[ref] = {'basis': basis, 'date': value, 'source': source if value else 'unknown', 'verified_at': verified_at}
+            unknown = sum(not dates[ref]['date'] for ref, _ in matches)
+            if args.get('date_from') or args.get('date_to'):
+                matches = [(ref, c) for ref, c in matches if dates[ref]['date']
+                           and (not args.get('date_from') or dates[ref]['date'] >= args['date_from'])
+                           and (not args.get('date_to') or dates[ref]['date'] <= args['date_to'])]
+            result = page_result(sorted(matches, key=lambda row: (dates[row[0]]['date'] or '', row[1]['updated_at'], row[1]['id']), reverse=True), args, 12)
+            result['items'] = [{**case_public(self.case(ref), ref), 'date_evidence': dates[ref]} for ref, c in result['items']]
+            result['unknown_date_count'] = unknown
+            snapshots = [v['verified_at'] for v in dates.values() if v['verified_at']]
+            result['freshness'] = {'live_official_query': False, 'snapshot_verified_at_min': min(snapshots, default=None),
+                                   'snapshot_verified_at_max': max(snapshots, default=None)}
+            result['scope'] = '仅当前群绑定项目；日期按北京时间' + CASE_DATE_LABELS[basis] + '；依据本机台账及最近官网同步快照；缺失日期未纳入日期统计；未找到不代表其他项目或官网不存在'
+            self.dates.record(name, args, result)
             return result, []
         if name == 'read_images':
             return self.read_images(args['photo_refs'])
@@ -376,7 +404,8 @@ class ProjectAgentTools:
         return self._remember_draft(case, case['workflow_stage'], prepare_materials(self.platform, case, incoming, actor='feishu_agent'))
 
     def save(self, case):
-        with self.platform.material_lock:
+        from .project_accounts import case_context
+        with self.platform.material_lock, case_context(self.platform, case['id']):
             return self._save(case)
 
     def _save(self, case):

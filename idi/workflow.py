@@ -4,14 +4,13 @@ import hashlib
 import json
 import re
 import threading
-from collections import Counter
 from datetime import datetime
 
 from .case_codes import issue_code, unique_prefix
 from .db import audit, dump, now, rowdict, uid
-from .domain import DomainError, PHOTO_GROUPS, WORKFLOW_STAGES, clean_date
+from .domain import CASE_PLATFORM_COLUMNS, DomainError, PHOTO_GROUPS, WORKFLOW_STAGES, case_filters, clean_date, decode_case
 from .platform_client import unsubmitted_report
-from .platform_photos import online_photo_counts
+from .platform_photos import attachment_removal_history, online_photo_counts
 from .stage_access import FORM_LABELS, STAGE_FORM, stage_access
 
 INTAKE = {'pending_intake', 'insurer_intake', 'insurer_review', 'historical_unverified'}
@@ -80,7 +79,11 @@ class Workflow:
         self.synchronizer = PlatformSync(self)
 
     def sync_status(self):
-        return self.synchronizer.status()
+        from .identity import current
+        value = self.synchronizer.status()
+        if current() and not current().admin:
+            return {'lists': bool(value.get('lists')), 'state': value.get('state', '')}
+        return value
 
     def sync(self, payload, progress):
         return self.synchronizer.run(payload, progress)
@@ -106,7 +109,7 @@ class Workflow:
         con.execute("INSERT INTO settings VALUES('platform_lists',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (dump({'run_id': run_id, 'read_at': read_at, 'coverage': 'full', 'counts': {k: len(v) for k, v in lists.items()}}),))
 
-    def apply_snapshot(self, snapshot, case_id=None):
+    def apply_snapshot(self, snapshot, case_id=None, *, details_read=True):
         row = {**snapshot.get('claim', {}), **snapshot.get('row', {})}
         record_id = str(row.get('reportReceivingId') or '')
         code = str(row.get('reportCode') or '').strip()
@@ -119,8 +122,10 @@ class Workflow:
         stamp = now()
         read_at = snapshot.get('fetched_at') or stamp
         with self.db.tx() as con:
-            current_link = con.execute('SELECT case_id,verified_at FROM platform_links WHERE report_receiving_id=?', (record_id,)).fetchone()
-            if current_link and current_link['verified_at'] and current_link['verified_at'] > read_at:
+            current_link = con.execute('SELECT case_id,verified_at,snapshot FROM platform_links WHERE report_receiving_id=?', (record_id,)).fetchone()
+            current_snapshot = json.loads(current_link['snapshot']) if current_link else {}
+            latest_read = max((current_link['verified_at'] or '') if current_link else '', current_snapshot.get('list_verified_at') or '')
+            if latest_read > read_at:
                 current = con.execute('SELECT workflow_stage FROM cases WHERE id=?', (current_link['case_id'],)).fetchone()
                 return {'case_id': current_link['case_id'], 'created': False, 'stage': current['workflow_stage'], 'stale_ignored': True}
             linked = con.execute('SELECT case_id FROM platform_links WHERE report_receiving_id=?', (record_id,)).fetchone()
@@ -169,19 +174,32 @@ class Workflow:
             link = con.execute('SELECT * FROM platform_links WHERE case_id=?', (case_id,)).fetchone()
             if link and link['report_receiving_id'] and link['report_receiving_id'] != record_id:
                 raise DomainError('本案已关联另一个官网记录，未覆盖', 409)
-            semantic = lambda value: {k: v for k, v in value.items() if k not in ('fetched_at', 'account')}
+            if not details_read:
+                # List status is fresh, but cached form fields and attachments were
+                # not fetched. Keep their original verification time and contents.
+                cached = json.loads(link['snapshot']) if link else {}
+                snapshot = {**cached, 'row': snapshot['row'], 'scope': snapshot['scope'],
+                            'account': snapshot.get('account', ''), 'list_verified_at': read_at}
+            elif link:
+                previous_snapshot = json.loads(link['snapshot'])
+                removed = attachment_removal_history(previous_snapshot, snapshot, read_at)
+                snapshot = {k: v for k, v in snapshot.items() if k != 'removed_attachments'}
+                if removed:
+                    snapshot['removed_attachments'] = removed
+            verified_at = read_at if details_read else (link['verified_at'] if link else None)
+            semantic = lambda value: {k: v for k, v in value.items() if k not in ('fetched_at', 'list_verified_at', 'account')}
             link_changed = not link or semantic(json.loads(link['snapshot'])) != semantic(snapshot)
             con.execute('''INSERT INTO platform_links VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(case_id) DO UPDATE SET
                 report_receiving_id=excluded.report_receiving_id,platform_report_code=excluded.platform_report_code,
                 insurer_report_number=excluded.insurer_report_number,snapshot=excluded.snapshot,verified_at=excluded.verified_at,
                 revision=excluded.revision,updated_at=excluded.updated_at''',
-                        (case_id, record_id, code, str(row.get('reportNumber') or ''), dump(snapshot), read_at,
+                        (case_id, record_id, code, str(row.get('reportNumber') or ''), dump(snapshot), verified_at,
                          (link['revision'] if link else 0) + int(link_changed), stamp))
             if created or previous['workflow_stage'] != stage:
-                self._event(con, case_id, 'platform_readback', previous['workflow_stage'] if previous else None, stage,
-                            'platform', {'report_receiving_id': record_id, 'remote_state': values['remote_status']}, read_at)
-            audit(con, 'case', case_id, 'platform_sync', before={'workflow_stage': previous['workflow_stage']} if previous else None,
-                  after={'workflow_stage': stage, 'report_receiving_id': record_id, 'remote_written': False}, actor='platform_readback')
+                self._event(con, case_id, 'platform_readback' if details_read else 'platform_list_sync', previous['workflow_stage'] if previous else None, stage,
+                            'platform' if details_read else 'platform_list', {'report_receiving_id': record_id, 'remote_state': values['remote_status']}, read_at)
+            audit(con, 'case', case_id, 'platform_sync' if details_read else 'platform_list_sync', before={'workflow_stage': previous['workflow_stage']} if previous else None,
+                  after={'workflow_stage': stage, 'report_receiving_id': record_id, 'remote_written': False}, actor='platform_readback' if details_read else 'platform_list')
         return {'case_id': case_id, 'created': created, 'stage': stage}
 
     def _event(self, con, case_id, kind, old, stage, source, detail, event_at):
@@ -226,7 +244,7 @@ class Workflow:
         events = self.db.all('SELECT * FROM case_events WHERE case_id=? ORDER BY created_at DESC,id DESC', (case_id,))
         for event in events:
             event['detail'] = json.loads(event['detail'])
-        return {'case': case, 'events': events, 'stage_label': WORKFLOW_STAGES[case['workflow_stage']],
+        return {'case': case, 'events': events, 'official_read_at': self.platform.link(case_id)['verified_at'], 'stage_label': WORKFLOW_STAGES[case['workflow_stage']],
                 'form_stage': STAGE_FORM.get(case['workflow_stage'], 'intake'), 'watermark': self.watermark(case),
                 'stage_access': {stage: stage_access(case, stage) for stage in FORM_LABELS},
                 'insurer': self.domain.completeness(case_id, case['insurer_template_id']),
@@ -238,6 +256,12 @@ class Workflow:
                 'contents': ['查勘打卡', 'XXX问题', '施工打卡', 'XXX施工', 'XXX完工']}
 
     def board(self, board='intake', project_id='', building='', query='', status='', archived=False, page=1, page_size=30, source='auto'):
+        # Every nested form/material read shares this request's snapshot. Nothing
+        # is cached across requests, so edits are visible on the next refresh.
+        with self.db.read_snapshot():
+            return self._board(board, project_id, building, query, status, archived, page, page_size, source)
+
+    def _board(self, board, project_id, building, query, status, archived, page, page_size, source):
         if board not in ('intake', 'work'):
             raise DomainError('看板不存在', 404)
         if source not in ('auto', 'platform', 'local'):
@@ -245,32 +269,53 @@ class Workflow:
         if source == 'auto':
             source = 'platform' if self.db.setting('platform_lists') else 'workflow'
         scope = 'intake' if board == 'intake' else 'repair'
-        entries = self.db.all('SELECT case_id,position FROM platform_list_entries WHERE scope=? ORDER BY position', (scope,))
-        order = {r['case_id']: r['position'] for r in entries}
-        cases = self.domain.cases(project_id=project_id or None, query=query or None)
-        cases = [c for c in cases if (not building or c['building'] == building)]
+        where, values = case_filters(project_id, query)
+        source_sql = ' FROM cases c JOIN projects pr ON pr.id=c.project_id'
+        ordering = 'c.updated_at DESC'
+        if building:
+            where.append('c.building=?')
+            values.append(building)
         if source == 'platform':
-            pool = sorted((c for c in cases if c['id'] in order), key=lambda c: order[c['id']])
-            source_total = len(entries)
+            source_sql += ' JOIN platform_list_entries e ON e.case_id=c.id AND e.scope=?'
+            values.insert(0, scope)
+            ordering = 'e.position,c.updated_at DESC'
+            from .identity import project_filter
+            access_scope, access_args = project_filter('c.project_id')
+            source_total = self.db.one('SELECT COUNT(*) AS n FROM platform_list_entries e JOIN cases c ON c.id=e.case_id WHERE e.scope=? AND ' + access_scope, (scope, *access_args))['n']
         else:
-            pool = [c for c in cases if (source != 'local' or not c['platform_linked']) and (c['workflow_stage'] in INTAKE) == (board == 'intake')]
+            if source == 'local':
+                where.append('NOT EXISTS(SELECT 1 FROM platform_links l WHERE l.case_id=c.id AND l.verified_at IS NOT NULL)')
+            where.append('c.workflow_stage ' + ('IN' if board == 'intake' else 'NOT IN') + ' (' + ','.join('?' for _ in INTAKE) + ')')
+            values.extend(sorted(INTAKE))
             if not archived:
-                pool = [c for c in pool if c['workflow_stage'] not in ARCHIVED]
-            source_total = len(pool)
-        counters = dict(Counter(c['workflow_stage'] for c in pool))
+                where.append('c.workflow_stage NOT IN (' + ','.join('?' for _ in ARCHIVED) + ')')
+                values.extend(sorted(ARCHIVED))
+        filtered_sql = source_sql + (' WHERE ' + ' AND '.join(where) if where else '')
+        counters = {r['workflow_stage']: r['n'] for r in self.db.all(
+            'SELECT c.workflow_stage,COUNT(*) AS n' + filtered_sql + ' GROUP BY c.workflow_stage', values)}
+        if source != 'platform':
+            source_total = sum(counters.values())
         if status:
-            pool = [c for c in pool if c['workflow_stage'] == status]
-        total = len(pool)
+            filtered_sql += (' AND ' if where else ' WHERE ') + 'c.workflow_stage=?'
+            values.append(status)
+        total = counters.get(status, 0) if status else sum(counters.values())
         page, page_size = max(1, page), min(100, max(1, page_size))
-        pool = pool[(page - 1) * page_size:page * page_size]
+        pool = [decode_case(r) for r in self.db.all(
+            'SELECT c.*,pr.name AS project_name,(SELECT COUNT(*) FROM photos p WHERE p.case_id=c.id) AS photo_count'
+            + CASE_PLATFORM_COLUMNS + filtered_sql + ' ORDER BY ' + ordering + ' LIMIT ? OFFSET ?',
+            [*values, page_size, (page - 1) * page_size])]
+        case_ids = [c['id'] for c in pool]
+        placeholders = ','.join('?' for _ in case_ids) or 'NULL'
         counts = {}
-        for row in self.db.all("SELECT p.case_id,p.photo_group,COUNT(*) AS count FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE b.media_type='image' AND p.recognition_state<>'conflict' GROUP BY p.case_id,p.photo_group"):
+        for row in self.db.all(f"SELECT p.case_id,p.photo_group,COUNT(*) AS count FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE p.case_id IN ({placeholders}) AND b.media_type='image' AND p.recognition_state<>'conflict' GROUP BY p.case_id,p.photo_group", case_ids):
             counts.setdefault(row['case_id'], {})[row['photo_group']] = row['count']
-        shared_counts = {r['case_id']: r['count'] for r in self.db.all("SELECT p.case_id,COUNT(*) AS count FROM visit_shared_checkins s JOIN photos p ON p.id=s.photo_id JOIN blobs b ON b.hash=p.blob_hash WHERE b.media_type='image' AND p.recognition_state<>'conflict' GROUP BY p.case_id")}
-        for case_id, count in shared_counts.items():
+        legacy_counts = {r['case_id']: r['count'] for r in self.db.all(f"SELECT p.case_id,COUNT(*) AS count FROM visit_shared_checkins s JOIN photos p ON p.id=s.photo_id JOIN blobs b ON b.hash=p.blob_hash WHERE p.case_id IN ({placeholders}) AND b.media_type='image' AND p.recognition_state<>'conflict' AND NOT EXISTS(SELECT 1 FROM photos copy WHERE copy.reuse_source_id=p.id) GROUP BY p.case_id", case_ids)}
+        shared_counts = {r['case_id']: r['count'] for r in self.db.all(f"SELECT case_id,COUNT(*) AS count FROM photos WHERE case_id IN ({placeholders}) AND reuse_source_id IS NOT NULL AND photo_group='work_checkin' AND recognition_state<>'conflict' GROUP BY case_id", case_ids)}
+        for case_id, count in legacy_counts.items():
             counts.setdefault(case_id, {})['work_checkin'] = counts.get(case_id, {}).get('work_checkin', 0) + count
-        visit_counts = {r['case_id']: r['count'] for r in self.db.all("SELECT case_id,COUNT(*) AS count FROM visits WHERE stage='work' GROUP BY case_id")}
-        exceptions = {r['case_id']: r['count'] for r in self.db.all("SELECT p.case_id,COUNT(*) AS count FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE b.media_type='image' AND (p.photo_group='unknown' OR p.recognition_state IN ('failed','conflict')) GROUP BY p.case_id")}
+            shared_counts[case_id] = shared_counts.get(case_id, 0) + count
+        visit_counts = {r['case_id']: r['count'] for r in self.db.all(f"SELECT case_id,COUNT(*) AS count FROM visits WHERE case_id IN ({placeholders}) AND stage='work' GROUP BY case_id", case_ids)}
+        exceptions = {r['case_id']: r['count'] for r in self.db.all(f"SELECT p.case_id,COUNT(*) AS count FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE p.case_id IN ({placeholders}) AND b.media_type='image' AND (p.photo_group='unknown' OR p.recognition_state IN ('failed','conflict')) GROUP BY p.case_id", case_ids)}
         items = []
         for case in pool:
             stage = case['workflow_stage']

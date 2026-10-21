@@ -1,0 +1,47 @@
+name: idi-dev
+
+services:
+  idi:
+    image: idi-dev:local
+    build: .
+    init: true
+    restart: "no"
+    stop_grace_period: 30s
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    pids_limit: 256
+    mem_limit: 3g
+    environment:
+      IDI_WORKER: ${IDI_DEV_WORKER:-0}
+      IDI_PLATFORM_WRITE: "0"
+      IDI_DOMAIN: ""
+      IDI_VPS_SUBNET: "172.30.81.0/24"
+      IDI_VPS_GATEWAY: "172.30.81.1"
+      IDI_VPS_APP_IP: "172.30.81.10"
+      IDI_VPS_PROXY_IP: "172.30.81.20"
+    ports:
+      - "127.0.0.1:18767:8766"
+    volumes:
+      - data:/var/lib/idi
+      - key:/var/lib/idi-key
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+      - /run/idi:uid=10001,gid=10001,mode=0700
+    networks:
+      idi:
+        ipv4_address: 172.30.81.10
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "2"}
+
+networks:
+  idi:
+    ipam:
+      config:
+        - subnet: "172.30.81.0/24"
+          gateway: "172.30.81.1"
+
+volumes:
+  data:
+  key:

@@ -11,6 +11,7 @@ import time
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -42,6 +43,27 @@ def external_id(value):
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value):
         raise DomainError("官网记录 ID 必须使用完整字符串，不能使用报修编号代替或转换为数字")
     return value
+
+
+def attachment_url(value):
+    """Only the official file area may receive the platform session token."""
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        raise DomainError('官网附件缺少有效文件地址', 422)
+    parsed, base = urlsplit(value), urlsplit(BASE_URL)
+    if (parsed.netloc and (parsed.scheme != base.scheme or parsed.netloc != base.netloc)
+            or parsed.scheme and not parsed.netloc or parsed.fragment):
+        raise DomainError('官网附件地址不属于已配置的文件服务', 422)
+    path = parsed.path
+    for _ in range(3):
+        path = unquote(path)
+    if ('\\' in path or '%' in path or any(ord(c) < 32 for c in path)
+            or any(p in ('.', '..') for p in path.split('/'))):
+        raise DomainError('官网附件地址无效', 422)
+    if path.startswith(base.path + '/profile/'):
+        path = path[len(base.path):]
+    if not path.startswith('/profile/') or path.endswith('/'):
+        raise DomainError('官网附件地址不属于已配置的文件服务', 422)
+    return BASE_URL + path + ('?' + parsed.query if parsed.query else '')
 
 
 def unsubmitted_report(row, scope):
@@ -78,7 +100,7 @@ class PlatformLoginError(DomainError):
 class PlatformClient:
     """Read-only by default; reviewed writes require explicit runtime configuration."""
 
-    def __init__(self, transport=None, write_enabled=False):
+    def __init__(self, transport=None, write_enabled=False, *, permanently_read_only=False):
         self._http = httpx.Client(base_url=BASE_URL, timeout=25, follow_redirects=False, transport=transport)
         self._token = ""
         self._account = ""
@@ -87,6 +109,7 @@ class PlatformClient:
         self._session_generation = 0
         self._connected_at = None
         self.write_enabled = bool(write_enabled)
+        self._permanently_read_only = permanently_read_only
         self.request_interval = 0.0 if transport is not None else 1.0
         self._next_request = 0.0
         self._read_pause_until = 0.0
@@ -145,6 +168,8 @@ class PlatformClient:
                     "connected_at": self._connected_at, "mode": "reviewed_writes" if self.write_enabled else "read_only", "write_enabled": self.write_enabled}
 
     def _write(self, path, **kwargs):
+        if self._permanently_read_only:
+            raise DomainError('公司账号仅用于读取清单和下载资料；官网写入必须使用本项目账号', 403)
         if not self.write_enabled:
             raise DomainError("官网当前为只读模式，可保存核对记录和下载资料；尚未启用官网上传提交", 403)
         allowed = {stage['endpoint'] for stage in STAGES.values()} | {'/insurance/sysFileInfo/upload'}
@@ -188,6 +213,50 @@ class PlatformClient:
         if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict) or not records[0].get('id') or not records[0].get('fileUrl'):
             raise DomainError('官网上传回执缺少文件记录，未继续业务提交', 502)
         return records[0]
+
+    def download_attachment(self, url, max_bytes, account=''):
+        url = attachment_url(url)
+        with self._lock:
+            if not self._token:
+                raise DomainError('请先连接官网，再同步附件原件', 401)
+            if account and account != self._account:
+                raise DomainError('官网登录账号已变化，请刷新案件后再同步附件', 409)
+            self._before_request()
+            try:
+                with self._http.stream('GET', url, headers={'Authorization': 'Bearer ' + self._token},
+                                       timeout=httpx.Timeout(60, connect=15)) as response:
+                    if response.status_code == 429:
+                        raise self._pause_reads(response)
+                    if response.status_code in (401, 403):
+                        if response.status_code == 401:
+                            self.logout()
+                        raise DomainError('官网登录已失效或没有附件读取权限，请重新连接官网', response.status_code)
+                    if response.is_redirect:
+                        raise DomainError('官网附件地址发生跳转，请刷新案件资料后重试', 502)
+                    response.raise_for_status()
+                    if 'text/html' in response.headers.get('content-type', '').lower():
+                        raise DomainError('官网未返回附件文件，请刷新案件资料后重试', 502)
+                    chunks, size = [], 0
+                    for chunk in response.iter_bytes():
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise DomainError('官网附件超过本地单文件大小限制', 413)
+                        chunks.append(chunk)
+                    data = b''.join(chunks)
+                    if 'json' in response.headers.get('content-type', '').lower():
+                        try:
+                            result = json.loads(data)
+                        except ValueError:
+                            result = {}
+                        if isinstance(result, dict) and result.get('code') == 2:
+                            self.logout()
+                            raise DomainError('官网登录已过期，请重新连接后同步附件', 401)
+                        raise DomainError('官网未返回附件文件，请刷新案件资料后重试', 502)
+                    if not data:
+                        raise DomainError('官网附件为空，未保存到本地', 502)
+                    return data
+            except httpx.HTTPError as error:
+                raise DomainError('官网附件暂时无法下载，请稍后重试', 502) from error
 
     def submit(self, stage, payload):
         if stage not in STAGES:

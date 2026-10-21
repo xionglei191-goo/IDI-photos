@@ -15,13 +15,16 @@ $idiLocalAddress = if ($idiNetwork.listen_host -eq '0.0.0.0') { '127.0.0.1' } el
 $idiUrl = "http://${idiLocalAddress}:$Port"
 try { $idiHealth = Invoke-RestMethod -Uri "$idiUrl/api/health" -TimeoutSec 2 } catch { $idiHealth = $null }
 if ($idiHealth -and $idiHealth.application -eq 'IDI') {
-    $idiSystem = Invoke-RestMethod -Uri "$idiUrl/api/system" -TimeoutSec 2
-    if ([System.IO.Path]::GetFullPath($idiSystem.data_dir) -ne $env:IDI_DATA_DIR) { throw 'This port is serving a different IDI archive.' }
+    $idiRecordPath = Join-Path $env:IDI_DATA_DIR 'service.json'
+    if (-not (Test-Path -LiteralPath $idiRecordPath)) { throw 'This port is serving another IDI instance; no matching service record exists.' }
+    $idiRecord = Get-Content -LiteralPath $idiRecordPath -Raw | ConvertFrom-Json
+    if ([System.IO.Path]::GetFullPath($idiRecord.data_dir) -ne $env:IDI_DATA_DIR -or [int]$idiRecord.port -ne $Port) { throw 'This port is serving a different IDI archive.' }
+    $idiSystem = $idiRecord.network
+    if (-not $idiSystem) { throw 'The running service predates the authenticated launcher. Stop it with stop.cmd, then start it again.' }
     if ([bool]$idiSystem.local_only -ne [bool]$idiNetwork.local_only -or (($idiSystem.lan_urls | Sort-Object) -join ',') -ne (($idiNetwork.lan_urls | Sort-Object) -join ',') -or (($idiSystem.lan_subnets | Sort-Object) -join ',') -ne (($idiNetwork.lan_subnets | Sort-Object) -join ',')) { throw 'Network configuration changed. Stop the service with stop.cmd, then start it again.' }
     if ($idiSystem.listen_host -and $idiSystem.listen_host -ne $idiNetwork.listen_host) { throw 'Listen address changed. Stop the service with stop.cmd, then start it again.' }
     foreach ($idiNetworkKey in @('public_urls','trusted_proxies')) { if ((($idiSystem.$idiNetworkKey | Sort-Object) -join ',') -ne (($idiNetwork.$idiNetworkKey | Sort-Object) -join ',')) { throw 'Tunnel configuration changed. Stop the service with stop.cmd, then start it again.' } }
-    $idiSession = Invoke-RestMethod -Uri "$idiUrl/api/platform/session" -TimeoutSec 2
-    if ([bool]$idiSession.write_enabled -ne (-not $ReadOnly)) { throw 'The running service has a different submission mode. Stop it with stop.cmd, then start it again.' }
+    if ([bool]$idiRecord.platform_write_enabled -ne (-not $ReadOnly)) { throw 'The running service has a different submission mode. Stop it with stop.cmd, then start it again.' }
     Write-Output "IDI is already running: $idiUrl"
     foreach ($idiLanUrl in $idiNetwork.lan_urls) { Write-Output "LAN workbench: $idiLanUrl" }
     foreach ($idiPublicUrl in $idiNetwork.public_urls) { Write-Output "Tunnel workbench: $idiPublicUrl" }

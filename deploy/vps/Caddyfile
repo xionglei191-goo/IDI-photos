@@ -1,0 +1,29 @@
+{
+	admin off
+}
+
+{$IDI_DOMAIN} {
+	encode zstd gzip
+	header Strict-Transport-Security "max-age=31536000"
+	request_body {
+		max_size 1GB
+	}
+
+	# Exact camera routes have their own pairing code / device bearer token.
+	# Never exempt /api/camera/*: that would expose administration routes.
+	@device path /api/camera/pair /api/camera/cases /api/camera/captures /api/camera/captures/*/original /api/camera/native-config /api/camera/native-session /api/camera/h5-config /api/camera/h5-session /api/camera/official-captures /api/camera/official-captures/*
+	handle @device {
+		reverse_proxy {$IDI_VPS_APP_IP}:8766 {
+			header_up X-Forwarded-Proto https
+		}
+	}
+	handle {
+		basic_auth {
+			import /etc/caddy/users.caddy
+		}
+		reverse_proxy {$IDI_VPS_APP_IP}:8766 {
+			header_up -Authorization
+			header_up X-Forwarded-Proto https
+		}
+	}
+}

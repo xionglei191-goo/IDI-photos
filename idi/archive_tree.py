@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import threading
 import time
 from pathlib import Path, PurePosixPath
@@ -20,6 +21,16 @@ TREE_STAGES = {"unknown": "待分类", "survey": "查勘", "work": "施工", "ac
 def digest(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def is_junction(path: Path) -> bool:
+    # pathlib.is_junction only exists from Python 3.12; the service supports 3.11.
+    if os.name != "nt":
+        return False
+    try:
+        return path.lstat().st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    except FileNotFoundError:
+        return False
 
 
 def distinct_names(rows, caption, limit=56, always_suffix=False, reserved=()):
@@ -91,7 +102,7 @@ class ArchiveTree:
         for path in (candidate, *candidate.parents):
             if path == self.storage.settings.data_dir:
                 break
-            if path.is_symlink() or path.is_junction():
+            if path.is_symlink() or is_junction(path):
                 raise ValueError("目录树路径含链接，请移走该链接后重试：" + str(path))
         if not candidate.resolve().is_relative_to(self.root):
             raise ValueError("目录树路径越界")

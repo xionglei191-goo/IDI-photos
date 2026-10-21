@@ -7,6 +7,15 @@ from idi.api import create_app
 from idi.config import Settings
 
 
+def login_admin(client, app):
+    app.state.services['access'].save_user({'username': 'network-admin', 'display_name': '网络测试管理员',
+        'password': 'network-test-password', 'system_role': 'admin'}, bootstrap=True)
+    response = client.post('/api/auth/login', json={'username': 'network-admin', 'password': 'network-test-password'},
+                           headers={'X-IDI-Request': '1'})
+    assert response.status_code == 200
+    return response
+
+
 @pytest.fixture
 def lan_app(tmp_path):
     return create_app(Settings((tmp_path / 'archive').resolve(), host='0.0.0.0', worker_enabled=False,
@@ -16,6 +25,8 @@ def lan_app(tmp_path):
 def test_lan_client_reads_page_and_can_make_same_origin_write(lan_app):
     with TestClient(lan_app, base_url='http://192.168.31.252:8766', client=('192.168.31.80', 50000)) as client:
         assert client.get('/api/health').status_code == 200
+        assert client.get('/api/system').status_code == 401
+        login_admin(client, lan_app)
         system = client.get('/api/system').json()
         assert system['local_only'] is False
         assert system['lan_urls'] == ['http://192.168.31.252:8766']
@@ -40,7 +51,8 @@ def test_lan_mode_retains_host_and_write_protections(lan_app):
         for origin in ('https://attacker.example', 'http://192.168.31.252:8000', 'https://192.168.31.252:8766', 'null'):
             response = client.post('/api/projects', json={'name': 'bad'}, headers={'X-IDI-Request': '1', 'Origin': origin})
             assert response.status_code == 403
-        assert client.get('/api/projects').json() == []
+        assert client.get('/api/projects').status_code == 401
+        assert not lan_app.state.services['db'].all('SELECT * FROM projects')
 
 
 def test_default_still_rejects_lan_clients(app):
@@ -51,6 +63,17 @@ def test_default_still_rejects_lan_clients(app):
 def test_loopback_remains_available_in_lan_mode(lan_app):
     with TestClient(lan_app, base_url='http://127.0.0.1:8766', client=('127.0.0.1', 50000)) as client:
         assert client.get('/api/health').status_code == 200
+
+
+def test_lan_cannot_bootstrap_admin_even_with_local_forwarded_address(lan_app):
+    with TestClient(lan_app, base_url='http://192.168.31.252:8766', client=('192.168.31.80', 50000),
+                    headers={'X-IDI-Request': '1', 'X-Forwarded-For': '127.0.0.1'}) as client:
+        assert client.get('/api/auth/status').json() == {'setup_required': True, 'setup_allowed': False}
+        result = client.post('/api/auth/setup', json={
+            'username': 'lan-owner', 'display_name': 'LAN', 'password': 'blocked-test-password'})
+        assert result.status_code == 403
+        assert '系统管理员' in result.json()['detail']
+        assert not lan_app.state.services['db'].all('SELECT id FROM idi_users')
 
 
 def test_network_file_survives_restart_and_local_override(tmp_path, monkeypatch):
@@ -91,14 +114,28 @@ def tunnel_app(tmp_path):
 
 
 def test_tunnel_get_and_same_origin_write_preserve_real_proxy_peer(tunnel_app):
-    with TestClient(tunnel_app, base_url='http://idi.example.test', client=('192.168.31.246', 50000),
+    with TestClient(tunnel_app, base_url='https://idi.example.test', client=('192.168.31.246', 50000),
                     headers={'X-Forwarded-Proto': 'https', 'X-Forwarded-For': '203.0.113.15'}) as client:
         assert client.get('/api/health').status_code == 200
+        response = login_admin(client, tunnel_app)
+        assert 'Secure' in response.headers['set-cookie']
         assert client.get('/api/system').json()['public_urls'] == ['https://idi.example.test']
         response = client.post('/api/projects', json={'name': '公网入口测试'},
                                headers={'Origin': 'https://idi.example.test', 'X-IDI-Request': '1'})
         assert response.status_code == 200
         assert response.json()['name'] == '公网入口测试'
+
+
+def test_public_tunnel_reports_setup_unavailable_and_rejects_bootstrap(tunnel_app):
+    with TestClient(tunnel_app, base_url='https://idi.example.test', client=('192.168.31.246', 50000),
+                    headers={'X-Forwarded-Proto': 'https', 'X-Forwarded-For': '127.0.0.1',
+                             'X-IDI-Request': '1', 'Origin': 'https://idi.example.test'}) as client:
+        assert client.get('/api/auth/status').json() == {'setup_required': True, 'setup_allowed': False}
+        result = client.post('/api/auth/setup', json={
+            'username': 'public-owner', 'display_name': 'Public', 'password': 'blocked-test-password'})
+        assert result.status_code == 403
+        assert 'SSH' in result.json()['detail'] and '手机' not in result.json()['detail']
+        assert not tunnel_app.state.services['db'].all('SELECT id FROM idi_users')
 
 
 @pytest.mark.parametrize('peer,proto', [
@@ -126,6 +163,7 @@ def test_tunnel_keeps_domain_origin_and_header_checks(tunnel_app):
 def test_public_configuration_does_not_change_direct_lan_access(tunnel_app):
     with TestClient(tunnel_app, base_url='http://192.168.31.252:8766', client=('192.168.31.80', 50000)) as client:
         assert client.get('/api/health').status_code == 200
+        login_admin(client, tunnel_app)
         response = client.post('/api/projects', json={'name': '直接局域网访问'},
                                headers={'Origin': 'http://192.168.31.252:8766', 'X-IDI-Request': '1', 'X-Forwarded-Proto': 'https'})
         assert response.status_code == 200

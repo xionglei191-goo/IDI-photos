@@ -16,12 +16,13 @@ from .case_agent import tool
 from .db import dump, now, uid
 from .domain import DomainError, PHOTO_GROUPS, STAGES, WORKFLOW_STAGES
 from .platform_photos import online_photo_counts
+from .agent_dates import DATE_PERIOD
 
 TEXT = {'type': 'string'}
 PAGE = {'page': {'type': 'integer', 'minimum': 1, 'maximum': 10000},
         'page_size': {'type': 'integer', 'minimum': 1, 'maximum': 50}}
-DATES = {key: {**TEXT, 'description': '北京时间日期 YYYY-MM-DD，含当日', 'maxLength': 10}
-         for key in ('date_from', 'date_to')}
+DATES = {**{key: {**TEXT, 'description': '北京时间日期 YYYY-MM-DD，含当日；相对日期优先用 date_period', 'maxLength': 10}
+         for key in ('date_from', 'date_to')}, **DATE_PERIOD}
 SCOPE = {'project_ref': TEXT, 'case_ref': TEXT}
 PHOTO_FILTERS = {**SCOPE, **PAGE, **DATES, 'query': {**TEXT, 'maxLength': 160},
                  'photo_group': {'type': 'string', 'enum': [*PHOTO_GROUPS, 'unknown']},
@@ -136,9 +137,11 @@ class AgentCapabilities:
         return result
 
     def search_photos(self, args):
+        args = self.owner.dates.resolve('search_photos', args)
         result = self.photo_page(args)
         result['items'] = [self.public_photo(p) for p in result['items']]
         result['scope'] = '当前授权范围的本机归档清单；日期为北京时间归档日期，未查看图片内容'
+        self.owner.dates.record('search_photos', args, result)
         return result
 
     def public_photo(self, photo):

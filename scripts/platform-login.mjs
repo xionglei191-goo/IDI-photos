@@ -5,6 +5,10 @@ import { chromium } from '../frontend/node_modules/playwright/index.mjs';
 
 const LOGIN_URL = 'https://gzzb2021.com/idi/#/login';
 const validToken = value => typeof value === 'string' && value.trim() && !['undefined', 'null'].includes(value.trim());
+export const browserLaunchOptions = (platform = process.platform) => ({
+  headless: true,
+  ...(platform === 'win32' ? { channel: 'chrome' } : {}),
+});
 
 export class WebsiteLoginError extends Error {
   constructor(message, status, failure) { super(message); this.status = status; this.failure = failure; }
@@ -76,7 +80,7 @@ async function main() {
     credentials = JSON.parse(input);
     input = '';
     phase = 'browser';
-    browser = await chromium.launch({ channel: 'chrome', headless: true });
+    browser = await chromium.launch(browserLaunchOptions());
     const context = await browser.newContext();
     const page = await context.newPage();
     const token = await loginThroughWebsite(page, credentials, diagnostics, value => { phase = value; });
@@ -86,7 +90,7 @@ async function main() {
     let message = '官网登录过程未完成，请稍后重试或先在官网确认登录要求。';
     let status = 502;
     if (error instanceof WebsiteLoginError) { message = error.message; status = error.status; diagnostics.failure = error.failure; }
-    else if (phase === 'browser') { message = '官网登录浏览器未能启动，请检查本机 Chrome 是否可用。'; status = 503; diagnostics.failure = 'browser_unavailable'; }
+    else if (phase === 'browser') { message = '官网登录浏览器未能启动，请检查服务端浏览器组件是否可用。'; status = 503; diagnostics.failure = 'browser_unavailable'; }
     else if (timedOut) {
       status = 504;
       diagnostics.failure = phase === 'token_response' ? 'token_missing' : 'timeout';

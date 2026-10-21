@@ -54,7 +54,7 @@ export default function VisitDialog({ value, close, notify, refresh }: { value: 
     } catch (e) { setError(message(e)); } finally { setBusy(false); }
   }
   const matching = (p: Photo) => !matchingDate || !date || !photoDay(p) || (photoDay(p) >= date && photoDay(p) <= (end?.slice(0, 10) || date));
-  const ownPhotos = photos.filter(p => (p.stage === stage || (stage === 'work' && p.photo_group === 'completion')) && (matching(p) || ids.includes(p.id)));
+  const ownPhotos = photos.filter(p => !(p.reuse_source_id && shared.includes(p.reuse_source_id)) && (p.stage === stage || (stage === 'work' && p.photo_group === 'completion')) && (matching(p) || ids.includes(p.id)));
   const sharedPhotos = photos.filter(p => p.photo_group === 'survey_checkin' && ['building_checkin', 'door_checkin'].includes(p.role) && p.media_type === 'image' && (matching(p) || shared.includes(p.id)));
   function choices(items: Photo[], reuse: boolean) {
     const selected = reuse ? shared : ids;
@@ -64,21 +64,21 @@ export default function VisitDialog({ value, close, notify, refresh }: { value: 
       const wrongDate = reuse && (!date || photoDay(p) !== date);
       const reason = p.recognition_state === 'conflict' ? '识别冲突，需先核对' : assignedElsewhere ? '已关联另一次进场' : wrongDate ? '日期与本次进场不同或未核实' : '';
       return <label className={`visit-photo-option ${reason ? 'unavailable' : ''}`} key={p.id}>
-        <input type="checkbox" aria-label={`${p.original_name}（${reuse ? '共用查勘打卡' : '本次资料'}）`} disabled={busy || (!!reason && !selected.includes(p.id))} checked={selected.includes(p.id)} onChange={e => change(v => e.target.checked ? [...v, p.id] : v.filter(id => id !== p.id))} />
+        <input type="checkbox" aria-label={`${p.original_name}（${reuse ? '复制为维修打卡' : '本次资料'}）`} disabled={busy || (!!reason && !selected.includes(p.id))} checked={selected.includes(p.id)} onChange={e => change(v => e.target.checked ? [...v, p.id] : v.filter(id => id !== p.id))} />
         {p.thumbnail_url && <img src={p.thumbnail_url} alt="" loading="lazy" />}
         <span><strong>{p.original_name}</strong><small>{ROLES[p.role] || PHOTO_GROUPS[p.photo_group]} · {dateTime(p.watermark_time || p.exif_time)}</small>
-          <small>{reason || (reuse ? '原件仍归查勘；同时用于本次施工打卡' : p.visit_key || p.process || '未分进场')}</small></span>
+          <small>{reason || (reuse ? p.reuse_copy_id ? '使用已有维修副本，保留查勘原照' : '复制为维修打卡，保留查勘原照' : p.visit_key || p.process || '未分进场')}</small></span>
       </label>;
     })}{!items.length && <p className="muted">当前筛选下没有可选照片。</p>}</div>;
   }
-  return <Modal title="进场与维修记录" wide close={() => { if (!busy) close(); }} footer={<><span className="grow muted">照片只保存一份；不同次进场分别核对</span><button disabled={busy} onClick={close}>关闭</button><button className="primary" type="submit" form="visit-record" disabled={busy || loading || !date}>{busy ? '正在保存…' : editing ? '保存本次记录' : '建立进场记录'}</button></>}>
+  return <Modal title="进场与维修记录" wide close={() => { if (!busy) close(); }} footer={<><span className="grow muted">查勘原照和维修副本分别归档；不同次进场分别核对</span><button disabled={busy} onClick={close}>关闭</button><button className="primary" type="submit" form="visit-record" disabled={busy || loading || !date}>{busy ? '正在保存…' : editing ? '保存本次记录' : '建立进场记录'}</button></>}>
     <p className="muted">{place(value)} · {value.title}</p><ErrorBox error={error || list.error} />
     <div className="visit-record-heading"><h3>已记录的进场</h3><button disabled={busy} onClick={() => edit(null)}>新增一次进场</button></div>
     <div className="visit-record-list">{list.data?.map(v => <article key={v.id} className={editing?.id === v.id ? 'active' : ''}>
       <div className="row between wrap"><strong>{v.visit_date} · {v.visit_key || STAGES[v.stage]}</strong><button disabled={busy} aria-label={`编辑${v.visit_date} ${v.visit_key || STAGES[v.stage]}`} onClick={() => edit(v)}>编辑本次</button></div>
-      <p>{STAGES[v.stage]}{v.crew_number ? ` · ${v.crew_number} 人` : ''}{v.started_at ? ` · ${timeInput(v.started_at).slice(11)}` : ''}{v.finished_at ? ` 至 ${timeInput(v.finished_at).slice(0, 10) === v.visit_date ? timeInput(v.finished_at).slice(11) : dateTime(v.finished_at)}` : ''}{v.same_day_repair ? ' · 当天维修、共用查勘打卡' : ''}</p>
+      <p>{STAGES[v.stage]}{v.crew_number ? ` · ${v.crew_number} 人` : ''}{v.started_at ? ` · ${timeInput(v.started_at).slice(11)}` : ''}{v.finished_at ? ` 至 ${timeInput(v.finished_at).slice(0, 10) === v.visit_date ? timeInput(v.finished_at).slice(11) : dateTime(v.finished_at)}` : ''}{v.same_day_repair ? ' · 当天维修、复制查勘打卡' : ''}</p>
       {v.notes && <p className="visit-notes">{v.notes}</p>}
-      {v.stage === 'work' && <div className="visit-counts"><span className={v.counts.building_checkin ? '' : 'material-missing'}>楼栋打卡 {v.counts.building_checkin}</span><span className={v.counts.door_checkin ? '' : 'material-missing'}>入户打卡 {v.counts.door_checkin}</span><span className={v.counts.construction ? '' : 'material-missing'}>施工 {v.counts.construction}</span><span>完工 {v.counts.completion}</span>{!!v.counts.shared_checkin && <span>其中共用打卡 {v.counts.shared_checkin}</span>}</div>}
+      {v.stage === 'work' && <div className="visit-counts"><span className={v.counts.building_checkin ? '' : 'material-missing'}>楼栋打卡 {v.counts.building_checkin}</span><span className={v.counts.door_checkin ? '' : 'material-missing'}>入户打卡 {v.counts.door_checkin}</span><span className={v.counts.construction ? '' : 'material-missing'}>施工 {v.counts.construction}</span><span>完工 {v.counts.completion}</span>{!!v.counts.shared_checkin && <span>其中复用副本 {v.counts.shared_checkin}</span>}</div>}
     </article>)}{!list.loading && !list.data?.length && <p className="muted">尚未区分进场。按实际记录建立；同一天多次上门也分别记录。</p>}</div>
     <form id="visit-record" onSubmit={save} className="visit-record-form">
       <h3>{editing ? '编辑本次进场' : '新增进场'}</h3><fieldset disabled={busy}><div className="form-grid">
@@ -94,7 +94,7 @@ export default function VisitDialog({ value, close, notify, refresh }: { value: 
       <label className="check space-top"><input type="checkbox" checked={matchingDate} onChange={e => setMatchingDate(e.target.checked)} />按本次日期筛选照片</label>
       <p className="muted">日期筛选用于找照片，不会自动把同一天的多次施工合并。已属于其他进场的照片需先从原记录移除。</p>
       {loading ? <Loading /> : <><h4>本次资料 · 已选 {ids.length}</h4>{choices(ownPhotos, false)}
-        {stage === 'work' && sameDay && <><h4>共用本次查勘打卡 · 已选 {shared.length}</h4><p className="muted">选择楼栋及入户照片。保留查勘分类，同时计入这一次施工；后续进场需使用新的打卡。</p>{choices(sharedPhotos, true)}</>}</>}
+        {stage === 'work' && sameDay && <><h4>复制查勘打卡为维修打卡 · 已选 {shared.length}</h4><p className="muted">选择当天同次进场的楼栋及入户照片，保存时生成独立维修副本，保留查勘原照及原水印。已有副本会直接使用；后续进场需使用新的打卡。</p>{choices(sharedPhotos, true)}</>}</>}
     </form>
   </Modal>;
 }

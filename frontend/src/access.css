@@ -1,0 +1,17 @@
+.auth-page{min-height:100dvh;display:grid;place-items:center;padding:24px;background:#f5f6f8}
+.auth-card{width:min(100%,440px);padding:36px;background:#fff;border:1px solid #dde2e8;border-radius:16px;box-shadow:0 12px 40px #17212b0b}
+.auth-brand{color:#a53f22;font-weight:650;letter-spacing:.03em;margin-bottom:20px}
+.auth-card h1{font-size:26px;margin-bottom:12px}.auth-card form,.access-form{display:grid;gap:18px;margin-top:24px}
+.auth-card label,.access-form label{display:grid;gap:7px}.auth-card input,.access-form input,.access-form select{min-height:44px;width:100%}
+.auth-card form>button{min-height:44px;margin-top:6px}.access-settings{display:grid;gap:20px}
+.auth-setup-notice{display:grid;gap:16px;margin-top:24px}.auth-setup-notice>button{min-height:44px}
+.access-settings td small,.settings-card td small{display:block;margin-top:4px;color:#667180}
+.access-settings select{min-height:40px;max-width:100%}.project-workspace{min-height:100dvh;background:#f7f8fa}
+.project-workspace>main{max-width:1500px;margin:auto;padding:24px}.project-toolbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+.project-toolbar label{display:flex;align-items:center;gap:8px}.project-photo-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px;margin:20px 0}
+.project-photo{background:white;border:1px solid #dfe3e9;border-radius:10px;overflow:hidden}
+.project-photo>a{display:flex;height:170px;align-items:center;justify-content:center;background:#edf0f4}
+.project-photo img{width:100%;height:100%;object-fit:contain}.project-photo>div{padding:14px}.project-photo p{overflow-wrap:anywhere;margin:0 0 8px}
+.project-photo small{display:block;color:#667180;margin:5px 0}.project-photo .row{margin-top:12px}
+.project-workspace .app-header{position:relative}.project-workspace .settings-card{margin:16px 0}.project-member-hint{padding:14px 18px;background:#edf5ee;border-left:3px solid #56835c;border-radius:4px;margin:18px 0}
+@media(max-width:640px){.auth-card{padding:24px}.project-workspace>main{padding:16px}.project-toolbar label{width:100%}.project-toolbar select{flex:1;min-width:0}.project-photo-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.project-photo>a{height:140px}.project-workspace .brand{font-size:15px}.project-workspace .app-header{padding:12px}}

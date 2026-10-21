@@ -16,6 +16,7 @@ from .config import Settings
 from .db import Database, audit, dump, now, rowdict, uid
 from .domain import Domain, DomainError, photo_group
 from .storage import ALLOWED_EXTS, Storage
+from .identity import current, require_project
 
 
 def infer_path_metadata(path: str):
@@ -39,6 +40,7 @@ def infer_path_metadata(path: str):
 class Importer:
     def __init__(self, settings: Settings, db: Database, storage: Storage, domain: Domain):
         self.settings, self.db, self.storage, self.domain = settings, db, storage, domain
+        self.dedup = None
 
     def create_batch(self, kind, project_id=None, case_id=None, details=None):
         if case_id:
@@ -46,54 +48,97 @@ class Importer:
         elif project_id and not self.db.one("SELECT id FROM projects WHERE id=?", (project_id,)):
             raise DomainError("项目不存在")
         batch_id = uid()
+        require_project(project_id)
+        person = current()
         with self.db.tx() as con:
-            con.execute("INSERT INTO import_batches(id,kind,project_id,case_id,details,created_at) VALUES(?,?,?,?,?,?)", (batch_id, kind, project_id, case_id, dump(details or {}), now()))
+            con.execute("INSERT INTO import_batches(id,kind,project_id,case_id,details,created_at,user_id) VALUES(?,?,?,?,?,?,?)", (batch_id, kind, project_id, case_id, dump(details or {}), now(), person.id if person else None))
         return batch_id
 
     def batch(self, batch_id):
         result = self.db.one("SELECT * FROM import_batches WHERE id=?", (batch_id,))
         if not result:
             raise DomainError("导入批次不存在", 404)
+        require_project(result['project_id'])
         result["details"] = json.loads(result["details"])
         result["items"] = self.db.all("SELECT * FROM import_items WHERE batch_id=? ORDER BY created_at", (batch_id,))
         return result
 
     def add_file(self, data: bytes, name: str, *, case_id=None, project_id=None, source_type="upload",
-                 source_path="", batch_id=None, message=None, metadata=None):
+                 source_path="", batch_id=None, message=None, metadata=None, prepared_ocr=None):
         if case_id:
             project_id = self.domain.case(case_id)["project_id"]
-        blob = self.storage.put(data, name)
+        require_project(project_id)
+        person = current()
+        if not data or len(data) > self.settings.max_file_bytes:
+            raise ValueError("文件为空或超过单文件大小限制")
+        suffix = Path(name).suffix.lower()
+        if suffix not in ALLOWED_EXTS:
+            raise ValueError(f"不支持的文件类型：{suffix or '无扩展名'}")
+        incoming_hash = hashlib.sha256(data).hexdigest()
+        if prepared_ocr and prepared_ocr['blob_hash'] != incoming_hash:
+            raise DomainError('识别后图片文件发生变化，请重新导入', 409)
         fields = infer_path_metadata(source_path or name)
-        metadata = metadata or {}
+        metadata = {**(metadata or {}), 'uploaded_by': person.id if person else None,
+                    'uploaded_by_name': person.display_name if person else ''}
         for key in ("stage", "role", "part", "process", "watermark_time", "notes"):
             if key in metadata:
                 fields[key] = metadata[key]
-        if blob["media_type"] != "image":
-            fields["role"] = "other"
         message = message or {}
-        source_key = hashlib.sha256(dump([source_path or name, blob["hash"], message.get("id", "")]).encode()).hexdigest()
+        source_key = hashlib.sha256(dump([source_path or name, incoming_hash, message.get("id", "")]).encode()).hexdigest()
         with self.db.tx() as con:
             if case_id:
-                photo = rowdict(con.execute("SELECT * FROM photos WHERE case_id=? AND blob_hash=?", (case_id, blob["hash"])).fetchone())
+                photo = rowdict(con.execute("SELECT * FROM photos WHERE case_id=? AND blob_hash=? AND reuse_source_id IS NULL", (case_id, incoming_hash)).fetchone())
             else:
-                photo = rowdict(con.execute("SELECT * FROM photos WHERE case_id IS NULL AND COALESCE(project_id,'')=? AND blob_hash=?", (project_id or "", blob["hash"])).fetchone())
+                photo = rowdict(con.execute("SELECT * FROM photos WHERE case_id IS NULL AND COALESCE(project_id,'')=? AND blob_hash=? AND reuse_source_id IS NULL", (project_id or "", incoming_hash)).fetchone())
                 if photo is None:
                     # A later folder copy must retain provenance on the already filed image.
                     # Ambiguous reuse across multiple cases remains unassigned for review.
-                    candidates = con.execute("SELECT * FROM photos WHERE blob_hash=?" + (" AND project_id=?" if project_id else ''),
-                                             (blob['hash'], project_id) if project_id else (blob['hash'],)).fetchall()
+                    candidates = con.execute("SELECT * FROM photos WHERE blob_hash=? AND reuse_source_id IS NULL" + (" AND project_id=?" if project_id else ''),
+                                             (incoming_hash, project_id) if project_id else (incoming_hash,)).fetchall()
                     if len(candidates) == 1:
                         photo = dict(candidates[0])
+            reason = ''
+            if photo is None and source_type == 'feishu' and prepared_ocr and self.dedup:
+                photo, reason = self.dedup.find(con, data, prepared_ocr['identity'],
+                    case_id=prepared_ocr['case_id'], project_id=project_id,
+                    scope_conflict=prepared_ocr['scope_conflict'])
             duplicate = photo is not None
             if duplicate:
                 photo_id = photo["id"]
+                blob = rowdict(con.execute('SELECT * FROM blobs WHERE hash=?', (photo['blob_hash'],)).fetchone())
+                if blob['hash'] == incoming_hash:
+                    # Preserve the existing restore/mismatch behavior for exact file retries.
+                    blob = self.storage.put(data, name, connection=con)
+                elif not self.storage.verify(blob):
+                    raise DomainError('已有照片原件校验失败，未合并新来源', 409)
+                if prepared_ocr and self.dedup and blob['hash'] == incoming_hash:
+                    if not photo['watermark_code']:
+                        self.dedup.remember(con, photo_id, prepared_ocr['identity'])
+                    self.dedup.cache(con, prepared_ocr)
             else:
+                blob = self.storage.put(data, name, connection=con)
+                if blob["media_type"] != "image":
+                    fields["role"] = "other"
                 photo_id = uid()
                 reviewed_metadata = any(k in metadata for k in ("stage", "role", "part", "process", "watermark_time"))
-                con.execute("INSERT INTO photos(id,blob_hash,project_id,case_id,stage,role,part,process,watermark_time,exif_time,notes,recognition_state,created_at,updated_at,photo_group) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (photo_id, blob["hash"], project_id, case_id, fields["stage"], fields["role"], fields.get("part", ""), fields.get("process", ""), fields.get("watermark_time"), blob.get("exif_time"), fields.get("notes", ""), "recognized" if reviewed_metadata else "pending", now(), now(), photo_group(fields['stage'], fields['role'])))
+                con.execute("INSERT INTO photos(id,blob_hash,project_id,case_id,stage,role,part,process,watermark_time,exif_time,notes,recognition_state,created_at,updated_at,photo_group,uploaded_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (photo_id, blob["hash"], project_id, case_id, fields["stage"], fields["role"], fields.get("part", ""), fields.get("process", ""), fields.get("watermark_time"), blob.get("exif_time"), fields.get("notes", ""), "recognized" if reviewed_metadata else "pending", now(), now(), photo_group(fields['stage'], fields['role']), person.id if person else None))
                 audit(con, "photo", photo_id, "import", after={"blob_hash": blob["hash"], "case_id": case_id, "source_type": source_type, "source_path": source_path, "metadata": metadata}, actor="import")
+                if prepared_ocr and self.dedup:
+                    self.dedup.remember(con, photo_id, prepared_ocr['identity'], reason)
+                    self.dedup.cache(con, prepared_ocr)
+                    if reason:
+                        con.execute("UPDATE photos SET recognition_state='conflict' WHERE id=?", (photo_id,))
+            if source_type == 'feishu':
+                metadata = {**metadata, 'original_hash': incoming_hash}
+                if prepared_ocr:
+                    metadata.update(watermark_code=prepared_ocr['identity']['code'],
+                                    watermark_confidence=prepared_ocr['identity']['confidence'],
+                                    watermark_dedup_reason=reason)
+                if duplicate:
+                    metadata.update(deduplicated=True, primary_hash=blob['hash'])
             con.execute("INSERT OR IGNORE INTO photo_sources VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (uid(), photo_id, batch_id, message.get("id"), source_type, source_key, Path(name.replace("\\", "/")).name, source_path, message.get("group_name", ""), message.get("sender", ""), message.get("sent_at"), now(), dump(metadata)))
-        return {"photo_id": photo_id, "duplicate": duplicate, "blob_hash": blob["hash"], "media_type": blob["media_type"]}
+        return {"photo_id": photo_id, "duplicate": duplicate, "blob_hash": blob["hash"], "media_type": blob["media_type"],
+                "incoming_hash": incoming_hash, "watermark_dedup_reason": reason}
 
     def folder_entries(self, folder: str):
         root = Path(folder).expanduser().resolve()
@@ -143,7 +188,7 @@ class Importer:
                 name = entry["name"]
                 item_name = f"{index + 1:05d} · {name}" if name_counts[name] > 1 else name
                 done = self.db.one("SELECT status,photo_id FROM import_items WHERE batch_id=? AND source_name=?", (batch_id, item_name))
-                if done and done["status"] in ("imported", "duplicate"):
+                if done and done["status"] in ("imported", "duplicate", "deleted"):
                     if done["photo_id"]:
                         new_ids.append(done["photo_id"])
                     progress(index + 1, len(entries))

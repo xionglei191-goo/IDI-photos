@@ -26,15 +26,84 @@ def test_case_evidence_is_filled_without_photos_and_ambiguous_fields_are_explain
     result = platform.prefill_draft(case['id'], 'survey', set())
     plan = result['plan']
     assert result['changed']
-    assert plan['draft']['values'] == {'defectDesc': '施工时保护不到位、操作不当造成', 'defectiveSite': '主卧卫生间瓷砖'}
+    assert plan['draft']['values'] == {'defectDesc': '施工时保护不到位、操作不当造成', 'defectiveSite': '主卧卫生间瓷砖',
+                                      'divisionWorksCode': 'part_engineering_03'}
     assert plan['draft']['files'] == {}
-    assert len(plan['field_sources']) == 2
+    assert len(plan['field_sources']) == 3
     assert all(s['origin'] == 'automatic' and s['current'] and not s['stale'] for s in plan['field_sources'].values())
-    assert '装饰装修工程' in plan['field_suggestion_notes']['divisionWorksCode']
+    assert '装饰装修工程' in plan['field_sources']['divisionWorksCode']['source']
+    assert 'divisionWorksCode' not in plan['field_suggestion_notes']
     assert '多个' not in plan['field_suggestion_notes']['siteSurveyDate']
     revision = plan['draft']['revision']
     again = platform.prefill_draft(case['id'], 'survey', set())
     assert not again['changed'] and again['plan']['draft']['revision'] == revision
+
+
+def test_single_personnel_prefill_includes_name_phone_and_is_stable(platform, case):
+    platform.test_survey.clear()
+    platform.test_survey['repairMethod'] = '1'
+    platform.test_personnel[:] = platform.test_personnel[:1]
+    enter_stage(platform, case['id'], 'survey')
+    plan = platform.prefill_draft(case['id'], 'survey', set())['plan']
+    assert plan['draft']['values']['repairUserId'] == 'person-1'
+    assert plan['business_fields']['repairPersonName'] == '甲'
+    assert plan['business_fields']['repairPersonPhone'] == '13800000001'
+    assert plan['field_sources']['repairUserId']['origin'] == 'automatic'
+    assert not platform.prefill_draft(case['id'], 'survey', set())['changed']
+    # A later change to multiple candidates removes the unconfirmed automatic choice.
+    platform.test_personnel.append({'userId': 'person-2', 'name': '乙', 'phone': '13800000002'})
+    enter_stage(platform, case['id'], 'survey')
+    plan = platform.prefill_draft(case['id'], 'survey', set())['plan']
+    assert 'repairUserId' not in plan['draft']['values']
+
+
+@pytest.mark.parametrize('personnel_value', ['person-1', ''])
+def test_new_selection_rules_preserve_manual_category_and_personnel(platform, case, personnel_value):
+    platform.test_survey.clear()
+    platform.test_personnel[:] = platform.test_personnel[:1]
+    enter_stage(platform, case['id'], 'survey')
+    data = draft_data(platform, case['id'], 'survey', {
+        'divisionWorksCode': 'part_engineering_04', 'repairMethod': '1', 'repairUserId': personnel_value})
+    platform.save_draft(case['id'], 'survey', data)
+    plan = platform.prefill_draft(case['id'], 'survey', set())['plan']
+    assert plan['values']['divisionWorksCode'] == 'part_engineering_04'
+    assert plan['values']['repairUserId'] == personnel_value
+    assert plan['field_sources']['divisionWorksCode']['origin'] == 'manual'
+    assert plan['field_sources']['repairUserId']['origin'] == 'manual'
+
+
+def test_updated_rules_revisit_waiting_cases_and_save_only_drafts(platform, services, case, photo, monkeypatch):
+    import idi.automatic_uploads as automatic_module
+    import idi.platform as platform_module
+
+    auto, _, uploads, writes, _ = setup_flow(services, platform, case, photo, monkeypatch)
+    platform.test_survey.clear()
+    platform.test_survey['repairMethod'] = '1'
+    platform.test_personnel[:] = platform.test_personnel[:1]
+    services['domain'].save_case({'title': '洗手盆水龙头松动，次卧门把手松动'}, case['id'])
+    enter_stage(platform, case['id'], 'survey')
+    current_suggestions = platform_module.stage_suggestions
+
+    def old_suggestions(*args, **kwargs):
+        suggestions, notes = current_suggestions(*args, **kwargs)
+        for key in ('divisionWorksCode', 'repairUserId'):
+            suggestions.pop(key, None)
+        return suggestions, notes
+
+    with monkeypatch.context() as previous:
+        previous.setattr(automatic_module, 'PREFILL_RULES_VERSION', 'automatic-prefill-v1')
+        previous.setattr(platform_module, 'stage_suggestions', old_suggestions)
+        assert tick(auto, case['id'])['state'] == 'needs_fields'
+        assert auto.run_once() == 0
+    previous_writes = len(writes)
+    assert auto.run_once() == 1
+    payload = writes[-1][1]
+    assert len(writes) == previous_writes + 1
+    assert payload['divisionWorksCode'] == 'part_engineering_03'
+    assert payload['repairUserId'] == 'person-1'
+    assert payload['repairPersonName'] == '甲' and payload['repairPersonPhone'] == '13800000001'
+    assert all(p['state'] == 0 for _, p in writes) and not uploads
+    assert auto.run_once() == 0
 
 
 def test_manual_values_explicit_blanks_and_file_selections_are_preserved(platform, services, case, photo):
@@ -43,9 +112,10 @@ def test_manual_values_explicit_blanks_and_file_selections_are_preserved(platfor
     data = draft_data(platform, case['id'], 'survey', {'defectDesc': '', 'defectiveSite': '人工核实的部位', 'siteSurveyDate': '2026-10-16 09:15'}, {'buildingFileInfoList': [p['id']]})
     platform.save_draft(case['id'], 'survey', data)
     plan = platform.prefill_draft(case['id'], 'survey', {p['id']})['plan']
-    assert plan['draft']['values'] == data['values']
+    assert plan['draft']['values'] == {**data['values'], 'divisionWorksCode': 'part_engineering_03'}
     assert plan['draft']['files'] == data['files']
-    assert all(s['origin'] == 'manual' for s in plan['field_sources'].values())
+    assert all(plan['field_sources'][key]['origin'] == 'manual' for key in data['values'])
+    assert plan['field_sources']['divisionWorksCode']['origin'] == 'automatic'
     # A removed key also represents an explicit manual clear.
     platform.save_draft(case['id'], 'survey', draft_data(platform, case['id'], 'survey', {}))
     assert platform.prefill_draft(case['id'], 'survey', {p['id']})['plan']['draft']['values'] == {}

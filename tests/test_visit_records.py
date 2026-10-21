@@ -31,7 +31,7 @@ def record(domain, case, photos, **changes):
                                              shared_checkin_ids=[p['id'] for p in photos[:2]], **changes))
 
 
-def test_shared_originals_count_in_two_uses_but_remain_four_originals(services, case, photo, client):
+def test_shared_checkins_create_independent_records_and_preserve_original_bytes(services, case, photo, client):
     domain = services['domain']
     photos = materials(photo)
     originals = [services['storage'].resolve(services['db'].one('SELECT stored_path FROM blobs WHERE hash=?', (p['blob_hash'],))['stored_path']).read_bytes() for p in photos]
@@ -39,12 +39,14 @@ def test_shared_originals_count_in_two_uses_but_remain_four_originals(services, 
     assert any(r['missing'] for r in before['items'] if r['stage'] == 'work' and 'checkin' in r['role'])
     visit = record(domain, case, photos)
     assert visit['counts'] == {'building_checkin': 1, 'door_checkin': 1, 'construction': 1, 'completion': 1, 'shared_checkin': 2}
-    assert domain.photos(case_id=case['id'])['total'] == 4
+    assert domain.photos(case_id=case['id'])['total'] == 6
+    copies = {p['reuse_source_id']: p for p in domain.photos(case_id=case['id'], photo_group='work_checkin')['items']}
+    assert set(copies) == {p['id'] for p in photos[:2]}
     assert domain.photos(case_id=case['id'], photo_group='survey_checkin')['total'] == 2
     assert domain.photos(case_id=case['id'], photo_group='work_checkin')['total'] == 2
     assert domain.photos(case_id=case['id'], stage='work')['total'] == 3
     response = client.get('/api/photos', params={'case_id': case['id'], 'visit_id': visit['id']}).json()
-    assert {p['id'] for p in response['items']} == {p['id'] for p in photos}
+    assert {p['id'] for p in response['items']} == {p['id'] for p in photos[2:]} | {p['id'] for p in copies.values()}
     for p, data in zip(photos, originals):
         current = domain.photo(p['id'])
         assert current['blob_hash'] == hashlib.sha256(data).hexdigest()
@@ -53,7 +55,7 @@ def test_shared_originals_count_in_two_uses_but_remain_four_originals(services, 
         assert domain.photo(p['id'])['visit_id'] is None
         assert domain.photo(p['id'])['shared_checkin_visit_id'] == visit['id']
     quality = domain.completeness(case['id'])
-    assert quality['total_images'] == 4
+    assert quality['total_images'] == 6
     assert all(r['count'] == 1 and r['missing'] == 0 for r in quality['items'] if r['stage'] == 'work' and 'checkin' in r['role'])
     with services['db'].tx() as con:
         con.execute("UPDATE cases SET workflow_stage='repair' WHERE id=?", (case['id'],))
@@ -61,8 +63,8 @@ def test_shared_originals_count_in_two_uses_but_remain_four_originals(services, 
     assert board['photo_counts']['survey_checkin'] == board['photo_counts']['work_checkin'] == 2
     assert board['shared_checkin_count'] == 2 and board['work_visit_count'] == 1
     draft = services['platform'].draft(case['id'], 'repair')
-    assert draft['files']['buildingFileInfoList'] == [photos[0]['id']]
-    assert draft['files']['houseFileInfoList'] == [photos[1]['id']]
+    assert draft['files']['buildingFileInfoList'] == [copies[photos[0]['id']]['id']]
+    assert draft['files']['houseFileInfoList'] == [copies[photos[1]['id']]['id']]
 
 
 def test_second_entry_same_day_has_separate_gaps_and_cannot_reuse_first_checkin(services, case, photo):
@@ -130,12 +132,13 @@ def test_edit_release_and_stale_revision_keep_original_classification(services, 
     assert saved.status_code == 200
     assert saved.json()['counts']['shared_checkin'] == 0
     assert client.put(path, json=body).status_code == 409
-    assert domain.photos(case_id=case['id'], photo_group='work_checkin')['total'] == 0
+    assert domain.photos(case_id=case['id'], photo_group='work_checkin')['total'] == 2
+    assert all(p['visit_id'] is None for p in domain.photos(case_id=case['id'], photo_group='work_checkin')['items'])
     assert all(domain.photo(p['id'])['visit_id'] is None for p in photos)
     assert domain.photo(photos[0]['id'])['photo_group'] == 'survey_checkin'
 
 
-def test_photo_identity_change_invalidates_shared_link(services, case, photo):
+def test_original_date_change_does_not_rewrite_the_work_copy(services, case, photo):
     domain = services['domain']
     photos = materials(photo)
     visit = record(domain, case, photos)
@@ -143,9 +146,10 @@ def test_photo_identity_change_invalidates_shared_link(services, case, photo):
     assert len(domain.visits(case['id'])[0]['shared_checkin_ids']) == 2
     domain.update_photo(photos[0]['id'], {'watermark_time': '2026-10-17 09:25'})
     updated = domain.visits(case['id'])[0]
-    assert updated['shared_checkin_ids'] == [photos[1]['id']]
-    assert updated['counts']['building_checkin'] == 0
-    assert domain.photos(case_id=case['id'], photo_group='work_checkin')['total'] == 1
+    assert set(updated['shared_checkin_ids']) == {p['id'] for p in photos[:2]}
+    assert updated['counts']['building_checkin'] == 1
+    assert domain.photos(case_id=case['id'], photo_group='work_checkin')['total'] == 2
+    domain.save_visit(case['id'], {**updated, 'same_day_repair': True}, visit['id'])
 
 
 def test_export_preserves_entry_records_gaps_and_one_copy_per_original(services, case, photo):
@@ -153,9 +157,9 @@ def test_export_preserves_entry_records_gaps_and_one_copy_per_original(services,
     photos = materials(photo)
     first = record(domain, case, photos)
     second = domain.save_visit(case['id'], entry(visit_key='下午返场', started_at=None, finished_at=None, same_day_repair=False, notes='=HYPERLINK("unsafe")'))
-    package = services['reporter'].build(uid(), case['id'], [p['id'] for p in photos], 'insurer-v2')
+    package = services['reporter'].build(uid(), case['id'], [p['id'] for p in domain.photos(case_id=case['id'])['items']], 'insurer-v2')
     manifest = package['manifest']
-    assert len(manifest['photos']) == 4
+    assert len(manifest['photos']) == 6
     assert {v['id'] for v in manifest['visits']} == {first['id'], second['id']}
     assert any(r['scope_key'] == 'visit:' + second['id'] and r['missing'] for r in manifest['completeness']['items'])
     with zipfile.ZipFile(services['storage'].resolve(package['zip_path'])) as archive:

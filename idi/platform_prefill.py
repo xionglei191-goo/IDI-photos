@@ -10,6 +10,8 @@ from datetime import datetime
 from .platform_contract import STAGES
 
 
+PREFILL_RULES_VERSION = 'automatic-prefill-v2'
+
 ENGINEERING_TERMS = {
     '地基基础和主体结构': ('地基', '基础沉降', '主体结构', '承重', '梁柱', '楼板结构'),
     '保温和防水工程': ('防水', '屋面渗漏', '外墙渗漏', '外墙渗水'),
@@ -168,7 +170,15 @@ def survey_suggestions(case, link, photos, selections, values, dictionaries):
         if key in suggestions:
             continue
         names = [name for name, terms in rules.items() if any(term in text for term in terms)]
-        if len(names) == 1:
+        if key == 'divisionWorksCode' and len(names) > 1:
+            # Choose consistently from matched, currently available categories.
+            # Dictionary codes must still come from the official option list.
+            for name in names:
+                code = option_code(dictionary, name)
+                if code:
+                    add(key, code, '资料匹配' + '、'.join(names) + '；按自动填报规则选用：' + name, problem_ids)
+                    break
+        elif len(names) == 1:
             code = option_code(dictionary, names[0])
             if code:
                 add(key, code, '依据报修问题与所选查勘照片文字匹配官网选项：' + names[0], problem_ids)
@@ -189,7 +199,15 @@ def survey_suggestions(case, link, photos, selections, values, dictionaries):
     if 'repairMethod' not in suggestions and not values.get('repairMethod'):
         notes['repairMethod'] = '尚未确认查勘与维修的实际安排，无法自动选择当天维修、计划维修或零注拒。'
     if not values.get('repairUserId') and 'repairUserId' not in suggestions:
-        notes['repairUserId'] = '请确认本次实际维修人员；官网候选人员列表本身不能证明谁已到场。'
+        personnel = snapshot.get('personnel', [])
+        people = {p['userId']: p for p in personnel if p.get('userId')}
+        if len(people) == 1:
+            person = next(iter(people.values()))
+            add('repairUserId', person['userId'], '官网维修人员仅有一个候选，自动选择：' + (person.get('name') or person['userId']))
+        elif people:
+            notes['repairUserId'] = '官网有多个维修人员候选，请选择本次维修人员。'
+        else:
+            notes['repairUserId'] = '当前没有已核对的官网维修人员候选，请刷新官网案件资料后选择。'
     if not values.get('estimateRestorationCostCode') and 'estimateRestorationCostCode' not in suggestions:
         notes['estimateRestorationCostCode'] = '现有资料没有明确的费用预估范围，请按实际核价选择。'
     return suggestions, notes

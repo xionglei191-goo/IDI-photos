@@ -9,6 +9,7 @@ export async function api<T = unknown>(path: string, options: RequestInit = {}):
   if (options.body && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json');
   const response = await fetch(path, { ...options, headers });
   if (!response.ok) {
+    if (response.status === 401 && response.headers.get('X-IDI-Auth') === 'expired' && !path.startsWith('/api/auth/')) window.dispatchEvent(new Event('idi-session-expired'));
     let message = `请求失败 (${response.status})`;
     try { const error = await response.json(); message = typeof error.detail === 'string' ? error.detail : JSON.stringify(error.detail || error); } catch { /* retain status */ }
     throw new ApiError(message, response.status);

@@ -1,6 +1,6 @@
 {
   "name": "idi-workbench",
-  "version": "0.2.34",
+  "version": "0.2.41",
   "private": true,
   "type": "module",
   "scripts": {

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from .connectors.feishu import content_parts
 from .db import dump, now
 from .domain import DomainError
+from .agent_dates import parsed
 
 SUMMARY_BUDGET = 2600
 HISTORY_BUDGET = 9000
@@ -26,6 +27,7 @@ agreements 只表示对话中的明确约定，不代表业务审批。不要记
 每条必须引用输入提供的 sources 编号，不能发明来源；合并重复事项，删除已被替代的内容。
 focus、agreements、pending 各最多6条，每条 text 不超过300字、sources 最多4个；总正文尽量不超过1000字。
 多人话题保留关键约定的发言人标识；某人的个人偏好不代表其他成员的偏好。
+历史“今天/昨天”等相对日期须保留其消息日期；旧答复里的日期可能错误，不能作为当前日期或已核验业务事实。
 仅调用 finish_context_summary 返回 JSON。'''
 SUMMARY_TOOL = [{'type': 'function', 'function': {
     'name': 'finish_context_summary', 'description': '保存本次完整替换摘要，不包含业务操作。',
@@ -324,7 +326,9 @@ class ConversationContext:
         # Include whole turns, not a character-truncated version of every turn.
         selected, used, selected_count = [], 0, 0
         for item in reversed(old + recent):
-            pair = [{'role': 'user', 'content': item['question']}]
+            at = parsed(item['created_at'])
+            history_at = at.isoformat(timespec='seconds') if at else item['created_at']
+            pair = [{'role': 'user', 'content': f'[历史消息时间：{history_at}；仅作上下文，相对日期不代表现在]\n' + item['question']}]
             if item['answer']:
                 pair.append({'role': 'assistant', 'content': item['answer']})
             cost = token_estimate(pair)

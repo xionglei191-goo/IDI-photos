@@ -4,6 +4,8 @@ import json
 
 from .domain import DomainError
 from .platform_contract import STAGES
+from .platform_photos import active_attachment
+from .checkin_copies import verified_copy_receipts
 
 
 def check_material_scope(platform, case, allowed_photo_ids):
@@ -22,11 +24,21 @@ def prepare_materials(platform, case, incoming, *, actor):
     draft, link = platform.draft(case['id'], stage), platform.link(case['id'])
     files = deepcopy(draft['files']) if draft['revision'] else {}
     remote_ids = {str(f['id']) for field in STAGES[stage]['fields'] if field['kind'] == 'files'
-                  for f in (platform._remote(link, stage).get(field['key']) or []) if isinstance(f, dict) and f.get('id')}
+                  for f in (platform._remote(link, stage).get(field['key']) or []) if active_attachment(f)}
+    removed = {field['key']: {str(item['id']): item['fileUrl'] for item in platform.removed_files(link, stage).get(field['key'], [])}
+               for field in STAGES[stage]['fields'] if field['kind'] == 'files'}
+    removed_photos = set()
     uploaded = set()
     for row in db.all("SELECT result FROM platform_review_batches WHERE case_id=? AND stage=? AND state IN ('save_verified','verified')", (case['id'], stage)):
-        uploaded.update(pid for pid, receipt in json.loads(row['result']).get('uploaded', {}).items() if str(receipt.get('id')) in remote_ids)
+        for pid, receipt in json.loads(row['result']).get('uploaded', {}).items():
+            if str(receipt.get('id')) in remote_ids:
+                uploaded.add(pid)
+            for field, items in removed.items():
+                if items.get(str(receipt.get('id'))) == receipt.get('fileUrl') and receipt.get('fileUrl'):
+                    removed_photos.add((field, pid))
+    uploaded.update(verified_copy_receipts(platform, case['id'], stage, link))
     excluded = {(r['field'], r['photo_id']) for r in db.all('SELECT field,photo_id FROM platform_draft_exclusions WHERE case_id=? AND stage=?', (case['id'], stage))}
+    blocked = {(r['field'], r['blob_hash']) for r in db.all('SELECT field,blob_hash FROM platform_attachment_blocks WHERE case_id=? AND stage=?', (case['id'], stage))}
     applicable, omitted = set(), set()
     for photo in incoming:
         current = platform.domain.photo(photo['id'])
@@ -36,14 +48,15 @@ def prepare_materials(platform, case, incoming, *, actor):
             raise DomainError('图片存在未解决冲突或原件校验失败，未自动选材', 409)
         for field in STAGES[stage]['fields']:
             suggest = field.get('suggest')
-            shared = suggest == ['work', photo['role']] and photo.get('shared_checkin_visit_id') and photo['role'] in ('building_checkin', 'door_checkin')
+            shared = suggest == ['work', photo['role']] and photo.get('shared_checkin_visit_id') and not photo.get('reuse_copy_id') and photo['role'] in ('building_checkin', 'door_checkin')
             if (suggest != [photo['stage'], photo['role']] and not shared) or field.get('readonly'):
                 continue
             if (photo.get('extension') or '').lower() not in field['extensions']:
                 omitted.add(photo['id'])
                 continue
             applicable.add(photo['id'])
-            if (field['key'], photo['id']) in excluded:
+            if ((field['key'], photo['id']) in excluded or (field['key'], photo['blob_hash']) in blocked
+                    or (field['key'], photo['id']) in removed_photos):
                 omitted.add(photo['id'])
             elif photo['id'] not in uploaded:
                 files[field['key']] = list(dict.fromkeys([*files.get(field['key'], []), photo['id']]))
@@ -52,7 +65,7 @@ def prepare_materials(platform, case, incoming, *, actor):
     if applicable and applicable <= uploaded:
         return {**base, 'state': 'already_saved', 'reason': '本次照片已有回执并存在于官网快照，未重复上传'}
     if applicable and applicable <= omitted:
-        return {**base, 'state': 'excluded', 'reason': '本次照片已被人工排除或文件格式不适用，未重新加入'}
+        return {**base, 'state': 'excluded', 'reason': '本次照片已从官网删除、被人工排除或文件格式不适用，未重新加入'}
     if files != (draft['files'] if draft['revision'] else {}) or not draft['revision']:
         plan = platform.save_draft(case['id'], stage, {'values': deepcopy(draft['values']), 'files': files,
             'revision': draft['revision'], 'link_revision': link['revision']}, actor=actor, photo_guards=incoming,

@@ -185,14 +185,28 @@ class ConnectorService:
                 after_read = path.stat()
                 if (before_read.st_size, before_read.st_mtime_ns) != (after_read.st_size, after_read.st_mtime_ns):
                     raise DomainError('文件仍在写入，等待保存完成后重试')
+                prepared = None
+                if (connector['kind'] == 'feishu' and path.suffix.lower() in IMAGE_EXTS
+                        and connector['config'].get('auto_ocr') and self.importer.dedup):
+                    prepared = self.importer.dedup.prepare(content, path,
+                        case_id=connector['config'].get('case_id'), project_id=connector['config'].get('project_id'))
                 imported = self.importer.add_file(content, event.get("original_name") or path.name,
                          case_id=connector["config"].get("case_id"), project_id=connector["config"].get("project_id"), source_type=connector["kind"],
-                         source_path=str(path), message=message, metadata={"context_text": context_text, "identity_scope": event.get("identity_scope", "provided_event"), **{key: raw[key] for key in ('chat_id', 'feishu_message_id', 'remote_message_type', 'resource_key', 'resource_type', 'captured_at') if key in raw}})
+                         source_path=str(path), message=message, prepared_ocr=prepared,
+                         metadata={"context_text": context_text, "identity_scope": event.get("identity_scope", "provided_event"), **{key: raw[key] for key in ('chat_id', 'feishu_message_id', 'remote_message_type', 'resource_key', 'resource_type', 'captured_at') if key in raw}})
                 result.update(photo_id=imported["photo_id"], media_state="saved", duplicate=bool(existing) or imported["duplicate"])
                 with self.db.tx() as con:
                     con.execute("UPDATE messages SET media_state='saved',photo_id=?,error=NULL WHERE id=?", (imported["photo_id"], message_id))
                 if imported["media_type"] == "image" and not imported["duplicate"] and connector["config"].get("auto_ocr"):
                     self.jobs.enqueue("recognize", {"photo_ids": [imported["photo_id"]]})
+                if connector['kind'] == 'feishu' and imported['duplicate']:
+                    # Only remove our downloaded inbox copy after both source and receipt committed.
+                    inbox = (self.settings.data_dir / 'inbox' / connector_id).resolve()
+                    try:
+                        if path.is_relative_to(inbox) and hashlib.sha256(path.read_bytes()).hexdigest() == imported['incoming_hash']:
+                            path.unlink()
+                    except OSError:
+                        log.warning('Duplicate inbox attachment could not be removed')
             except Exception as error:
                 result.update(media_state="failed", error=str(error))
                 with self.db.tx() as con:

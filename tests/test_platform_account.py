@@ -282,6 +282,7 @@ def test_unauthorized_write_is_not_replayed_by_reconnection(account, monkeypatch
         return httpx.Response(401, json={'code': 2})
     account.platform.client.close()
     account.platform.client = PlatformClient(httpx.MockTransport(transport), write_enabled=True)
+    account.platform.project_accounts = None  # lifecycle of an isolated project writer
     restored = configured(account)
     logins = fake_login(restored, monkeypatch)
     restored.tick()

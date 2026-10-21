@@ -25,8 +25,12 @@ class Settings:
     lan_subnets: tuple[str, ...] = ()
     public_origins: tuple[str, ...] = ()
     trusted_proxies: tuple[str, ...] = ()
+    local_admin_proxies: tuple[str, ...] = ()
+    deployment: str = "local"
 
     def __post_init__(self):
+        if self.deployment not in ("local", "vps"):
+            raise ValueError("部署类型必须为 local 或 vps")
         address = ip_address(self.host)
         if address.version != 4:
             raise ValueError("服务监听地址必须是 IPv4 地址")
@@ -42,7 +46,7 @@ class Settings:
                 raise ValueError("开放局域网前必须配置本机局域网地址和允许访问的网段")
             if not address.is_unspecified and address not in hosts:
                 raise ValueError("监听地址不在本机局域网地址列表中")
-        for value in self.trusted_proxies:
+        for value in (*self.trusted_proxies, *self.local_admin_proxies):
             proxy = ip_address(value)
             if proxy.version != 4 or (not proxy.is_loopback and not any(proxy in net for net in networks)):
                 raise ValueError("受信代理必须是本机或已允许局域网内的明确 IPv4 地址")
@@ -76,7 +80,7 @@ class Settings:
 
     @property
     def lan_urls(self) -> list[str]:
-        return [] if self.local_only else [f"http://{host}:{self.port}" for host in self.lan_hosts]
+        return [] if self.local_only or self.deployment == "vps" else [f"http://{host}:{self.port}" for host in self.lan_hosts]
 
     def allows_client(self, host: str) -> bool:
         if host == "testclient":
@@ -92,11 +96,11 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         data_dir = Path(os.environ.get("IDI_DATA_DIR", ROOT / "data")).resolve()
-        path = data_dir / "network.json"
+        path = Path(os.environ.get("IDI_NETWORK_FILE", data_dir / "network.json"))
         network = json.loads(path.read_text(encoding="utf-8-sig")) if path.is_file() else {}
         if not isinstance(network, dict):
             raise ValueError("network.json 必须是网络配置对象")
-        for key in ("lan_hosts", "lan_subnets", "public_origins", "trusted_proxies"):
+        for key in ("lan_hosts", "lan_subnets", "public_origins", "trusted_proxies", "local_admin_proxies"):
             if not isinstance(network.get(key, []), list) or any(not isinstance(value, str) for value in network.get(key, [])):
                 raise ValueError(f"network.json 的 {key} 必须是字符串列表")
         return cls(
@@ -109,6 +113,8 @@ class Settings:
             lan_subnets=tuple(network.get("lan_subnets", [])),
             public_origins=tuple(network.get("public_origins", [])),
             trusted_proxies=tuple(network.get("trusted_proxies", [])),
+            local_admin_proxies=tuple(network.get("local_admin_proxies", [])),
+            deployment=network.get("deployment", "local"),
         )
 
     def prepare(self) -> None:

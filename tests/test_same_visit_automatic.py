@@ -30,7 +30,7 @@ def test_explicit_same_entry_unblocks_original_work_watermark_for_both_stages(pl
     visit = share(services, case, picture)
     current = services['domain'].photo(picture['id'])
     assert current['blob_hash'] == picture['blob_hash']
-    assert current['revision'] == picture['revision'] + 1
+    assert current['revision'] == picture['revision']
     assert services['db'].one('SELECT dirty FROM photo_pipeline WHERE photo_id=?', (picture['id'],))['dirty'] == 1
     assert rules.process(picture['id'])['state'] == 'local_draft'
     plan = platform.prefill_draft(case['id'], 'survey', {picture['id']})['plan']
@@ -38,10 +38,12 @@ def test_explicit_same_entry_unblocks_original_work_watermark_for_both_stages(pl
     assert plan['draft']['files']['buildingFileInfoList'] == [picture['id']]
     assert plan['field_sources']['siteSurveyDate']['photo_ids'] == [picture['id']]
     enter_stage(platform, case['id'], 'repair')
-    assert rules.process(picture['id'])['state'] == 'local_draft'
-    assert platform.draft(case['id'], 'repair')['files']['buildingFileInfoList'] == [picture['id']]
+    copy_id = current['reuse_copy_id']
+    assert rules.process(picture['id'])['state'] == 'stage_mismatch'
+    assert rules.process(copy_id)['state'] == 'local_draft'
+    assert platform.draft(case['id'], 'repair')['files']['buildingFileInfoList'] == [copy_id]
     assert services['domain'].photo(picture['id'])['shared_checkin_visit_id'] == visit['id']
-    assert services['db'].one('SELECT COUNT(*) n FROM photos')['n'] == 1
+    assert services['db'].one('SELECT COUNT(*) n FROM photos')['n'] == 2
     assert not services['db'].one('SELECT * FROM platform_review_batches')
 
 
@@ -58,7 +60,7 @@ def test_removing_reuse_invalidates_queued_evidence_and_noop_visit_edit_does_not
     assert services['domain'].photo(picture['id'])['revision'] == before['revision']
     assert services['db'].one('SELECT dirty FROM photo_pipeline WHERE photo_id=?', (picture['id'],))['dirty'] == 0
     services['domain'].save_visit(case['id'], {**visit, 'same_day_repair': False, 'shared_checkin_ids': []}, visit['id'])
-    assert services['domain'].photo(picture['id'])['revision'] == before['revision'] + 1
+    assert services['domain'].photo(picture['id'])['revision'] == before['revision']
     assert services['db'].one('SELECT dirty FROM photo_pipeline WHERE photo_id=?', (picture['id'],))['dirty'] == 1
     assert platform.preview(case['id'], 'survey')['field_sources']['siteSurveyDate']['stale']
     assert rules.process(picture['id'])['state'] == 'needs_check'
@@ -94,12 +96,14 @@ def test_shared_visit_does_not_hide_real_purpose_or_scope_conflict(platform, ser
     assert services['photo_workflow'].purpose_conflicts(current, fields, set(current['confirmed_fields']))
 
 
-def test_reclassifying_shared_photo_removes_reuse_and_marks_pipeline_dirty(platform, services, case, photo, monkeypatch):
+def test_reclassifying_original_preserves_work_copy_and_marks_only_original_dirty(platform, services, case, photo, monkeypatch):
     enter_stage(platform, case['id'], 'survey')
     picture = checkin(services, case, photo, monkeypatch)
     share(services, case, picture)
     services['photo_workflow'].process(picture['id'])
     current = services['domain'].update_photo(picture['id'], {'photo_group': 'work_checkin', 'role': 'building_checkin'})
-    assert not current['shared_checkin_visit_id']
+    assert current['shared_checkin_visit_id']
+    copy = services['domain'].photo(current['reuse_copy_id'])
+    assert copy['photo_group'] == 'work_checkin' and copy['revision'] == 1
     assert services['db'].one('SELECT dirty FROM photo_pipeline WHERE photo_id=?', (picture['id'],))['dirty'] == 1
     assert services['db'].all('PRAGMA foreign_key_check') == []

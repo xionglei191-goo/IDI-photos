@@ -2,9 +2,11 @@ annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
 certifi==2026.7.22
+cffi==2.1.1
 charset-normalizer==3.5.2
 click==8.5.0
 colorama==0.4.6
+cryptography==48.0.1
 et-xmlfile==2.0.0
 fastapi==0.143.1
 flatbuffers==25.12.19
@@ -26,6 +28,7 @@ pip==25.0.1
 pluggy==1.6.0
 protobuf==7.36.2
 pyclipper==1.4.0
+pycparser==3.11
 pycryptodome==4.0.0
 pydantic==2.14.1
 pydantic-core==2.50.1

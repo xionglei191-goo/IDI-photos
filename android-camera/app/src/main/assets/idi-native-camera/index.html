@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>正在打开今日相机</title>
+</head>
+<body>
+  <script>
+    // 1.3.70's native launcher uses form encoding (space -> '+'), while its
+    // supplied renderer uses decodeURIComponent. Normalize only the URL encoding;
+    // keep literal '+' and every original field value intact. Vendor files stay unmodified.
+    const params = new URLSearchParams(window.location.search);
+    // Supported by this SDK's bundled index.*.js renderer. Scaling happens before
+    // the official SDK creates the JPEG, never as a post-processing step.
+    params.set('watermarkScale', '0.68');
+    const query = Array.from(params, ([key, value]) =>
+      encodeURIComponent(key) + '=' + encodeURIComponent(value)).join('&');
+    window.location.replace('../XheyCameraSDKAssets/index.html?' + query);
+  </script>
+</body>
+</html>

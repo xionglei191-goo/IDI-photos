@@ -1,0 +1,18 @@
+.photo-delete-button{color:var(--danger);white-space:nowrap}
+.photo-delete-button:hover{background:#fff0f0;border-color:#d89c9c}
+.photo-delete-confirm{background:var(--danger);color:#fff;border-color:var(--danger)}
+.photo-delete-confirm:hover{background:#8e2929;color:#fff;border-color:#8e2929}
+.photo-delete-confirm:disabled{opacity:.5}
+.photo-table .photo-actions-column{position:sticky;right:0;z-index:1;width:96px;min-width:96px;background:var(--bg);box-shadow:-1px 0 var(--line);text-align:center}
+.photo-table thead .photo-actions-column{z-index:3;background:#f3f6f9}
+.photo-table tr.selected .photo-actions-column{background:#eaf3fb}
+.photo-actions-column button{min-height:36px}
+.photo-delete-note{margin-top:12px;font-size:13px;line-height:1.7}
+.photo-delete-list{list-style:none;margin:16px 0 0;padding:0;max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:6px}
+.photo-delete-list li{display:flex;align-items:center;gap:12px;padding:10px 12px;border-bottom:1px solid var(--line)}
+.photo-delete-list li:last-child{border-bottom:0}
+.photo-delete-list img{width:54px;height:54px;object-fit:cover;border-radius:4px;flex-shrink:0}
+.photo-delete-list li>div{min-width:0;overflow-wrap:anywhere}
+.photo-delete-list strong{font-size:13px;font-weight:500}
+.photo-delete-list small{display:block;margin-top:4px;color:var(--muted);font-size:12px}
+@media(pointer:coarse){.photo-actions-column button,.photo-delete-button,.photo-delete-confirm{min-height:44px}}

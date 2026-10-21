@@ -29,11 +29,13 @@ def platform_routes(service):
 
     @router.post("/session")
     def connect(data: dict = Body(...)):
-        return service.account.temporary_login(data.get("username"), data.get("password"))
+        with service.material_lock:
+            return service.account.temporary_login(data.get("username"), data.get("password"))
 
     @router.delete("/session")
     def disconnect():
-        return service.account.disconnect()
+        with service.material_lock:
+            return service.account.disconnect()
 
     @router.get('/account')
     def account():
@@ -41,15 +43,18 @@ def platform_routes(service):
 
     @router.put('/account')
     def save_account(data: dict = Body(...)):
-        return service.account.configure(data)
+        with service.material_lock:
+            return service.account.configure(data)
 
     @router.post('/account/connect')
     def connect_account():
-        return service.account.request_connect()
+        with service.material_lock:
+            return service.account.request_connect()
 
     @router.delete('/account')
     def forget_account():
-        return service.account.forget()
+        with service.material_lock:
+            return service.account.forget()
 
     @router.post("/dictionaries/refresh")
     def dictionaries():
@@ -75,9 +80,39 @@ def platform_routes(service):
     def workspace(case_id: str, stage: str):
         return service.preview(case_id, stage)
 
+    @router.get("/cases/{case_id}/stages/{stage}/files/{field_key}/{file_id}/{variant}")
+    def official_file(case_id: str, stage: str, field_key: str, file_id: str, variant: str):
+        return service.media.response(service.preview(case_id, stage), field_key, file_id, variant)
+
     @router.post("/cases/{case_id}/stages/{stage}/preview")
     def preview(case_id: str, stage: str, data: dict = Body(...)):
         return service.preview(case_id, stage, data)
+
+    @router.post("/cases/{case_id}/stages/{stage}/files/{field_key}/official/{file_id}/removal")
+    def prepare_removal(case_id: str, stage: str, field_key: str, file_id: str):
+        return service.removals.prepare(case_id, stage, field_key, file_id)
+
+    @router.post("/cases/{case_id}/stages/{stage}/files/{field_key}/local/{photo_id}/remove")
+    def remove_local_file(case_id: str, stage: str, field_key: str, photo_id: str, data: dict = Body(...)):
+        return service.removals.remove_local(case_id, stage, field_key, photo_id, data.get('revision'))
+
+    @router.get("/attachment-removals/{removal_id}")
+    def removal(removal_id: str):
+        return service.removals.get(removal_id)
+
+    @router.post("/attachment-removals/{removal_id}/confirm")
+    def confirm_removal(removal_id: str, data: dict = Body(...)):
+        if data.get('acknowledged') is not True:
+            raise DomainError('请确认要从此环节删除并撤回这张照片')
+        return service.removals.confirm(removal_id, data.get('fingerprint'))
+
+    @router.post("/attachment-removals/{removal_id}/readback")
+    def readback_removal(removal_id: str):
+        return service.removals.reconcile(removal_id)
+
+    @router.get("/attachment-removals/{removal_id}/{variant}")
+    def removal_file(removal_id: str, variant: str):
+        return service.removals.response(removal_id, variant)
 
     @router.put("/cases/{case_id}/stages/{stage}")
     def save(case_id: str, stage: str, data: dict = Body(...)):

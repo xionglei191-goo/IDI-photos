@@ -5,13 +5,14 @@ import json
 import logging
 import threading
 import time
+from contextlib import nullcontext
 
 from fastapi import APIRouter, Body
 
 from .db import audit, dump, now
 from .domain import DomainError
 from .photo_ai import digest
-from .platform_prefill import canonical_value
+from .platform_prefill import PREFILL_RULES_VERSION, canonical_value
 
 log = logging.getLogger(__name__)
 UNRESOLVED = ('submitting', 'saved', 'submitted', 'uncertain')
@@ -22,16 +23,20 @@ class AutomaticUploads:
         self.workflow, self.reviews, self.rules = workflow, reviews, photo_workflow
         self.db, self.platform, self.domain = workflow.db, workflow.platform, workflow.domain
         self._stop, self._lock, self._thread = threading.Event(), threading.Lock(), None
+        self.notifications = None
 
     def policy(self):
-        return self.db.setting('automatic_upload_policy', {'enabled': False, 'activated_at': ''})
+        return {'enabled': False, 'activated_at': '', 'notify_review_ready': False,
+                **self.db.setting('automatic_upload_policy', {})}
 
     def configure(self, data):
-        if set(data) != {'enabled'} or type(data['enabled']) is not bool:
-            raise DomainError('请提供自动上传开关')
-        old = self.policy()
-        self.db.set_setting('automatic_upload_policy', {**old, **data,
-            'activated_at': old.get('activated_at') or now() if data['enabled'] else old.get('activated_at', '')})
+        if not data or set(data) - {'enabled', 'notify_review_ready'} or any(type(v) is not bool for v in data.values()):
+            raise DomainError('请提供有效的自动上传或飞书核对提醒开关')
+        with self.notifications._lock if self.notifications else nullcontext():
+            old = self.policy()
+            value = {**old, **data}
+            value['activated_at'] = old.get('activated_at') or now() if value['enabled'] else old.get('activated_at', '')
+            self.db.set_setting('automatic_upload_policy', value)
         return self.status()
 
     def enroll(self, case_id, enabled=True):
@@ -47,24 +52,66 @@ class AutomaticUploads:
         return self.get(case_id)
 
     def get(self, case_id):
-        row = self.db.one('SELECT u.*,c.short_code,c.platform_report_code,c.title,c.workflow_stage,p.name AS project_name FROM automatic_upload_cases u JOIN cases c ON c.id=u.case_id JOIN projects p ON p.id=c.project_id WHERE case_id=?', (case_id,))
+        self.domain.case(case_id)
+        row = self.db.one('SELECT u.*,c.project_id,c.short_code,c.platform_report_code,c.title,c.workflow_stage,p.name AS project_name FROM automatic_upload_cases u JOIN cases c ON c.id=u.case_id JOIN projects p ON p.id=c.project_id WHERE case_id=?', (case_id,))
         if row:
             row['detail'] = json.loads(row['detail'])
+            row['notification'] = self.notifications.status_for(row) if self.notifications else None
         return row
 
     def status(self):
-        rows = self.db.all("SELECT case_id FROM automatic_upload_cases ORDER BY CASE WHEN state='awaiting_confirmation' THEN 0 ELSE 1 END,updated_at DESC LIMIT 200")
+        from .identity import current, project_filter
+        scope, args = project_filter('c.project_id')
+        rows = self.db.all("SELECT case_id FROM automatic_upload_cases u JOIN cases c ON c.id=u.case_id WHERE " + scope + " ORDER BY CASE WHEN u.state='awaiting_confirmation' THEN 0 ELSE 1 END,u.updated_at DESC LIMIT 200", args)
         items = [self.get(r['case_id']) for r in rows]
-        counts = {r['state']: r['n'] for r in self.db.all('SELECT state,COUNT(*) AS n FROM automatic_upload_cases WHERE enabled=1 GROUP BY state')}
+        counts = {r['state']: r['n'] for r in self.db.all('SELECT u.state,COUNT(*) AS n FROM automatic_upload_cases u JOIN cases c ON c.id=u.case_id WHERE u.enabled=1 AND ' + scope + ' GROUP BY u.state', args)}
+        connected, enabled = self.platform.client.status()['connected'], self.platform.client.write_enabled
+        accounts = getattr(self.platform, 'project_accounts', None)
+        company_connected = connected
+        project_connections = []
+        if accounts:
+            projects = self.domain.projects()
+            connected = any(accounts.account(p['id']).client.status()['connected'] for p in projects)
+            enabled = accounts.write_enabled and any(accounts.enabled(p['id']) and accounts.account(p['id'])._config for p in projects)
+            company_connected = accounts.company.client.status()['connected']
+            # Only surface accounts needed by this person's active saves. A
+            # connected account for another project cannot unblock these cases.
+            needed = {item['project_id'] for item in items if item['enabled'] and (
+                item['workflow_stage'] in ('survey', 'repair') or
+                item['state'] in ('saving', 'readback_pending', 'awaiting_confirmation'))}
+            for project in projects:
+                if project['id'] not in needed:
+                    continue
+                account = accounts.account(project['id']).status()
+                state = account['state']
+                if account['configured']:
+                    if not accounts.enabled(project['id']):
+                        state = 'write_paused'
+                    elif not accounts.write_enabled:
+                        state = 'server_read_only'
+                project_connections.append({'project_id': project['id'], 'project_name': project['name'],
+                                            'state': state, 'connected': account['session']['connected']})
+        person = current()
         return {'policy': self.policy(), 'items': items, 'counts': counts,
-                'connected': self.platform.client.status()['connected'], 'write_enabled': self.platform.client.write_enabled}
+                'connected': bool(connected), 'write_enabled': bool(enabled),
+                'account_scope': 'project' if accounts else 'company',
+                'company_connected': bool(company_connected), 'project_connections': project_connections,
+                'can_configure_project_accounts': person is None or person.admin}
 
     def signature(self, case_id, *, proposal=False):
+        from .project_accounts import case_context
+        with case_context(self.platform, case_id):
+            return self._signature(case_id, proposal=proposal)
+
+    def _signature(self, case_id, *, proposal=False):
         case = self.domain.case(case_id)
         photos = self.db.all('SELECT p.id,p.revision,p.blob_hash,p.stage,p.role,p.photo_group,p.recognition_state,sc.visit_id AS shared_checkin_visit_id,r.dirty,r.identity,r.state,r.photo_revision FROM photos p LEFT JOIN photo_pipeline r ON r.photo_id=p.id LEFT JOIN visit_shared_checkins sc ON sc.photo_id=p.id WHERE p.case_id=? ORDER BY p.id', (case_id,))
-        data = ['automatic-prefill-v1', self.rules.case_signature(case), photos, self.platform.prefill_defaults(),
+        data = [PREFILL_RULES_VERSION, self.rules.case_signature(case), photos, self.platform.prefill_defaults(),
                 self.db.all('SELECT stage,revision,target_report_id FROM platform_drafts WHERE case_id=? ORDER BY stage', (case_id,)),
+                self.db.all('SELECT stage,field,photo_id,photo_revision,blob_hash,target_report_id FROM platform_manual_file_selections WHERE case_id=? ORDER BY stage,field,photo_id', (case_id,)),
                 self.platform.link(case_id)['revision']]
+        if getattr(self.platform, 'project_accounts', None):
+            data.append(self.platform.project_accounts.binding(case['project_id']))
         if not proposal:
             session = self.platform.client.status()
             data += [self.policy().get('enabled'), self.rules.policy(), session['connected'], session.get('account'), self.platform.client.write_enabled,
@@ -99,10 +146,25 @@ class AutomaticUploads:
         if not all(self.rules.policy().get(k) for k in ('rules_enabled', 'auto_drafts')):
             raise DomainError('照片规则或草稿整理已暂停', 409)
         case = self.domain.case(case_id)
+        files = self.platform.draft(case_id, case['workflow_stage'])['files']
+        manual = self.platform.manual_file_selections(case_id, case['workflow_stage'])
         for photo_id in selected:
             photo = self.domain.photo(photo_id)
+            if photo.get('uploaded_by') and getattr(self.platform, 'project_accounts', None):
+                # Reload enabled state and membership for queued uploads too.
+                user = self.db.one('SELECT enabled,system_role FROM idi_users WHERE id=?', (photo['uploaded_by'],))
+                member = self.db.one('SELECT role FROM project_members WHERE project_id=? AND user_id=?',
+                                     (case['project_id'], photo['uploaded_by']))
+                if not user or not user['enabled'] or user['system_role'] != 'admin' and not member:
+                    raise DomainError('上传人员的项目权限已失效，照片保留，请管理员核对', 403)
             pipeline = self.db.one('SELECT * FROM photo_pipeline WHERE photo_id=?', (photo_id,))
-            if photo['case_id'] != case_id or not pipeline or pipeline['dirty'] or pipeline['photo_revision'] != photo['revision'] or pipeline['identity'] == 'unverified' or pipeline['state'] not in ('local_draft', 'already_saved'):
+            if photo['case_id'] != case_id or not pipeline or pipeline['dirty'] or pipeline['photo_revision'] != photo['revision'] or pipeline['identity'] == 'unverified':
+                raise DomainError('选材含未核对或已变化的照片，请先核对归属与用途', 409)
+            if pipeline['state'] == 'stage_mismatch':
+                fields = [key for key, ids in files.items() if photo_id in ids]
+                if not fields or any((field, photo_id) not in manual for field in fields):
+                    raise DomainError('照片原分类与当前环节不同，或人工选材后照片已变化，请在对应附件栏重新选择并保存本地草稿', 409)
+            elif pipeline['state'] not in ('local_draft', 'already_saved'):
                 raise DomainError('选材含未核对或已变化的照片，请先核对归属与用途', 409)
             if not self.platform.storage.verify(photo):
                 raise DomainError('原件校验失败，请核对归档文件', 409)
@@ -119,10 +181,13 @@ class AutomaticUploads:
     def _prefill_photo_ids(self, case):
         allowed = set()
         excluded = {p['photo_id'] for p in self.db.all('SELECT photo_id FROM platform_draft_exclusions WHERE case_id=? AND stage=?', (case['id'], case['workflow_stage']))}
+        blocked = {p['blob_hash'] for p in self.db.all('SELECT blob_hash FROM platform_attachment_blocks WHERE case_id=? AND stage=?', (case['id'], case['workflow_stage']))}
         for row in self.db.all("SELECT p.id FROM photos p JOIN photo_pipeline r ON r.photo_id=p.id JOIN blobs b ON b.hash=p.blob_hash WHERE p.case_id=? AND b.media_type='image' AND r.dirty=0 AND r.photo_revision=p.revision AND r.identity<>'unverified' AND p.recognition_state IN ('recognized','confirmed')", (case['id'],)):
             if row['id'] in excluded:
                 continue
             photo = self.domain.photo(row['id'])
+            if photo['blob_hash'] in blocked:
+                continue
             if not self.platform.storage.verify(photo):
                 continue
             task = self.rules.source_task(photo['id'])
@@ -172,7 +237,7 @@ class AutomaticUploads:
 
     def _discover(self):
         # Enabling the feature does not bulk-submit the historical archive.
-        for row in self.db.all('SELECT DISTINCT p.case_id FROM photos p JOIN platform_links l ON l.case_id=p.case_id WHERE p.created_at>=? AND l.report_receiving_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM automatic_upload_cases u WHERE u.case_id=p.case_id) LIMIT 200', (self.policy().get('activated_at') or now(),)):
+        for row in self.db.all('SELECT DISTINCT p.case_id FROM photos p JOIN platform_links l ON l.case_id=p.case_id WHERE (p.created_at>=? OR p.uploaded_by IS NOT NULL) AND l.report_receiving_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM automatic_upload_cases u WHERE u.case_id=p.case_id) LIMIT 200', (self.policy().get('activated_at') or now(),)):
             self.enroll(row['case_id'])
 
     def run_once(self):
@@ -181,7 +246,7 @@ class AutomaticUploads:
         processed = 0
         try:
             self._discover()
-            for small in self.db.all('SELECT case_id FROM automatic_upload_cases WHERE enabled=1 ORDER BY updated_at'):
+            for small in self.db.all("SELECT u.case_id FROM automatic_upload_cases u WHERE u.enabled=1 ORDER BY EXISTS(SELECT 1 FROM photos p WHERE p.case_id=u.case_id AND p.photo_group IN ('survey_checkin','work_checkin') AND p.updated_at>=u.updated_at) DESC,u.updated_at"):
                 if self._stop.is_set() or not self.policy().get('enabled'):
                     break
                 row = self.get(small['case_id'])
@@ -210,6 +275,7 @@ class AutomaticUploads:
 
     def process(self, row):
         case_id = row['case_id']
+        self.platform.removals.require_clear(case_id, self.domain.case(case_id)['workflow_stage'])
         self._invalidate(row)
         if not all(self.rules.policy().get(k) for k in ('rules_enabled', 'auto_drafts')):
             return self._record(case_id, 'paused', {'reason': '请在系统状态中启用照片规则和草稿整理'})
@@ -220,7 +286,9 @@ class AutomaticUploads:
         # Revisit only enrolled cases, including next-stage photos received earlier.
         for p in self.db.all("SELECT p.id FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE p.case_id=? AND b.media_type='image' ORDER BY p.created_at,p.id", (case_id,)):
             self.rules.process(p['id'], revisit=True)
-        with self.platform.material_lock:
+        from .project_accounts import case_context
+        with self.platform.material_lock, case_context(self.platform, case_id):
+            self.platform.removals.require_clear(case_id, case['workflow_stage'])
             prefill = self.platform.prefill_draft(case_id, case['workflow_stage'], self._prefill_photo_ids(case))
             if not self.platform.client.status()['connected']:
                 return self._record(case_id, 'awaiting_login', {**self._detail(prefill['plan']),
@@ -311,5 +379,13 @@ def automatic_upload_routes(service):
     @router.post('/cases/{case_id}')
     def enroll(case_id: str, data: dict = Body(default={})):
         return service.enroll(case_id, data.get('enabled', True))
+
+    @router.post('/notifications/{delivery_id}/retry')
+    def retry_notification(delivery_id: str):
+        return service.notifications.retry(delivery_id)
+
+    @router.post('/notifications/{delivery_id}/confirm')
+    def confirm_notification(delivery_id: str, data: dict = Body(...)):
+        return service.notifications.confirm(delivery_id, data.get('received'))
 
     return router

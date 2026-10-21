@@ -13,8 +13,8 @@ from .storage import Storage
 
 
 class PlatformAccountStore:
-    def __init__(self, data_dir):
-        self.path = data_dir / 'secrets' / 'platform-account.bin'
+    def __init__(self, data_dir, filename='platform-account.bin'):
+        self.path = data_dir / 'secrets' / filename
 
     def load(self):
         if not self.path.is_file():
@@ -28,7 +28,7 @@ class PlatformAccountStore:
                 raise ValueError()
             return value
         except (OSError, ValueError, DomainError) as error:
-            raise DomainError('系统账号无法解密，请在保存账号时的 Windows 用户下重新配置。') from error
+            raise DomainError('系统账号无法解密，请恢复原凭据加密环境或重新配置账号。') from error
 
     def save(self, value):
         # Encrypt before creating even a temporary file. The archive backup excludes secrets/.
@@ -43,9 +43,14 @@ class PlatformAccountStore:
 
 
 class PlatformAccount:
-    def __init__(self, platform, data_dir):
+    def __init__(self, platform, data_dir, *, client=None, key='company', validate=None, login_gate=None):
         self.platform, self.db = platform, platform.db
-        self.store = PlatformAccountStore(data_dir)
+        accounts = getattr(platform, 'project_accounts', None)
+        self._client = client if client is not None else accounts.company.client if accounts else None
+        self.validate = validate
+        self.login_gate = login_gate
+        self.state_key = 'platform_account_state' if key == 'company' else 'platform_account_state:' + key
+        self.store = PlatformAccountStore(data_dir, 'platform-account.bin' if key == 'company' else 'platform-project-' + key + '.bin')
         self.clock = lambda: datetime.now(timezone.utc)
         self._gate = threading.Lock()
         self._meta = threading.RLock()
@@ -57,16 +62,16 @@ class PlatformAccount:
             self._config = self.store.load()
         except DomainError as error:
             self._config, self._load_error = {}, str(error)
-        previous = self.db.setting('platform_account_state', {})
+        previous = self.db.setting(self.state_key, {})
         self._state = previous if previous.get('revision') == self._config.get('revision') else {}
         self._connecting = False
 
     @property
     def client(self):
-        return self.platform.client
+        return self._client if self._client is not None else self.platform.client
 
     def _persist(self):
-        self.db.set_setting('platform_account_state', {**self._state, 'revision': self._config.get('revision')})
+        self.db.set_setting(self.state_key, {**self._state, 'revision': self._config.get('revision')})
 
     def status(self):
         session = self.client.status()
@@ -113,6 +118,8 @@ class PlatformAccount:
                 or not isinstance(password, str) or len(password) > 512 or type(enabled) is not bool):
             raise DomainError('系统账号、密码或自动连接设置无效。')
         username = username.strip()
+        if self.validate:
+            self.validate(username)
         with self._editing(), self._meta:
             if not password:
                 if username != self._config.get('username') or not self._config.get('password'):
@@ -149,6 +156,8 @@ class PlatformAccount:
         return self.client.status()
 
     def temporary_login(self, username, password):
+        if self.validate:
+            self.validate(username)
         # An explicit temporary account takes priority over the saved account until re-enabled.
         with self._editing():
             with self._meta:
@@ -160,7 +169,8 @@ class PlatformAccount:
                 self._persist()
                 self._connecting = True
             try:
-                return self.client.login(username, password)
+                with self._login_slot():
+                    return self.client.login(username, password)
             finally:
                 with self._meta:
                     self._connecting = False
@@ -195,9 +205,27 @@ class PlatformAccount:
             if not keep:
                 self._gate.release()
 
+    @contextmanager
+    def _login_slot(self):
+        if self.login_gate is None:
+            yield
+            return
+        while not self.login_gate.acquire(timeout=.25):
+            if self._stop.is_set():
+                raise DomainError('服务正在停止，未启动新的官网登录', 503)
+        try:
+            if self._stop.is_set():
+                raise DomainError('服务正在停止，未启动新的官网登录', 503)
+            yield
+        finally:
+            self.login_gate.release()
+
     def _attempt(self):
         try:
-            self.client.login(self._config['username'], self._config['password'])
+            with self._login_slot():
+                if self.validate:
+                    self.validate(self._config['username'])
+                self.client.login(self._config['username'], self._config['password'])
             with self._meta:
                 self._state.update(last_success_at=self.clock().isoformat(), failures=0,
                                    blocked=False, error='', next_retry_at=None)

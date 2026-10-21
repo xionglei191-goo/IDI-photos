@@ -1,3 +1,3 @@
 """IDI case archive application."""
 
-__version__ = "0.2.34"
+__version__ = "0.2.41"

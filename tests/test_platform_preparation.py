@@ -27,6 +27,9 @@ def remote_file(file_id="old-1", name="已有关联.jpg"):
 def platform(services, case):
     service = services["platform"]
     service.client.close()
+    # These contract tests exercise a single mocked website client. Routing
+    # between real project clients is covered by test_project_accounts.
+    service.project_accounts = None
     requests = []
     row = {"reportReceivingId": REMOTE_ID, "reportCode": "ZLBH20260001", "reportNumber": "0001234567890123456789",
            "communityName": "从化铂悦府", "communityDesc": "1栋201", "accidentDesc": "墙面起皮",
@@ -43,6 +46,7 @@ def platform(services, case):
     repair = {"reportReceivingId": REMOTE_ID, "repairAcceptanceId": REPAIR_ID,
               "buildingFileInfoList": [], "houseFileInfoList": [], "preRepairFileInfo": [remote_file("defect")],
               "recoveredFileInfo": [], "supplementaryMaterialsFileInfo": [{"customTypeCode": "supplementary_material", "noRequire": True}]}
+    personnel = [{"userId": "person-1", "name": "甲", "phone": "13800000001"}, {"userId": "person-2", "name": "乙", "mobilePhone": "13800000002"}]
     def transport(request):
         requests.append((request.url.path, json.loads(request.content)))
         path = request.url.path
@@ -55,7 +59,7 @@ def platform(services, case):
         elif path.endswith("repairAcceptance/getInfo/" + REPAIR_ID):
             data = repair
         elif path.endswith("getMaintenancePersonnelOrUnitPerson"):
-            data = [{"userId": "person-1", "name": "甲", "phone": "13800000001"}, {"userId": "person-2", "name": "乙", "mobilePhone": "13800000002"}]
+            data = personnel
         else:
             pytest.fail("Unexpected remote endpoint: " + path)
         return httpx.Response(200, json={"code": 0, "data": data, "count": 1})
@@ -64,6 +68,7 @@ def platform(services, case):
     service.client._account = "test-account"
     service.bind(case["id"], {"report_receiving_id": REMOTE_ID, "revision": 0})
     service.test_requests, service.test_row, service.test_claim, service.test_survey, service.test_repair = requests, row, claim, survey, repair
+    service.test_personnel = personnel
     return service
 
 

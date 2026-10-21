@@ -7,11 +7,12 @@ from datetime import datetime
 
 from .db import Database, audit, dump, now, rowdict, uid
 from .case_codes import issue_code, normalize_code, sync_project_codes, unique_prefix
+from .identity import current, project_filter, require_admin, require_project
 
 STAGES = {"unknown": "待分类", "survey": "查勘", "work": "施工", "acceptance": "验收照片"}
 ROLES = {"unknown": "待分类", "building_checkin": "楼栋打卡", "door_checkin": "入户门打卡", "problem": "问题照片", "construction": "施工过程", "finished": "完工效果", "other": "其他资料"}
 STATUSES = {"pending": "待处理", "survey": "查勘中", "working": "施工中", "completed": "已完工", "accepted": "已验收", "closed": "已结案"}
-PHOTO_GROUPS = {"survey_checkin": "查勘打卡", "survey_problem": "查勘问题", "work_checkin": "施工打卡", "construction": "施工", "completion": "完工验收"}
+PHOTO_GROUPS = {"survey_checkin": "查勘打卡", "survey_problem": "查勘问题", "work_checkin": "维修打卡", "construction": "施工", "completion": "完工验收"}
 WORKFLOW_STAGES = {"pending_intake": "待维保受理", "insurer_intake": "待保司处理", "insurer_review": "待保司复核", "historical_unverified": "历史待核实", "survey": "查勘中", "repair": "施工中", "acceptance": "待验收", "settlement": "待结算", "closed": "已结束", "direct_payment": "直接赔付", "noncoverage": "非维修流程"}
 GROUP_FIELDS = {"survey_checkin": ("survey", "other"), "survey_problem": ("survey", "problem"), "work_checkin": ("work", "other"), "construction": ("work", "construction"), "completion": ("acceptance", "finished")}
 
@@ -38,13 +39,15 @@ CASE_PLATFORM_COLUMNS = """,(SELECT json_group_array(scope) FROM platform_list_e
     EXISTS(SELECT 1 FROM platform_links l WHERE l.case_id=c.id AND l.verified_at IS NOT NULL) AS platform_linked"""
 PHOTO_SELECT = """SELECT p.*, b.media_type,b.mime_type,b.size_bytes,b.width,b.height,b.extension,b.thumbnail_path,
     c.title AS case_title,c.report_number,c.platform_report_code,c.short_code,c.building,c.unit,c.floor,c.room,c.location_type,c.location_detail,c.insurer,
-    pr.name AS project_name,
-    (SELECT original_name FROM photo_sources s WHERE s.photo_id=p.id ORDER BY s.received_at,s.rowid LIMIT 1) AS original_name,
-    (SELECT sender FROM photo_sources s WHERE s.photo_id=p.id ORDER BY s.received_at,s.rowid LIMIT 1) AS sender,
-    (SELECT group_name FROM photo_sources s WHERE s.photo_id=p.id ORDER BY s.received_at,s.rowid LIMIT 1) AS group_name,
-    (SELECT message_time FROM photo_sources s WHERE s.photo_id=p.id ORDER BY s.received_at,s.rowid LIMIT 1) AS message_time,
-    (SELECT source_type FROM photo_sources s WHERE s.photo_id=p.id ORDER BY s.received_at,s.rowid LIMIT 1) AS source_type,
+    pr.name AS project_name,(SELECT display_name FROM idi_users u WHERE u.id=p.uploaded_by) AS uploaded_by_name,
+    (SELECT original_name FROM photo_sources s WHERE s.photo_id=p.id ORDER BY s.source_type='xhey_camera' DESC,s.received_at,s.rowid LIMIT 1) AS original_name,
+    (SELECT sender FROM photo_sources s WHERE s.photo_id=p.id ORDER BY s.source_type='xhey_camera' DESC,s.received_at,s.rowid LIMIT 1) AS sender,
+    (SELECT group_name FROM photo_sources s WHERE s.photo_id=p.id ORDER BY s.source_type='xhey_camera' DESC,s.received_at,s.rowid LIMIT 1) AS group_name,
+    (SELECT message_time FROM photo_sources s WHERE s.photo_id=p.id ORDER BY s.source_type='xhey_camera' DESC,s.received_at,s.rowid LIMIT 1) AS message_time,
+    (SELECT source_type FROM photo_sources s WHERE s.photo_id=p.id ORDER BY s.source_type='xhey_camera' DESC,s.received_at,s.rowid LIMIT 1) AS source_type,
     (SELECT COUNT(*) FROM photo_sources s WHERE s.photo_id=p.id) AS source_count,
+    EXISTS(SELECT 1 FROM photos source WHERE source.id=p.reuse_source_id) AS reuse_source_exists,
+    (SELECT copy.id FROM photos copy WHERE copy.reuse_source_id=p.id AND copy.case_id=p.case_id LIMIT 1) AS reuse_copy_id,
     v.visit_date,v.visit_key,sv.id AS shared_checkin_visit_id,sv.visit_date AS shared_checkin_date,sv.visit_key AS shared_checkin_key
     FROM photos p JOIN blobs b ON b.hash=p.blob_hash LEFT JOIN cases c ON c.id=p.case_id
     LEFT JOIN projects pr ON pr.id=p.project_id LEFT JOIN visits v ON v.id=p.visit_id
@@ -55,6 +58,19 @@ class DomainError(Exception):
     def __init__(self, message: str, status=400):
         super().__init__(message)
         self.status = status
+
+
+def case_filters(project_id=None, query=None, status=None):
+    scope, values = project_filter('c.project_id')
+    where = [scope]
+    for col, val in (("c.project_id", project_id), ("c.status", status)):
+        if val:
+            where.append(col + "=?")
+            values.append(val)
+    if query:
+        where.append("(c.title LIKE ? OR c.report_number LIKE ? OR c.room LIKE ? OR pr.name LIKE ? OR c.building||'-'||c.room LIKE ? OR c.short_code LIKE ? OR c.platform_report_code LIKE ? OR c.policy_number LIKE ? OR EXISTS(SELECT 1 FROM case_code_aliases a WHERE a.case_id=c.id AND a.code LIKE ?))")
+        values.extend([f"%{query}%"] * 9)
+    return where, values
 
 
 def decode_case(row):
@@ -73,8 +89,9 @@ def decode_case(row):
 def decode_photo(row):
     if row:
         row["confirmed_fields"] = json.loads(row["confirmed_fields"])
-        row["thumbnail_url"] = f"/api/photos/{row['id']}/thumbnail" if row.get("thumbnail_path") else None
-        row["original_url"] = f"/api/photos/{row['id']}/original"
+        row["reuse_metadata"] = json.loads(row.get("reuse_metadata") or '{}')
+        row["thumbnail_url"] = f"/api/photos/{row['id']}/thumbnail?v={row['blob_hash']}" if row.get("thumbnail_path") else None
+        row["original_url"] = f"/api/photos/{row['id']}/original?v={row['blob_hash']}"
         row.pop("thumbnail_path", None)
     return row
 
@@ -95,12 +112,14 @@ class Domain:
         self.db = db
 
     def projects(self):
-        rows = self.db.all("SELECT pr.*,(SELECT COUNT(*) FROM cases c WHERE c.project_id=pr.id) AS case_count,(SELECT COUNT(*) FROM photos p WHERE p.project_id=pr.id) AS photo_count FROM projects pr ORDER BY pr.name")
+        scope, args = project_filter('pr.id')
+        rows = self.db.all("SELECT pr.*,(SELECT COUNT(*) FROM cases c WHERE c.project_id=pr.id) AS case_count,(SELECT COUNT(*) FROM photos p WHERE p.project_id=pr.id) AS photo_count FROM projects pr WHERE " + scope + " ORDER BY pr.name", args)
         for row in rows:
             row["aliases"] = json.loads(row["aliases"])
         return rows
 
     def save_project(self, data: dict, project_id=None):
+        require_admin()
         name = str(data.get("name", "")).strip()
         if not name or len(name) > 120:
             raise DomainError("项目名称不能为空，且不能超过120字")
@@ -123,14 +142,7 @@ class Domain:
         return {**next(p for p in self.projects() if p["id"] == project_id), 'updated_case_codes': updated_codes}
 
     def cases(self, project_id=None, query=None, status=None):
-        where, values = [], []
-        for col, val in (("c.project_id", project_id), ("c.status", status)):
-            if val:
-                where.append(col + "=?")
-                values.append(val)
-        if query:
-            where.append("(c.title LIKE ? OR c.report_number LIKE ? OR c.room LIKE ? OR pr.name LIKE ? OR c.building||'-'||c.room LIKE ? OR c.short_code LIKE ? OR c.platform_report_code LIKE ? OR c.policy_number LIKE ? OR EXISTS(SELECT 1 FROM case_code_aliases a WHERE a.case_id=c.id AND a.code LIKE ?))")
-            values.extend([f"%{query}%"] * 9)
+        where, values = case_filters(project_id, query, status)
         rows = self.db.all("SELECT c.*,pr.name AS project_name,(SELECT COUNT(*) FROM photos p WHERE p.case_id=c.id) AS photo_count" + CASE_PLATFORM_COLUMNS + " FROM cases c JOIN projects pr ON pr.id=c.project_id" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY c.updated_at DESC", values)
         return [decode_case(row) for row in rows]
 
@@ -138,6 +150,7 @@ class Domain:
         row = self.db.one("SELECT c.*,pr.name AS project_name" + CASE_PLATFORM_COLUMNS + " FROM cases c JOIN projects pr ON pr.id=c.project_id WHERE c.id=?", (case_id,))
         if not row:
             raise DomainError("案件不存在", 404)
+        require_project(row['project_id'])
         return decode_case(row)
 
     def _case_values(self, data, existing=None):
@@ -181,6 +194,9 @@ class Domain:
 
     def save_case(self, data: dict, case_id=None):
         existing = self.case(case_id) if case_id else None
+        if existing:
+            require_project(existing['project_id'], manage=True)
+        require_project(data.get('project_id') or (existing or {}).get('project_id'), manage=True)
         values = self._case_values(data, existing)
         case_id = case_id or uid()
         try:
@@ -208,16 +224,19 @@ class Domain:
 
     def photos(self, project_id=None, case_id=None, stage=None, role=None, part=None, query=None,
                review=None, sort="watermark_time", direction="asc", page=1, page_size=30, ids=None, photo_group=None, visit_id=None):
-        where, values = [], []
+        scope, values = project_filter('p.project_id')
+        where = [scope]
         for col, value in (("p.project_id", project_id), ("p.case_id", case_id), ("p.stage", stage), ("p.role", role), ("p.part", part), ("p.photo_group", photo_group)):
             if value:
                 if (col, value) in (("p.stage", "work"), ("p.photo_group", "work_checkin")):
-                    where.append('(' + col + '=? OR EXISTS(SELECT 1 FROM visit_shared_checkins s WHERE s.photo_id=p.id))')
+                    where.append('(' + col + '=? OR EXISTS(SELECT 1 FROM visit_shared_checkins s WHERE s.photo_id=p.id '
+                                 'AND NOT EXISTS(SELECT 1 FROM photos copy WHERE copy.reuse_source_id=p.id)))')
                 else:
                     where.append(col + "=?")
                 values.append(value)
         if visit_id:
-            where.append('(p.visit_id=? OR EXISTS(SELECT 1 FROM visit_shared_checkins s WHERE s.photo_id=p.id AND s.visit_id=?))')
+            where.append('(p.visit_id=? OR EXISTS(SELECT 1 FROM visit_shared_checkins s WHERE s.photo_id=p.id AND s.visit_id=? '
+                         'AND NOT EXISTS(SELECT 1 FROM photos copy WHERE copy.reuse_source_id=p.id)))')
             values.extend((visit_id, visit_id))
         if review == "unassigned":
             where.append("p.case_id IS NULL")
@@ -251,6 +270,7 @@ class Domain:
         row = self.db.one(PHOTO_SELECT + " WHERE p.id=?", (photo_id,))
         if not row:
             raise DomainError("照片不存在", 404)
+        require_project(row['project_id'])
         result = decode_photo(row)
         result["sources"] = self.db.all("SELECT * FROM photo_sources WHERE photo_id=? ORDER BY received_at", (photo_id,))
         for source in result["sources"]:
@@ -285,6 +305,9 @@ class Domain:
                 before = rowdict(con.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone())
                 if not before:
                     raise DomainError("照片不存在", 404)
+                require_project(before['project_id'], manage=actor == 'local')
+                if 'project_id' in values:
+                    require_project(values['project_id'], manage=True)
                 if data.get("revision") is not None and before["revision"] != data["revision"]:
                     raise DomainError("照片已被其他操作修改，请刷新后重试", 409)
                 if values.get("photo_group") in GROUP_FIELDS:
@@ -322,10 +345,14 @@ class Domain:
                     values["confirmed_fields"] = dump(sorted(confirmed))
                     if data.get("confirm"):
                         values["recognition_state"] = "confirmed"
+                        values["watermark_dedup_reason"] = ""
                         values["confirmed_fields"] = dump(sorted(PHOTO_FIELDS - {"notes", "visit_id"}))
                 values.update(updated_at=now(), revision=before["revision"] + 1)
                 con.execute("UPDATE photos SET " + ",".join(f"{key}=?" for key in values) + " WHERE id=?", (*values.values(), photo_id))
                 if values.get('visit_id', before['visit_id']) != before['visit_id']:
+                    if before['reuse_source_id']:
+                        con.execute('DELETE FROM visit_shared_checkins WHERE photo_id=? AND visit_id=?',
+                                    (before['reuse_source_id'], before['visit_id']))
                     for affected in {before['visit_id'], values.get('visit_id')} - {None}:
                         con.execute('UPDATE visits SET revision=revision+1 WHERE id=?', (affected,))
                 after = rowdict(con.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone())
@@ -334,13 +361,26 @@ class Domain:
             raise DomainError("该案件已经存在相同原文件，或指定的关联记录不存在", 409) from error
         return self.photo(photo_id)
 
+    def reuse_checkin(self, photo_id, data):
+        from .checkin_copies import copy_for_work
+        if type(data.get('revision')) is not int or not data.get('case_id'):
+            raise DomainError('请核对案件和照片版本后复用')
+        with self.db.tx() as con:
+            copy_id, created = copy_for_work(con, photo_id, data['case_id'], revision=data['revision'],
+                                             repair_date=data.get('repair_date'))
+        return {'photo': self.photo(copy_id), 'created': created, 'source_photo_id': photo_id}
+
     def summary(self):
-        counts = self.db.one("SELECT COUNT(*) AS total,SUM(case_id IS NULL) AS unassigned,SUM(photo_group='unknown') AS unknown,SUM(recognition_state='failed') AS failed,SUM(b.media_type='image' AND (case_id IS NULL OR photo_group='unknown' OR recognition_state IN ('failed','conflict'))) AS exceptions FROM photos p JOIN blobs b ON b.hash=p.blob_hash")
+        scope, args = project_filter('p.project_id')
+        counts = self.db.one("SELECT COUNT(*) AS total,SUM(case_id IS NULL) AS unassigned,SUM(photo_group='unknown') AS unknown,SUM(recognition_state='failed') AS failed,SUM(b.media_type='image' AND (case_id IS NULL OR photo_group='unknown' OR recognition_state IN ('failed','conflict'))) AS exceptions FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE " + scope, args)
         counts = {k: v or 0 for k, v in counts.items()}
-        counts["stages"] = {r["stage"]: r["count"] for r in self.db.all("SELECT stage,COUNT(*) AS count FROM photos GROUP BY stage")}
-        counts["cases"] = self.db.one("SELECT COUNT(*) AS count FROM cases")["count"]
-        counts["active_jobs"] = self.db.one("SELECT COUNT(*) AS count FROM jobs WHERE state IN ('queued','running')")["count"]
-        counts["attachment_failures"] = self.db.one("SELECT COUNT(*) AS count FROM messages WHERE media_state IN ('failed','pending')")["count"]
+        counts["stages"] = {r["stage"]: r["count"] for r in self.db.all("SELECT stage,COUNT(*) AS count FROM photos p WHERE " + scope + " GROUP BY stage", args)}
+        scope, args = project_filter('project_id')
+        counts["cases"] = self.db.one("SELECT COUNT(*) AS count FROM cases WHERE " + scope, args)["count"]
+        person = current()
+        own = person is not None and not person.admin
+        counts["active_jobs"] = self.db.one("SELECT COUNT(*) AS count FROM jobs WHERE state IN ('queued','running')" + (" AND user_id=?" if own else ""), (person.id,) if own else ())["count"]
+        counts["attachment_failures"] = 0 if own else self.db.one("SELECT COUNT(*) AS count FROM messages WHERE media_state IN ('failed','pending')")["count"]
         return counts
 
     def templates(self):
@@ -384,7 +424,8 @@ class Domain:
         all_photos = self.db.all("SELECT p.*,b.media_type,v.visit_date,v.visit_key,v.basis FROM photos p JOIN blobs b ON b.hash=p.blob_hash LEFT JOIN visits v ON v.id=p.visit_id WHERE p.case_id=?", (case_id,))
         images = [p for p in all_photos if p["media_type"] == "image" and p['recognition_state'] != 'conflict' and (photo_ids is None or p["id"] in photo_ids)]
         full_case = photo_ids is None or {p['id'] for p in all_photos}.issubset(set(photo_ids))
-        shared = {r['photo_id']: r for r in self.db.all('SELECT s.photo_id,s.visit_id,v.visit_date,v.visit_key,v.basis FROM visit_shared_checkins s JOIN visits v ON v.id=s.visit_id WHERE v.case_id=?', (case_id,))}
+        shared = {r['photo_id']: r for r in self.db.all('SELECT s.photo_id,s.visit_id,v.visit_date,v.visit_key,v.basis FROM visit_shared_checkins s JOIN visits v ON v.id=s.visit_id WHERE v.case_id=? '
+                  'AND NOT EXISTS(SELECT 1 FROM photos copy WHERE copy.reuse_source_id=s.photo_id)', (case_id,))}
         # Count a shared original once in each intended use, never as two files.
         effective = images + [{**p, **shared[p['id']], 'stage': 'work', 'photo_group': 'work_checkin', 'shared_checkin': True}
                               for p in images if p['id'] in shared]

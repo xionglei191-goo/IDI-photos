@@ -1,4 +1,4 @@
-# Agent 工具说明（0.2.26）
+# Agent 工具说明（0.2.36）
 
 网页助手与飞书群助手共用 `ProjectAgentTools` 和 `AgentCapabilities`。网页提供 18 个工具；飞书完整配置提供 20 个，未授权官网草稿保存时为 19 个。日报只提供 13 个读取工具，独立案件审阅器保持 6 个审阅工具。
 
@@ -20,7 +20,9 @@
 
 项目引用 `J001`、案件引用 `C001`、照片引用 `P001`、分析引用 `A001` 只在当前轮工具上下文内使用，答复显示实际项目名、案件号和文件名。每次执行重查当前授权范围、案件归属、群绑定或网页对话状态；照片已转到其他项目时旧引用不能继续使用。
 
-`search_cases` 的 `query` 可为空，默认每页 12 条，支持 `workflow_stage`；日期筛选按北京时间的台账更新日期。照片默认每页 20 条，按归档时间排序，支持 `project_ref`、`case_ref`、`stage`、`photo_group`、`part`、`query`；日期筛选按北京时间归档日期，不冒充拍摄时间。`date_from`、`date_to` 都包含当日。分页上限 50 条，返回 `total`、`has_more`、`next_page` 和 `queried_at`。资料变化可能影响翻页顺序。
+`search_cases` 的 `query` 可为空，默认每页 12 条，支持 `workflow_stage`。`date_basis` 区分报案日期 `report_at`、首次入库 `created_at` 和台账更新 `updated_at`；无明确日期口径时沿用台账更新。报案日期优先读取当前关联的官网同步快照 `reportDate`，缺失时读取台账 `report_at`，不以同步时间代替报案时间；缺失或无效日期单独计数。返回 `date_evidence` 和快照核验时间范围，查询本身不刷新官网。
+
+照片默认每页 20 条，按归档时间排序，支持 `project_ref`、`case_ref`、`stage`、`photo_group`、`part`、`query`；日期筛选按北京时间归档日期，不冒充拍摄时间。`date_from`、`date_to` 都包含当日。两类查询都支持 `date_period`（今天、昨天、前天、本周、上周、本月、上月），以本次消息发送时的北京时间为基准；飞书发送时间不可用时回退接收或创建时间。服务器将时钟和日期范围传给模型，拒绝与问题冲突的日期参数，日期问题必须成功查询对应范围才能结束答复。历史消息带时间标记，不能把旧答复的“今天”用于本次查询。分页上限 50 条，返回 `total`、`has_more`、`next_page`、`queried_at` 和实际 `date_filter`。资料变化可能影响翻页顺序。
 
 原 `read_case` 保留最多 60 项的快速清单，但明确返回是否还有资料及分页工具名。清单检索不算查看原图；描述图片内容仍需 `read_images`，每轮最多查看 12 张。上下文限额导致工具结果省略时，模型须缩小范围查询，不得将省略后的结果当成完整资料。
 
@@ -50,4 +52,4 @@
 - 工具定义、参数校验、范围投影和维护动作：`idi/agent_capabilities.py`。
 - 网页及群工具注册：`idi/project_agent_tools.py`、`idi/workspace_chat.py`、`idi/feishu_agent.py`。
 - 原子重试：`idi/photo_ai.py`；官网快照应用前复核：`idi/workflow.py`。
-- 专项测试：`tests/test_agent_capabilities.py`。网络、模型、官网回执及发送禁止在隔离测试中验证；这些测试不代表对真实照片识别准确率的评估。
+- 专项测试：`tests/test_agent_capabilities.py`、`tests/test_agent_dates.py`。日期测试覆盖跨午夜、跨年、消息延迟、旧错误答复、官网报案日期来源和未查询直接答复的拦截。网络、模型、官网回执及发送禁止在隔离测试中验证；这些测试不代表对真实照片识别准确率的评估。

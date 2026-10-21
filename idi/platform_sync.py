@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from .db import dump, now, uid
 from .domain import DomainError
 from .platform_client import PlatformBudgetReached, PlatformReadPaused
+from .workflow import remote_stage
 
 CHINA = timezone(timedelta(hours=8))
 DEFAULTS = dict(enabled=True, hour=8, minute=0, recent_days=2, request_interval=1.0,
@@ -68,7 +69,7 @@ class PlatformSync:
             JOIN platform_links l ON l.case_id=e.case_id JOIN cases c ON c.id=e.case_id
             JOIN platform_repair_activity a ON a.report_receiving_id=e.report_receiving_id
             WHERE e.scope='repair' AND a.active=1
-            AND c.workflow_stage NOT IN ('closed','direct_payment','noncoverage')
+            AND c.workflow_stage NOT IN ('settlement','closed','direct_payment','noncoverage')
             AND (l.verified_at IS NULL OR l.verified_at<?)''', (cutoff,))['n']
 
     def _create(self, mode, session, refresh_details=True, when=None):
@@ -235,6 +236,21 @@ class PlatformSync:
                 [(run['id'], key, scope, dump(row), action) for key, (scope, row, action) in merged.items()])
             con.execute('UPDATE platform_sync_runs SET total=?,checkpoint=? WHERE id=?', (len(merged), dump(checkpoint), run['id']))
 
+    @staticmethod
+    def _list_snapshot(row, scope, previous, session, read_at):
+        # Omitted list fields must not erase the last observed acceptance state.
+        prior_row = previous.get('row', {})
+        merged = {**prior_row, **row}
+        prior_flow = str(prior_row.get('repairAcceptanceFlowStatus') or '')
+        if prior_flow in ('2', '9') and str(row.get('repairAcceptanceFlowStatus')) not in ('0', '1', '2', '9'):
+            merged['repairAcceptanceFlowStatus'] = prior_row['repairAcceptanceFlowStatus']
+        return {**previous, 'row': merged, 'scope': scope,
+                'account': session.get('account', ''), 'fetched_at': read_at}
+
+    @staticmethod
+    def _list_only(snapshot):
+        return remote_stage(snapshot) in ('settlement', 'closed')
+
     def _item(self, item, session, run, checkpoint):
         self._session(session)
         record_id, scope, row = item['report_receiving_id'], item['scope'], json.loads(item['snapshot'])
@@ -243,6 +259,7 @@ class PlatformSync:
         if previous.get('account') and previous['account'] != session.get('account'):
             raise DomainError('案件快照属于另一个官网账号，需人工核对后更新', 409)
         remove_repair = False
+        read_at = checkpoint.get('scans', {}).get(scope, {}).get('started_at') or now()
         if item['action'] == 'missing':
             row = self.client.lookup_row(record_id, 'repair')
             if row is None:
@@ -252,11 +269,16 @@ class PlatformSync:
                 raise DomainError('案件暂未在官网两张清单中找到，保留原记录等待核对', 409)
             if scope == 'repair' and str(row.get('endStatus')) == '0':
                 raise PlatformReadPaused('未归档维修清单与单案查询不一致，稍后核对', 300)
+            read_at = now()
         elif scope == 'intake' and previous.get('scope') == 'repair':
             repair_row = self.client.lookup_row(record_id, 'repair')
             if repair_row:
                 row, scope = repair_row, 'repair'
-        changed = previous.get('row') != row or previous.get('scope') != scope or not previous.get('claim')
+            read_at = now()
+        list_snapshot = self._list_snapshot(row, scope, previous, session, read_at)
+        list_only = run['mode'] == 'incremental' and self._list_only(list_snapshot)
+        changed = (previous.get('row') != (list_snapshot['row'] if list_only else row)
+                   or previous.get('scope') != scope or (not previous.get('claim') and not list_only))
         if changed or item['action'] in ('full', 'missing'):
             scan_time = checkpoint.get('scans', {}).get(scope, {}).get('started_at')
             if item['action'] != 'missing' and scan_time and self.clock() - instant(scan_time) > timedelta(minutes=15):
@@ -264,9 +286,11 @@ class PlatformSync:
                 if fresh is None:
                     raise DomainError('本案在分页后已变化，需重新核对官网清单', 409)
                 row = fresh
-            snapshot = self.client.snapshot_from_row(row, scope)
+                list_snapshot = self._list_snapshot(row, scope, previous, session, now())
+                list_only = run['mode'] == 'incremental' and self._list_only(list_snapshot)
+            snapshot = list_snapshot if list_only else self.client.snapshot_from_row(row, scope)
             self._session(session)
-            result = self.workflow.apply_snapshot(snapshot)
+            result = self.workflow.apply_snapshot(snapshot, details_read=not list_only)
             checkpoint['created' if result['created'] else 'updated'] += 1
             case_id = result['case_id']
         else:
@@ -336,7 +360,7 @@ class PlatformSync:
             JOIN platform_links l ON l.case_id=e.case_id JOIN cases c ON c.id=e.case_id
             JOIN platform_repair_activity a ON a.report_receiving_id=e.report_receiving_id
             WHERE e.scope='repair' AND a.active=1
-            AND c.workflow_stage NOT IN ('closed','direct_payment','noncoverage')
+            AND c.workflow_stage NOT IN ('settlement','closed','direct_payment','noncoverage')
             AND (l.verified_at IS NULL OR l.verified_at<?)
             ORDER BY CASE WHEN EXISTS(SELECT 1 FROM photos p WHERE p.case_id=e.case_id AND p.updated_at>COALESCE(l.verified_at,'')) THEN 0 ELSE 1 END,
                      COALESCE(l.verified_at,''),e.report_receiving_id LIMIT ?''', (cutoff, max(0, available // 5)))
@@ -345,12 +369,26 @@ class PlatformSync:
                 if budget['limit'] - budget['used'] < 5:
                     break
                 self._session(session)
-                snapshot = self.client.snapshot(candidate['report_receiving_id'], 'repair')
+                link = self.db.one('SELECT l.*,c.workflow_stage FROM platform_links l JOIN cases c ON c.id=l.case_id WHERE report_receiving_id=?', (candidate['report_receiving_id'],))
+                if not link or link['workflow_stage'] in ('settlement', 'closed', 'direct_payment', 'noncoverage'):
+                    continue
+                row = self.client.lookup_row(candidate['report_receiving_id'], 'repair')
+                if row is None:
+                    raise DomainError('此记录未在当前账号的对应列表中找到，请重新查询并选择案件', 404)
+                previous = json.loads(link['snapshot'])
+                if previous.get('account') and previous['account'] != session.get('account'):
+                    raise DomainError('案件快照属于另一个官网账号，需人工核对后更新', 409)
+                read_at = now()
+                snapshot = self._list_snapshot(row, 'repair', previous, session, read_at)
+                list_only = self._list_only(snapshot)
+                if not list_only:
+                    snapshot = self.client.snapshot_from_row(row, 'repair')
                 self._session(session)
-                result = self.workflow.apply_snapshot(snapshot)
+                result = self.workflow.apply_snapshot(snapshot, details_read=not list_only)
                 with self.db.tx() as con:
-                    self._upsert(con, 'repair', snapshot['row'], result['case_id'], run['id'], snapshot['fetched_at'])
-                checkpoint['photos_checked'] += 1
+                    self._upsert(con, 'repair', row, result['case_id'], run['id'], read_at)
+                if not list_only:
+                    checkpoint['photos_checked'] += 1
                 self._checkpoint(run['id'], checkpoint)
         checkpoint['photo_pending'] = self.photo_backlog()
         checkpoint['phase'] = 'done'

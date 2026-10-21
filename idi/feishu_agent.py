@@ -501,7 +501,7 @@ class FeishuAgent:
             health = self.recognizer.runtime.status()
             if not context.binding['ai_enabled'] or not health['can_attempt']:
                 raise DomainError('AI 暂缓或未启用，规则整理和统计日报继续运行')
-            messages = [{'role': 'system', 'content': SYSTEM}]
+            messages = [{'role': 'system', 'content': SYSTEM + '\n' + context.dates.system_prompt()}]
             if task['kind'] == 'brief':
                 snapshot = self.project_snapshot(task['project_id'], followup_only=True)
                 messages.append({'role': 'user', 'content': dump({'task': task['input']['text'], 'snapshot': snapshot})})
@@ -533,10 +533,16 @@ class FeishuAgent:
                 message = choice['message']
                 calls = message.get('tool_calls') or []
                 if not calls:
-                    answer = str(message.get('content') or '').strip()[:1800]
-                    if answer:
-                        break
-                    raise DomainError('模型未给出有效答复或工具调用')
+                    candidate = str(message.get('content') or '').strip()[:1800]
+                    if not candidate:
+                        raise DomainError('模型未给出有效答复或工具调用')
+                    try:
+                        answer = context.dates.finish(candidate)
+                    except DomainError as exc:
+                        messages += [{'role': 'assistant', 'content': candidate},
+                                     {'role': 'user', 'content': '服务器日期校验未通过：' + str(exc)}]
+                        continue
+                    break
                 if not isinstance(calls, list) or len(calls) > 4:
                     raise DomainError('模型一次调用了过多工具，本次停止')
                 if any(c.get('function', {}).get('name') == 'finish_reply' for c in calls) and len(calls) != 1:

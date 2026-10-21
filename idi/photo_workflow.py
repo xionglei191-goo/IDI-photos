@@ -10,6 +10,7 @@ from .domain import DomainError, PHOTO_GROUPS
 from .draft_materials import check_material_scope, prepare_materials
 from .photo_ai import digest
 from .recognition import extract_fields
+from .project_accounts import case_context
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +32,10 @@ class PhotoWorkflow:
 
     def source_task(self, photo_id):
         row = self.db.one("SELECT t.id FROM feishu_agent_tasks t,json_each(t.input_json,'$.photo_ids') p WHERE p.value=? AND t.kind<>'brief' AND t.state<>'cancelled' ORDER BY t.created_at DESC,t.id DESC LIMIT 1", (photo_id,))
+        if not row:
+            source = self.db.one('SELECT reuse_source_id FROM photos WHERE id=?', (photo_id,))
+            if source and source['reuse_source_id']:
+                row = self.db.one("SELECT t.id FROM feishu_agent_tasks t,json_each(t.input_json,'$.photo_ids') p WHERE p.value=? AND t.kind<>'brief' AND t.state<>'cancelled' ORDER BY t.created_at DESC,t.id DESC LIMIT 1", (source['reuse_source_id'],))
         return self.feishu.get(row['id']) if row else None
 
     def task_permission(self, task, case=None, *, saving=False):
@@ -67,7 +72,8 @@ class PhotoWorkflow:
                 # Explicit same-entry reuse preserves both the original work
                 # watermark and its reviewed survey purpose.
                 conflicts.difference_update(('stage', 'photo_group'))
-        return conflicts
+        from .checkin_copies import copy_purpose_conflicts
+        return copy_purpose_conflicts(photo, fields, conflicts)
 
     def process(self, photo_id, task=None, *, revisit=False):
         if not self.policy().get('rules_enabled') or self._stop.is_set():
@@ -79,6 +85,8 @@ class PhotoWorkflow:
                 return pipeline
             if photo['media_type'] != 'image':
                 return self.finish(photo, 'not_applicable', '非图片资料保留原件，按原流程人工选材')
+            if photo.get('watermark_dedup_reason'):
+                return self.finish(photo, 'needs_check', photo['watermark_dedup_reason'])
             task = task or self.source_task(photo_id)
             if task:
                 try:
@@ -95,9 +103,19 @@ class PhotoWorkflow:
             fields = {**local_fields, **extract_fields(text)}
             confirmed = set(photo['confirmed_fields'])
             identity, matched = 'unverified', None
-            if photo['case_id'] and 'case_id' in confirmed and photo['recognition_state'] != 'conflict':
+            app_capture = self.db.one('SELECT metadata FROM camera_official_captures WHERE photo_id=? AND archived_at IS NOT NULL', (photo_id,))
+            if app_capture and photo['case_id'] and photo.get('uploaded_by') and photo['recognition_state'] != 'conflict':
+                from .mobile_camera import case_number
+                capture = json.loads(app_capture['metadata'])
+                assigned = self.domain.case(photo['case_id'])
+                if capture.get('case_id') == assigned['id'] and capture.get('case_number') == case_number(assigned):
+                    # The authenticated APP supplied an explicit case and capture
+                    # purpose. This is assignment evidence, not an official
+                    # watermark authenticity or human-review claim.
+                    identity, matched = 'app_assigned_case', assigned['id']
+            if not matched and photo['case_id'] and 'case_id' in confirmed and photo['recognition_state'] != 'conflict':
                 identity, matched = 'human_confirmed', photo['case_id']
-            elif fields.get('platform_report_code') or fields.get('short_code'):
+            elif not matched and (fields.get('platform_report_code') or fields.get('short_code')):
                 _, matched = self.recognizer.match(text, fields, photo['project_id'])
                 if matched:
                     identity = 'official_identifier' if fields.get('platform_report_code') else 'short_identifier'
@@ -126,7 +144,7 @@ class PhotoWorkflow:
                     current = con.execute('SELECT * FROM photos WHERE id=?', (photo_id,)).fetchone()
                     if current['revision'] != photo['revision'] or current['case_id'] or 'case_id' in json.loads(current['confirmed_fields']):
                         raise DomainError('照片已被修改，等待重新核对', 409)
-                    if con.execute('SELECT id FROM photos WHERE case_id=? AND blob_hash=?', (matched, photo['blob_hash'])).fetchone():
+                    if con.execute('SELECT id FROM photos WHERE case_id=? AND blob_hash=? AND reuse_source_id IS NULL', (matched, photo['blob_hash'])).fetchone():
                         return self.finish(photo, 'needs_check', '此案件已有相同原件，请人工合并来源', fields=fields, con=con)
                     con.execute("UPDATE photos SET case_id=?,project_id=?,recognition_state='recognized',revision=revision+1,updated_at=? WHERE id=?", (matched, case['project_id'], now(), photo_id))
                     audit(con, 'photo', photo_id, 'rule_associate', after={'case_id': matched, 'basis': identity}, actor='rule')
@@ -185,7 +203,7 @@ class PhotoWorkflow:
         row = self.db.one(sql + (' AND task_id=?' if task_id else " AND task_id NOT IN (SELECT id FROM feishu_agent_tasks WHERE state IN ('queued','running'))") + ' ORDER BY created_at LIMIT 1', (task_id,) if task_id else ())
         if not row:
             return False
-        with self.platform.material_lock:
+        with self.platform.material_lock, case_context(self.platform, row['case_id']):
             # Single shared lock with Agent saves; persisted claim prevents replay.
             current = self.db.one('SELECT state FROM rule_draft_intents WHERE id=?', (row['id'],))
             if current['state'] not in ('queued','awaiting_login','read_only'):

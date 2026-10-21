@@ -1,9 +1,10 @@
-"""Explicit entry records and same-entry check-in reuse, without duplicating originals."""
+"""Explicit entry records with independent copies of same-entry survey check-ins."""
 import sqlite3
 from datetime import datetime
 
 from .db import audit, now, rowdict, uid
 from .domain import DomainError, STAGES, clean_date
+from .checkin_copies import copy_for_work, valid_work_copy
 
 
 def allows_photo(visit_stage, photo):
@@ -17,21 +18,27 @@ def photo_date(photo):
 def list_visits(domain, case_id):
     domain.case(case_id)
     visits = domain.db.all('SELECT * FROM visits WHERE case_id=? ORDER BY visit_date,COALESCE(started_at,created_at),id', (case_id,))
-    photos = domain.db.all('SELECT p.id,p.visit_id,p.role,p.photo_group,p.recognition_state,b.media_type FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE p.case_id=?', (case_id,))
-    shared = domain.db.all('SELECT s.photo_id,s.visit_id,p.role,p.recognition_state,b.media_type FROM visit_shared_checkins s JOIN photos p ON p.id=s.photo_id JOIN blobs b ON b.hash=p.blob_hash WHERE p.case_id=?', (case_id,))
+    photos = domain.db.all('SELECT p.id,p.visit_id,p.role,p.photo_group,p.recognition_state,p.reuse_source_id,b.media_type FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE p.case_id=?', (case_id,))
+    shared = domain.db.all('SELECT s.photo_id,s.visit_id,p.role,p.recognition_state,b.media_type,copy.id AS copy_id '
+                          'FROM visit_shared_checkins s JOIN visits v ON v.id=s.visit_id '
+                          'JOIN photos p ON p.id=s.photo_id JOIN blobs b ON b.hash=p.blob_hash '
+                          'LEFT JOIN photos copy ON copy.reuse_source_id=p.id AND copy.case_id=v.case_id '
+                          "WHERE v.case_id=? AND p.case_id=v.case_id AND p.photo_group='survey_checkin'", (case_id,))
     for visit in visits:
         own = [p for p in photos if p['visit_id'] == visit['id']]
         reused = [p for p in shared if p['visit_id'] == visit['id']]
-        visit['photo_ids'] = [p['id'] for p in own]
+        shared_copies = {p['copy_id'] for p in reused if p['copy_id']}
+        visit['photo_ids'] = [p['id'] for p in own if p['id'] not in shared_copies]
         visit['shared_checkin_ids'] = [p['photo_id'] for p in reused]
+        visit['copied_checkin_ids'] = [p['id'] for p in own if p['reuse_source_id']]
         valid = [p for p in own if p['recognition_state'] != 'conflict' and p['media_type'] == 'image']
-        valid_shared = [p for p in reused if p['recognition_state'] != 'conflict' and p['media_type'] == 'image']
+        valid_shared = [p for p in reused if not p['copy_id'] and p['recognition_state'] != 'conflict' and p['media_type'] == 'image']
         visit['counts'] = {
             'building_checkin': sum(p['role'] == 'building_checkin' for p in valid + valid_shared),
             'door_checkin': sum(p['role'] == 'door_checkin' for p in valid + valid_shared),
             'construction': sum(p['photo_group'] == 'construction' for p in valid),
             'completion': sum(p['photo_group'] == 'completion' for p in valid),
-            'shared_checkin': len(valid_shared),
+            'shared_checkin': len(valid_shared) + sum(bool(p['reuse_source_id']) for p in valid),
         }
     return visits
 
@@ -74,7 +81,8 @@ def save_visit(domain, case_id, data, visit_id=None):
                 raise DomainError('进场记录不存在', 404)
             if before and data.get('revision') != before['revision']:
                 raise DomainError('进场记录已变化，请刷新后重试', 409)
-            previous_ids = [r[0] for r in con.execute('SELECT id FROM photos WHERE visit_id=?', (visit_id,))]
+            previous_ids = [r[0] for r in con.execute('SELECT p.id FROM photos p WHERE p.visit_id=? '
+                            'AND NOT EXISTS(SELECT 1 FROM visit_shared_checkins s WHERE s.photo_id=p.reuse_source_id AND s.visit_id=p.visit_id)', (visit_id,))]
             previous_shared = [r[0] for r in con.execute('SELECT photo_id FROM visit_shared_checkins WHERE visit_id=?', (visit_id,))]
             ids = data.get('photo_ids', previous_ids)
             shared_ids = data.get('shared_checkin_ids', previous_shared)
@@ -89,6 +97,15 @@ def save_visit(domain, case_id, data, visit_id=None):
                 raise DomainError('请先标记本次为查勘后当天维修、同一次进场')
             end_date = end[:10] if end else date
             for photo_id in ids + shared_ids:
+                # An existing copy has its own reviewed metadata. Later edits to
+                # the survey original must not rewrite this entry's work record.
+                if photo_id in previous_shared and photo_id in shared_ids:
+                    copy = rowdict(con.execute('SELECT * FROM photos WHERE reuse_source_id=? AND case_id=? AND visit_id=?',
+                                               (photo_id, case_id, visit_id)).fetchone())
+                    if copy and valid_work_copy(copy):
+                        if photo_date(copy) != date or copy['recognition_state'] == 'conflict':
+                            raise DomainError('维修副本的日期或识别结果与本次进场不一致，请先核对')
+                        continue
                 photo = rowdict(con.execute('SELECT p.*,b.media_type FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE p.id=?', (photo_id,)).fetchone())
                 if not photo or photo['case_id'] != case_id:
                     raise DomainError('照片必须属于本案')
@@ -109,6 +126,9 @@ def save_visit(domain, case_id, data, visit_id=None):
                     owner = con.execute('SELECT visit_id FROM visit_shared_checkins WHERE photo_id=?', (photo_id,)).fetchone()
                     if owner and owner[0] != visit_id:
                         raise DomainError('该打卡已用于另一次施工进场，不能覆盖本次缺项', 409)
+                    copy = con.execute('SELECT visit_id FROM photos WHERE reuse_source_id=? AND case_id=?', (photo_id, case_id)).fetchone()
+                    if copy and copy['visit_id'] and copy['visit_id'] != visit_id:
+                        raise DomainError('该副本已用于另一次施工进场，不能覆盖本次缺项', 409)
             fields = {'stage': stage, 'visit_date': date, 'visit_key': key, 'notes': notes,
                       'started_at': start, 'finished_at': end, 'crew_number': crew, 'same_day_repair': int(same_day)}
             if created:
@@ -121,6 +141,17 @@ def save_visit(domain, case_id, data, visit_id=None):
                 target = visit_id if photo_id in ids else None
                 con.execute('UPDATE photos SET visit_id=?,revision=revision+1,updated_at=? WHERE id=?', (target, stamp, photo_id))
                 audit(con, 'photo', photo_id, 'assign_visit', old, {'visit_id': target})
+            for photo_id in set(previous_shared) - set(shared_ids):
+                copy = con.execute('SELECT id,visit_id FROM photos WHERE reuse_source_id=? AND case_id=? AND visit_id=?',
+                                   (photo_id, case_id, visit_id)).fetchone()
+                if copy and copy['id'] not in ids:
+                    con.execute('UPDATE photos SET visit_id=NULL,revision=revision+1,updated_at=? WHERE id=?', (stamp, copy['id']))
+                    audit(con, 'photo', copy['id'], 'assign_visit', {'visit_id': visit_id}, {'visit_id': None})
+            for photo_id in shared_ids:
+                copy = rowdict(con.execute('SELECT * FROM photos WHERE reuse_source_id=? AND case_id=? AND visit_id=?',
+                                           (photo_id, case_id, visit_id)).fetchone())
+                if not copy or not valid_work_copy(copy):
+                    copy_for_work(con, photo_id, case_id, visit_id=visit_id, repair_date=date)
             con.executemany('DELETE FROM visit_shared_checkins WHERE photo_id=? AND visit_id=?',
                             [(pid, visit_id) for pid in set(previous_shared) - set(shared_ids)])
             con.executemany('INSERT INTO visit_shared_checkins VALUES(?,?,?)',

@@ -13,9 +13,14 @@ test('automatic upload control persists and proposal requires human confirmation
   await expect(enabled).not.toBeChecked();
   await enabled.click();
   await expect(enabled).toBeChecked();
+  const notifications = policy.getByRole('checkbox', { name: '飞书核对提醒', exact: true });
+  await expect(notifications).not.toBeChecked();
+  await notifications.click();
+  await expect(notifications).toBeChecked();
   await page.reload();
   await page.getByRole('button', { name: '系统设置', exact: true }).click();
   await expect(enabled).toBeChecked();
+  await expect(notifications).toBeChecked();
   const panel = page.getByRole('region', { name: '拟提交事项', exact: true });
   expect((await (await request.get('/api/workflow/uploads')).json()).policy.enabled).toBe(true);
   const p = await (await request.post('/api/projects', { headers, data: { name: '自动上传验收项目' } })).json();

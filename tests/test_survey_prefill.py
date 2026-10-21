@@ -35,13 +35,15 @@ def test_realistic_case_suggestions_have_sources_and_do_not_mutate_inputs(eviden
     assert {k: v['value'] for k, v in suggested.items()} == {
         'siteSurveyDate': '2026-10-16 09:25', 'defectDesc': '施工时保护不到位、操作不当造成',
         'defectiveSite': '主卧马桶地面连接处', 'divisionWorksCode': 'part_engineering_04',
-        'defectTypeCode': 'defect_type_other', 'repairMethod': '1', 'planRepairDate': '2026-10-16'}
+        'defectTypeCode': 'defect_type_other', 'repairMethod': '1', 'planRepairDate': '2026-10-16',
+        'repairUserId': 'person1'}
     assert suggested['siteSurveyDate']['photo_ids'] == ['building']
     assert suggested['defectDesc']['needs_review'] and '受理' in suggested['defectDesc']['source']
     assert all(v['source'] for v in suggested.values())
-    assert set(notes) == {'repairUserId', 'estimateRestorationCostCode'} and evidence == before
-    # A sole personnel option and a low cost threshold do not establish actual staff or cost.
-    assert not {'repairUserId', 'estimateRestorationCostCode'} & suggested.keys()
+    assert set(notes) == {'estimateRestorationCostCode'} and evidence == before
+    assert '仅有一个候选' in suggested['repairUserId']['source']
+    assert suggested['repairUserId']['needs_review']
+    assert 'estimateRestorationCostCode' not in suggested
 
 
 def test_multiple_visits_require_explicit_selection(evidence):
@@ -107,12 +109,55 @@ def test_manual_date_and_method_control_dependent_date_suggestion(evidence):
     assert evidence['values'] == {'repairMethod': '2'}
 
 
-def test_ambiguous_categories_are_not_guessed(evidence):
+def test_multiple_engineering_categories_choose_one_but_defect_type_still_requires_review(evidence):
     evidence['case']['title'] = '卫生间地砖开裂，马桶晃动'
     suggested, notes = survey_suggestions(**evidence)
-    assert 'divisionWorksCode' not in suggested and 'defectTypeCode' not in suggested
-    assert '装饰装修工程' in notes['divisionWorksCode'] and '建筑给水排水工程' in notes['divisionWorksCode']
+    assert suggested['divisionWorksCode']['value'] == 'part_engineering_03'
+    assert '装饰装修工程' in suggested['divisionWorksCode']['source']
+    assert '建筑给水排水工程' in suggested['divisionWorksCode']['source']
+    assert 'divisionWorksCode' not in notes and 'defectTypeCode' not in suggested
     assert '裂' in notes['defectTypeCode'] and '其他' in notes['defectTypeCode']
+
+
+def test_multiple_engineering_matches_skip_unavailable_categories(evidence):
+    evidence['case']['title'] = '卫生间地砖开裂，马桶晃动'
+    evidence['dictionaries']['part_engineering'] = [{'code': 'current-plumbing', 'name': '建筑给水排水工程'}]
+    suggested, _ = survey_suggestions(**evidence)
+    assert suggested['divisionWorksCode']['value'] == 'current-plumbing'
+    evidence['dictionaries']['part_engineering'] = []
+    assert 'divisionWorksCode' not in survey_suggestions(**evidence)[0]
+
+
+@pytest.mark.parametrize('people', [
+    [],
+    [{'userId': '', 'name': '无有效编号'}],
+    [{'userId': 'person1', 'name': '甲'}, {'userId': 'person2', 'name': '乙'}],
+])
+def test_personnel_requires_exactly_one_valid_official_candidate(evidence, people):
+    evidence['link']['snapshot']['personnel'] = people
+    suggested, notes = survey_suggestions(**evidence)
+    assert 'repairUserId' not in suggested and 'repairUserId' in notes
+
+
+def test_unverified_personnel_is_not_automatically_selected(evidence):
+    evidence['link']['verified_at'] = None
+    assert 'repairUserId' not in survey_suggestions(**evidence)[0]
+
+
+def test_duplicate_rows_for_one_person_count_as_one_candidate(evidence):
+    evidence['link']['snapshot']['personnel'] *= 2
+    assert survey_suggestions(**evidence)[0]['repairUserId']['value'] == 'person1'
+
+
+def test_existing_personnel_selection_is_retained(evidence):
+    evidence['values']['repairUserId'] = 'manual-person'
+    assert 'repairUserId' not in survey_suggestions(**evidence)[0]
+    evidence['values'] = {}
+    evidence['link']['snapshot']['survey']['repairUserId'] = 'person1'
+    evidence['link']['snapshot']['personnel'].append({'userId': 'person2', 'name': '乙'})
+    suggested, _ = survey_suggestions(**evidence)
+    assert suggested['repairUserId']['value'] == 'person1'
+    assert suggested['repairUserId']['source'] == '官网已保存的现场查勘记录'
 
 
 def test_options_use_current_dictionary_codes_and_never_guess_unknown_type(evidence):
@@ -138,7 +183,8 @@ def test_explicit_photo_part_and_saved_survey_fields_have_priority(evidence):
     assert suggested['defectDesc']['value'] == '查勘已记录的具体原因'
     assert suggested['divisionWorksCode']['value'] == 'part_engineering_03'
     assert suggested['defectTypeCode']['value'] == 'defect_type_03'
-    assert not suggested['defectDesc']['needs_review'] and 'repairUserId' not in suggested
+    assert not suggested['defectDesc']['needs_review']
+    assert suggested['repairUserId']['value'] == 'person1'
 
 
 def test_plan_exposes_suggestions_without_writing_draft_or_bypassing_stage_lock(services, case, photo):

@@ -10,6 +10,7 @@ from .domain import DomainError
 from .platform_contract import VERSION
 from .platform_client import PlatformWriteError
 from .stage_access import stage_access
+from .project_accounts import scoped_case, scoped_record
 
 
 class ReviewBatches:
@@ -32,6 +33,7 @@ class ReviewBatches:
             with self._active_lock:
                 self._active.discard(review_id)
 
+    @scoped_case()
     def snapshot(self, case_id, stage, *, save_only=False):
         plan = self.platform.preview(case_id, stage)
         case = plan['case']
@@ -56,6 +58,10 @@ class ReviewBatches:
                             'existing_files': {f['key']: f['existing'] for f in plan['file_fields']},
                             'draft_revision': plan['draft']['revision'], 'target': plan['link']['report_receiving_id'],
                             'link_revision': plan['link']['revision']}
+        if getattr(self.platform, 'project_accounts', None):
+            binding = self.platform.project_accounts.binding(case['project_id'])
+            plan['write_binding'] = binding
+            fingerprint_data['write_binding'] = binding
         if save_only:
             fingerprint_data['save_only'] = True
             plan = {**plan, 'actions': ['save'], 'save_only': True}
@@ -73,6 +79,7 @@ class ReviewBatches:
                         (review_id, case_id, stage, fingerprint, dump(plan), now(), int(save_only)))
         return self.get(review_id)
 
+    @scoped_record('platform_review_batches')
     def get(self, review_id):
         row = self.db.one('SELECT * FROM platform_review_batches WHERE id=?', (review_id,))
         if not row:
@@ -85,17 +92,23 @@ class ReviewBatches:
         row['access'] = stage_access(self.workflow.domain.case(row['case_id']), row['stage'])
         return row
 
+    @scoped_record('platform_review_batches', 'review_confirmation')
     def confirm(self, review_id, fingerprint, local_only=False, action='submit'):
+        from .identity import current
+        if getattr(self.platform, 'project_accounts', None) and not local_only and action != 'save' and current() is None:
+            raise DomainError('正式提交须由登录的 IDI 系统管理员或本项目管理员核对确认', 403)
         with self._execution(review_id), self.platform.material_lock:
             self._confirm(review_id, fingerprint, local_only, action)
         return self.get(review_id)
 
+    @scoped_record('platform_review_batches', 'automatic_save')
     def save_for_agent(self, review_id, fingerprint, check_permission=None):
         with self._execution(review_id), self.platform.material_lock:
             self._confirm(review_id, fingerprint, False, 'save', draft_only=True, check_permission=check_permission)
         return self.get(review_id)
 
     def _verified_uploads(self, plan):
+        from .checkin_copies import verified_copy_receipts
         selected = {p['id']: p['blob_hash'] for field in plan['file_fields'] for p in field['selected']}
         remote_ids = {str(f['id']) for field in plan['file_fields'] for f in field['existing'] if f.get('id')}
         receipts = {}
@@ -107,6 +120,8 @@ class ReviewBatches:
             for photo_id, receipt in result.get('uploaded', {}).items():
                 if photo_id in selected and originals.get(photo_id) == selected[photo_id] and str(receipt.get('id')) in remote_ids:
                     receipts[photo_id] = receipt
+        receipts.update({pid: receipt for pid, receipt in verified_copy_receipts(
+            self.platform, plan['case']['id'], plan['stage'], plan['link']).items() if pid in selected})
         return receipts
 
     def _confirm(self, review_id, fingerprint, local_only, action, draft_only=False, check_permission=None):
@@ -141,10 +156,12 @@ class ReviewBatches:
         if not local_only and not self.platform.client.write_enabled:
             raise DomainError('官网当前为只读模式，可保存核对记录和下载资料', 403)
         if not local_only:
+            self.platform.removals.require_clear(record['case_id'], record['stage'])
             session = self.platform.client.status()
             if not session['connected']:
                 raise DomainError('请先连接官网，再继续保存或提交', 401)
-            expected_account = plan['link']['snapshot'].get('account')
+            expected_account = (plan['write_binding']['username'] if 'write_binding' in plan
+                                else plan['link']['snapshot'].get('account'))
             if expected_account and expected_account != session['account']:
                 raise DomainError('官网登录账号已变化，请先刷新案件并重新审核', 409)
         with self.db.tx() as con:
@@ -230,6 +247,7 @@ class ReviewBatches:
             else:
                 con.execute('UPDATE platform_review_batches SET result=? WHERE id=?', (dump(result), review_id))
 
+    @scoped_record('platform_review_batches', 'readback')
     def reconcile(self, review_id):
         with self._execution(review_id), self.platform.material_lock:
             self._reconcile(review_id)

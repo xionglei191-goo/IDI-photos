@@ -1,0 +1,9 @@
+.gradle/
+.idea/
+**/build/
+local.properties
+signing.properties
+*.jks
+*.keystore
+xhey.properties
+xhey-sdk/

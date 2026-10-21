@@ -90,6 +90,12 @@ def restore(source: Path, target: Path, resume=False):
                     value = json.loads(config[0])
                     value.update(auto_review=False, ai_review=False)
                     con.execute("UPDATE settings SET value=? WHERE key='followup'", (json.dumps(value),))
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_notifications'").fetchone():
+                con.execute("UPDATE review_notifications SET state='cancelled',error='从备份恢复，核对提醒已暂停' WHERE state IN ('queued','failed')")
+                con.execute("UPDATE review_notifications SET state='unknown',error='恢复前发送结果需核对群内记录' WHERE state='sending'")
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='platform_attachment_removals'").fetchone():
+                con.execute("UPDATE platform_attachment_removals SET state='stale',error='从备份恢复，请重新核对删除对象' WHERE state='prepared'")
+                con.execute("UPDATE platform_attachment_removals SET state='uncertain',error='恢复前撤回结果需回读官网核实' WHERE state='removing'")
     return {"target": str(target), "verified_files": len(files), "connectors_enabled": resume}
 
 

@@ -1,0 +1,70 @@
+name: idi-vps
+
+services:
+  idi:
+    image: ${IDI_IMAGE:-idi-vps:local}
+    build: .
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 90s
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    pids_limit: 256
+    mem_limit: ${IDI_MEMORY_LIMIT:-3g}
+    environment:
+      IDI_DOMAIN: ${IDI_DOMAIN:-}
+      IDI_VPS_SUBNET: ${IDI_VPS_SUBNET:-172.30.80.0/24}
+      IDI_VPS_GATEWAY: ${IDI_VPS_GATEWAY:-172.30.80.1}
+      IDI_VPS_APP_IP: ${IDI_VPS_APP_IP:-172.30.80.10}
+      IDI_VPS_PROXY_IP: ${IDI_VPS_PROXY_IP:-172.30.80.20}
+      IDI_PLATFORM_WRITE: ${IDI_PLATFORM_WRITE:-0}
+    ports:
+      - "127.0.0.1:${IDI_HTTP_PORT:-8766}:8766"
+    volumes:
+      - idi_data:/var/lib/idi
+      - idi_key:/var/lib/idi-key
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+      - /run/idi:uid=10001,gid=10001,mode=0700
+    networks:
+      idi:
+        ipv4_address: ${IDI_VPS_APP_IP:-172.30.80.10}
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  caddy:
+    image: caddy:2-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
+    profiles: [https]
+    restart: unless-stopped
+    depends_on:
+      idi: {condition: service_healthy}
+    environment:
+      IDI_DOMAIN: ${IDI_DOMAIN:-}
+      IDI_VPS_APP_IP: ${IDI_VPS_APP_IP:-172.30.80.10}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./deploy/vps/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/vps/users.caddy:/etc/caddy/users.caddy:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      idi:
+        ipv4_address: ${IDI_VPS_PROXY_IP:-172.30.80.20}
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+networks:
+  idi:
+    ipam:
+      config:
+        - subnet: ${IDI_VPS_SUBNET:-172.30.80.0/24}
+          gateway: ${IDI_VPS_GATEWAY:-172.30.80.1}
+
+volumes:
+  idi_data:
+  idi_key:
+  caddy_data:
+  caddy_config:

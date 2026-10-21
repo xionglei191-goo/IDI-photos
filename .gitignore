@@ -24,6 +24,7 @@ secrets/
 *.tsbuildinfo
 frontend/test-results/
 frontend/playwright-report/
+deploy/vps/users.caddy
 
 inbox/
 

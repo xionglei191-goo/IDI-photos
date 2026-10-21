@@ -2,6 +2,42 @@
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlsplit
 
+from .platform_contract import STAGES
+
+
+def active_attachment(item):
+    return (isinstance(item, dict) and item.get('id') and item.get('fileUrl')
+            and str(item.get('invalid', '')).lower() not in ('1', 'true'))
+
+
+def attachment_removal_history(previous, snapshot, read_at):
+    """Record disappearance only from successfully read, explicit file lists."""
+    from copy import deepcopy
+
+    history = deepcopy(previous.get('removed_attachments', {}))
+    keys = {field['key'] for stage in STAGES.values() for field in stage['fields'] if field['kind'] == 'files'}
+    for section in ('claim', 'survey', 'repair'):
+        old, fresh = previous.get(section) or {}, snapshot.get(section) or {}
+        for key in keys:
+            items = fresh.get(key)
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                continue
+            active = {str(item['id']) for item in items if active_attachment(item)}
+            removed = {str(item['id']): item for item in history.get(section, {}).get(key, [])
+                       if str(item['id']) not in active}
+            before = old.get(key) if isinstance(old.get(key), list) else []
+            candidates = [item for item in before if active_attachment(item)]
+            candidates += [item for item in items if item.get('id') and item.get('fileUrl')
+                           and str(item.get('invalid', '')).lower() in ('1', 'true')]
+            for item in candidates:
+                identity = str(item['id'])
+                if identity not in active and identity not in removed:
+                    removed[identity] = {**item, 'removed_at': read_at}
+            if removed or key in history.get(section, {}):
+                history.setdefault(section, {})[key] = list(removed.values())
+    return {section: {key: items for key, items in fields.items() if items}
+            for section, fields in history.items() if any(fields.values())}
+
 
 PHOTO_FIELDS = {
     'survey_checkin': ('survey', 'siteSurveyId', ('buildingFileInfoList', 'houseFileInfoList')),

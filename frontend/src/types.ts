@@ -14,12 +14,15 @@ export interface Source { id: string; source_type: string; original_name: string
 export interface Candidate { case_id: string; case_title: string; report_number: string | null; project_name: string; location: string; score: number; reasons: string[] }
 export interface Recognition { id: string; provider: string; state: string; raw_text: string; suggestions: { fields?: Record<string, string>; evidence?: unknown }; candidates: Candidate[]; error: string | null; created_at: string }
 export interface Photo {
+  uploaded_by?: string | null; uploaded_by_name?: string | null;
   processing?: { receipt: string; pipeline: { state?: string; identity?: string; reason?: string }; draft: Record<string, unknown>; rule: { state: string; error: string | null } | null; ai: { id: string; state: string; attempts: number; error: string | null; result?: Record<string, unknown> } | null };
   id: string; blob_hash: string; project_id: string | null; case_id: string | null; visit_id: string | null;
   visit_date?: string | null; visit_key?: string | null; shared_checkin_visit_id?: string | null; shared_checkin_date?: string | null; shared_checkin_key?: string | null;
+  reuse_source_id?: string | null; reuse_source_exists?: boolean; reuse_source_revision?: number | null; reuse_copy_id?: string | null;
   case_title: string | null; project_name: string | null; report_number: string | null; building: string | null; room: string | null; unit: string | null; insurer: string | null;
   stage: string; role: string; photo_group: string; short_code: string | null; platform_report_code: string | null; part: string; process: string; watermark_time: string | null; exif_time: string | null;
   notes: string; recognition_state: string; confirmed_fields: string[]; revision: number; media_type: string;
+  watermark_code?: string; watermark_code_source?: string; watermark_dedup_reason?: string;
   size_bytes: number; width: number | null; height: number | null; original_name: string; thumbnail_url: string | null;
   original_url: string; sender: string; group_name: string; message_time: string | null; source_type: string; source_count: number;
   created_at: string; updated_at: string; sources?: Source[]; recognitions?: Recognition[];
@@ -36,7 +39,7 @@ export interface Package { id: string; case_id: string; case_title: string; proj
 export interface PackageDetail extends Package { manifest: { case: Case; photos: Photo[]; completeness: Completeness; version: number; created_at: string }; events: { id: string; state: string; event_at: string; note: string; attachment_hash: string | null; created_at: string }[] }
 export interface Connector { id: string; name: string; kind: string; enabled: boolean; status: string; error: string | null; last_seen_at: string | null; wxauto_available: boolean; secret_configured?: boolean; config: { project_id: string | null; case_id: string | null; path: string; groups: string[]; auto_ocr: boolean; app_id?: string; chat_id?: string; chat_name?: string }; counts: { messages: number; saved: number; failed: number; pending: number }; capture?: { phase: string; last_event_at: string | null; last_history_at: string | null }; queue?: { total: number; completed: number; failed: number; pending: number; last_error?: string } }
 export interface RecognitionConfig { local_ocr: boolean; local_ocr_available: boolean; vision_enabled: boolean; base_url: string; model: string; key_env: string; vision_key_present: boolean; vision_key_stored?: boolean; vision_ready: boolean }
-export interface System { version: string; data_dir: string; local_only: boolean; lan_urls: string[]; public_urls: string[]; stages: Record<string, string>; roles: Record<string, string>; case_statuses: Record<string, string>; recognition: RecognitionConfig; max_file_mb: number }
+export interface System { deployment?: "local" | "vps"; version: string; data_dir: string; local_only: boolean; lan_urls: string[]; public_urls: string[]; stages: Record<string, string>; roles: Record<string, string>; case_statuses: Record<string, string>; recognition: RecognitionConfig; max_file_mb: number }
 export interface Filter { project_id: string; case_id: string; stage: string; review: string; photo_group?: string }
 export interface Batch { id: string; kind: string; state: string; total: number; imported: number; duplicates: number; failed: number; created_at: string; finished_at: string | null; details: Record<string, unknown>; items?: { id: string; source_name: string; status: string; photo_id: string | null; error: string | null }[] }
 export type Notify = (message: string, error?: boolean) => void;

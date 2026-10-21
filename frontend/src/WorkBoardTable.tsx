@@ -41,7 +41,7 @@ export default function WorkBoardTable({ items, openCase, showPhotos }: {
       <tr data-photo-source="local">
         <th scope="row" className="photo-source-cell local-source">本地<small>已归档原件</small></th>
         {Object.keys(PHOTO_GROUPS).map(group => <td className="photo-count-cell" data-photo-group={group} key={group}>
-          <button aria-label={`${c.short_code || c.title} ${PHOTO_GROUPS[group]} ${c.photo_counts[group]}张`} title={`查看本地${PHOTO_GROUPS[group]}`} className={c.photo_counts[group] ? 'count-present' : ['survey_checkin', 'survey_problem'].includes(group) || c.workflow_stage !== 'survey' ? 'count-missing' : 'count-future'} onClick={() => showPhotos(c.id, group)}>{c.photo_counts[group]}</button>{group === 'work_checkin' && !!c.shared_checkin_count && <small title="同一次进场共用查勘原件，不增加原件总数">共用 {c.shared_checkin_count}</small>}
+          <button aria-label={`${c.short_code || c.title} ${PHOTO_GROUPS[group]} ${c.photo_counts[group]}张`} title={`查看本地${PHOTO_GROUPS[group]}`} className={c.photo_counts[group] ? 'count-present' : ['survey_checkin', 'survey_problem'].includes(group) || c.workflow_stage !== 'survey' ? 'count-missing' : 'count-future'} onClick={() => showPhotos(c.id, group)}>{c.photo_counts[group]}</button>{group === 'work_checkin' && !!c.shared_checkin_count && <small title="从同次查勘原照复制，原照与维修副本独立归档">复用副本 {c.shared_checkin_count}</small>}
         </td>)}
       </tr>
     </tbody>)}

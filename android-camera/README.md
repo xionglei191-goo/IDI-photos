@@ -1,0 +1,91 @@
+# IDI 相机 0.5.2 · 官方原生版
+
+安卓 APK 使用用户提供的 **XheyCameraSDK 1.3.70.9b61b4a6 Android** 拍摄，保留案件选择、内容编辑、本地照片和上传记录。支持 Android 8.0 及以上的 ARM 手机；包内包含 arm64-v8a 和 armeabi-v7a 官方库。
+
+## 使用流程
+
+1. 在运行 IDI 的电脑打开 `http://127.0.0.1:8766/camera-setup`，启用已保存的 SDK 授权，选择项目并生成配对码。
+2. 安装 0.5.2 APK，由 IDI 系统管理员选择人员和所属项目生成配对码，输入服务器地址和配对码后「连接并同步」。已有版本可用同一发布签名覆盖升级，保留手机记录。IDI 0.2.37 起，历史设备需重新按人员配对。
+3. 选择案件或点击「拍照」，允许相机和精确位置权限后直接进入官方预览，并自动弹出水印设置。手动填写或确认环节、部位和照片内容，保存后继续取景；取景时点击水印可再次修改。0.5.1 已移除水印面板的语音填写入口及识别调用。
+4. 预览顶部选择「拍照」或「录像」。录像首次使用需允许麦克风，每段最长 60 秒，720p、目标码率 4 Mbps，保存为含音轨的 MP4。开始录像前可修改水印，录制或暂停期间锁定水印和模式。核对后拍摄，照片保留 SDK 返回的 JPEG，视频保留 SDK 返回的 MP4；不重绘、不转码，预览缩略图单独生成。
+5. 原片上传到电脑归档，默认显示「已归档 · 未做本地验真」，不自动提交保司官网。断网时已经保存的原片留在手机，联网后补传。
+6. 手机记录页可播放、暂停、拖动视频进度并导出 MP4 原片，电脑资料列表也可播放。视频标为「视频已归档 · 未验真」，不计入必需照片数量。
+7. 照片本地验真为可选项，默认关闭。只有在电脑配对页明确开启时，新的照片上传才调用官方验真接口，并在明确通过后归档；开关不会补验已归档照片。关闭会暂停此前等待验真的任务。视频暂不支持本地验真，无论该开关状态如何均不调用照片验真接口。
+
+打开相机后未拍摄就退出，不会在照片记录或异常计数中占一条。旧版留下的未拍摄取消、中断记录也不再显示。相机打开前的授权、网络错误仍在相机页面提示；实际返回过照片后发生的保存、上传错误继续显示。已有原片、部分保存文件和上传回执不会因退出相机而删除或隐藏。
+
+拍摄需要 SDK App ID / Secret Key。只有开启本地验真时才需要验真 Group Key / Group Secret。SDK 返回的时间和防伪码仅标作未核验元数据；缺少 SDK 时间时不使用手机时钟冒充水印时间。启用本地验真并通过后，水印时间以官方结果为准。案件归属和水印内容仍需人工核对，拍照和验真不推进案件流程。
+
+## 水印与原生接口
+
+当前账号沿用「IDI 案件现场照片」团队模板，顺序为 **时间 → 官方地点 → 案件号 → 小区 → 位置 → 环节 → 内容**。官方 SDK 生成时间和定位，IDI 自动传入其余五项；案件号采用完整报案编号，位置采用案件的楼栋房号。
+
+接入依据是此次实际提供的 1.3.70 包：
+
+- `CameraViewConfig.kCustomInputItems` 接受 `HashMap<String, String>`，不是 JSON 字符串。
+- 通过 `kAppid`、`kNoncestr`、整数 `kTimestamp`、`kSignature` 传入电脑生成的签名；不向手机发送 `kSecretKey`。
+- 拍照设置 Photo 模式、单张拍摄、保存确认事件和 CameraX 后端。录像设置 Video 模式、720p、60 秒以及每个拍摄编号独立的 SDK 保存目录；只在切换录像时申请录音权限。
+- 在 `kCameraActivityWillDismiss` 事件中读取 `Result.capturedImages`，由 `CapturedImage.getImageData()` 取得原片、`getUserComment()` 取得 SDK 元数据。保存成功后才调用 `dismiss()`。
+- 视频在 Activity 返回成功时读取 `CameraActivity.getRecordingResult()`，使用 `RecordingResult.videoInfo.filePath` 保存原文件；校验文件位于本次拍摄目录、MP4 可读取、时长有效，不使用照片回调。SDK `VideoInfo` 不提供照片 UserComment，视频水印时间不伪填为本机时间。
+- 只在显式模拟器测试的 debug 包中允许 SDK 的模拟器测试选项；发布包保留官方模拟器拦截。
+
+`EditableCameraActivity` 继承 SDK 相机，只读取官方页面中可见水印的坐标，在其上提供本机无障碍点击入口并打开统一设置面板。更改环节、内容或拍摄模式后，保留同一个拍摄编号，通过新签名和 `kCustomInputItems` 重新打开 SDK 预览；等待旧相机销毁并释放原生资源后才启动新相机，不会修改厂商 HTML、JavaScript 或成片。照片确认页、录像和录像暂停时不提供该编辑入口；一旦已有原片或部分文件，元数据不允许改写。案件号、小区、位置沿用已选案件，时间和官方地点由 SDK 生成。
+
+后端按照片 20 MiB、视频 64 MiB 限制读取，检查视频 MP4 结构、H.264 视频轨、尺寸和时长。60 秒录制停止时容许 SDK 收尾造成的文件时长增加，最多接收 65 秒；不裁剪原片。格式检查不等于内容或真实性验证。视频按拍摄编号与哈希幂等归档，保留删除标记；取消、崩溃恢复不删除任何已有 SDK 文件。视频上传的读超时为 120 秒，失败保留本机原片后重试。
+
+旧版公开文档中的 `Result.images` 不适用于本包。原生 Java 配置没有独立的缩放参数，但随包水印渲染器支持 `watermarkScale`。本版通过自有的本地入口页传入 `0.68`，并把 SDK 的表单 URL 编码规范化，避免空格显示成“+”；随后进入未修改的官方资源页。水印缩放在 SDK 生成原片前完成，不对成片二次处理。团队模板 ID 可留空，但此时需要在官方相机中手工核对模板和字段。时间、地点必须由官方模板保留；是否能通过验真以实际官方验真结果为准。
+
+## 授权与传输
+
+SDK 和验真密钥继续以当前 Windows 用户的 DPAPI 加密保存在档案目录 `secrets/xhey-camera.bin`，不进入 Git、APK 或便携备份。迁机后需重新填写。手机每次拍摄从 `/api/camera/native-session` 获取新签名；该接口检查设备项目权限、案件号、案件状态、项目和位置是否过期，响应禁止缓存。旧的密钥下载接口保持停用。
+
+官方 SDK 使用随包提供的原生库和水印资源，并联网取得授权、时间、定位等服务。IDI 收到原片后仅上传到配对的电脑；只有显式开启照片本地验真才额外向 `openapi.xhey.top` 发送照片原片验真。SDK 的内部网络处理以厂商实现为准。原生日志委托不转发签名和配置。拍摄、验真各自受官方试用期及额度限制。
+
+旧 H5 客户端的签名和上传接口仍保留，以兼容已有安装和待上传照片；0.5.1 的正式拍摄入口使用原生 SDK，视频仅允许原生来源。示例体验仍使用 CameraX 自绘照片水印，仅保存在本机，不能当作官方照片。
+
+## 构建
+
+依赖 JDK 21、Android SDK 36、Gradle 9.5.1。将原始 `XheyCameraSDK-v1.3.70.9b61b4a6.Android.zip` 解压到 `android-camera/xhey-sdk/1.3.70/`，保留 ZIP 内的根目录。默认路径为：
+
+```text
+android-camera/xhey-sdk/1.3.70/XheyCameraSDK-v1.3.70.9b61b4a6.Android/
+  xheycamerasdk-release.aar
+  XheyCameraSDKAssets/
+```
+
+原始 ZIP SHA256：`7f4c70658063849520684c816c8a643cd0bb0281a0a2eb955f37e4b465afb0a6`。SDK 包和本机配置不进入 Git，构建时必须准备该依赖；可参考 `xhey.properties.example` 覆盖路径，不要混用不同版本的 AAR 与资源。构建只打包 `XheyCameraSDKAssets/`，不会把 AAR 作为普通资产再打包一次。
+
+```powershell
+$env:ANDROID_HOME = 'F:\Android\Sdk'
+.\android-camera\build.ps1 -Variant debug -Test
+.\android-camera\build.ps1 -Variant release -GradlePath 'C:\Gradle\gradle-9.5.1\bin\gradle.bat'
+```
+
+发布签名仍读取 `android-camera/signing.properties`，沿用当前 Windows 用户 `.android/idi-camera-signing/` 中的原发布密钥；不进入 Git。0.5.2 的 `versionCode` 为 11。交付副本为 `artifacts/android-camera/IDI-Camera-0.5.2-native.apk`。手机端保留已有照片和上传记录；电脑端 0.2.37 新增人员权限迁移。保留 `not_requested` 与 `verified` 的明确区分。保留 0.4.1 的启动器重复进入保护和拍摄编号关联修复。0.4.2 在冷启动时将无照片、无活动相机的空会话记为取消，并从照片列表和计数中排除；内部会话及任何已有文件不删除，已保存原片继续恢复。
+
+## 验证
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_official_camera.py tests/test_mobile_camera.py tests/test_network_access.py tests/test_photo_deletion.py -q
+.\.venv\Scripts\python.exe -X utf8 android-camera/verification/acceptance_server.py --port 8877 --root artifacts/native-sdk-integration/local --local-only
+```
+
+隔离模拟器中运行 `CameraDeviceTest`（传入一次性配对码和 `expected_verification=not_requested`）验证原片哈希、断网补传、幂等归档与状态显示；`NativeSdkDeviceTest` 验证原生参数传递、新版回调数据的无损保存、启动器重复进入及中断拍摄恢复。合成照片不能作为官方验真证据。
+
+实时原生照片检查需要显式提供 `native_live=1`，视频检查使用 `video_live=1` 和 `VideoDeviceTest`；测试后端使用 `--live-xhey-config data` 读取本机加密配置，但默认关闭本地验真。只有另加 `--live-verify` 才允许照片调用计费验真接口。实时测试只使用独立案件、目录和端口，不写入生产案件。模拟器记录见 `artifacts/native-sdk-integration/` 和 `artifacts/camera-video-20261020/`。
+
+2026-10-20 在 OPPO Find X（Android 10、ARM64）完成实体手机检查：0.4.0 拍摄后覆盖升级到 0.4.1，照片和配对信息保留；0.4.1 从桌面返回原生相机后继续拍摄并归档成功。真实 GPS、七行水印及 SDK EXIF 已检查，两张原片均为 `not_requested`、验真尝试次数为 0。手机上传完成状态证明客户端通过回执哈希检查，另已校验电脑存档文件的 SHA-256；未独立读取发布应用的手机私有原片目录。真机记录见 `artifacts/physical-camera-20261020/`。0.4.1 通过 5 项单元测试、4 项定向仪器测试及构建/lint；断网补传沿用此前隔离模拟器验证，本次未做真机断网测试或项目全量测试。
+
+0.4.2 在同一实体手机覆盖升级后，5 条未生成照片的旧记录不再显示，原有 2 张照片和正式配对保留；打开官方相机后未拍摄直接退出，列表仍为 2 条、异常 0 条。5 项单元测试和 6 项仪器测试通过，实时拍摄仪器用例按开关跳过，构建/lint 通过。回归覆盖旧取消记录、活动相机、原片、部分保存文件、无文件的真实保存失败及上传回执的保留；本轮未拍摄或上传正式照片，未运行项目全量测试。证据见 `artifacts/camera-cancel-20261020/`。
+
+0.4.3 在实体手机从「拍照」直接进入官方预览并自动打开设置，保存后点击水印可再次编辑；不拍摄退出返回案件页，原有 2 张照片、异常 0 条和正式配对保留。隔离模拟器通过官方 SDK 拍摄，修改后的「完工照片 / 厨房 / PREVIEW-EDIT-043」与原片及电脑归档一致，原片 SHA-256 一致，本地验真尝试 0 次。5 项单元测试、9 项常规仪器用例及 1 项单独的实时 SDK 用例通过，含断网补传回归；常规运行中的实时用例按开关跳过后单独执行。构建/lint 通过，未运行项目全量测试。证据见 `artifacts/camera-preview-20261020/`。
+
+0.5.0 通过 106 项后端相关测试、5 项 Android 单元测试、11 项常规仪器用例（另外 2 项实时用例由开关跳过）以及构建/lint。隔离模拟器通过官方 SDK 录制到 60 秒上限，保存的原片为 720×1280、61.710 秒、含音轨，断网保存、恢复联网上传和重复上传幂等检查通过；另一次实际录像验证来回切换模式、暂停、继续和手动停止，手机播放与导出、电脑浏览器播放均已检查。手机原片与电脑归档 SHA-256 相同；仅确认模拟器文件有音轨，未验证真机收音质量。
+
+复测曾在模拟器的 ARM 原生库转换层发生一次切换崩溃，日志显示旧相机尚未销毁就启动了新相机。现等待 SDK 完成旧 Activity 销毁再启动，修正后的来回切换和实时录像用例通过。实体 OPPO Find X 已从 0.4.3 覆盖升级至 0.5.0，原有 4 条已归档记录、异常 0 条和正式配对保留，直接预览及水印设置入口正常；本轮未在真机录音、录像或向正式案件上传测试资料，麦克风权限留待用户首次录像时选择。本机和公网下载的 APK 哈希与发布包一致；现有电脑服务已加载视频接口，未再次重启。未运行项目全量测试。完整证据见 `artifacts/camera-video-20261020/`。
+
+0.5.1 移除水印编辑的语音按钮、两处识别结果回调和语音识别应用查询声明，保留录像所需的麦克风权限。发布构建、5 项单元测试与 lint 通过；实体手机覆盖升级后，手动填写入口、保存并回到官方预览、未拍摄退出及原有 4 条记录已检查。本轮未重新录制视频或运行项目全量测试。证据见 `artifacts/camera-no-voice-20261020/`。
+
+0.5.2 在连接设置中显示绑定的人员姓名，并明确由管理员按人员及项目生成配对码。设备权限由服务器实时核验。发布构建、5 项单元测试和 lint 通过；本轮未覆盖安装实体手机或重新验证实际拍摄。后端通过模拟官网验证了成员 APP 上传、项目账号自动保存草稿、管理员正式提交的完整链路。证据见 `artifacts/project-permissions-2026-10-20/`。
+
+参考：[官方 SDK 文档](https://developer.xhey.top/docs/camerasdk)；[官方验真 API 文档](https://docs.xhey.top/docs/trutu-build-api/)。

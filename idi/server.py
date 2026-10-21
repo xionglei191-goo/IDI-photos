@@ -47,7 +47,14 @@ def main():
         lock.close()
         raise SystemExit(f"Port {args.port} is already in use.")
     record = settings.data_dir / "service.json"
-    record.write_text(json.dumps({"pid": os.getpid(), "host": settings.host, "port": args.port, "data_dir": str(settings.data_dir), "executable": sys.executable, "base_executable": getattr(sys, "_base_executable", sys.executable), "started_at": now()}, indent=2), encoding="utf-8")
+    record.write_text(json.dumps({"pid": os.getpid(), "host": settings.host, "port": args.port,
+        "data_dir": str(settings.data_dir), "executable": sys.executable,
+        "base_executable": getattr(sys, "_base_executable", sys.executable), "started_at": now(),
+        "platform_write_enabled": settings.platform_write_enabled,
+        "network": {"local_only": settings.local_only, "listen_host": settings.host,
+                    "lan_urls": settings.lan_urls, "lan_subnets": list(settings.lan_subnets) if not settings.local_only else [],
+                    "public_urls": list(settings.public_origins), "trusted_proxies": list(settings.trusted_proxies)}
+    }, indent=2), encoding="utf-8")
     if args.open_browser:
         def open_when_ready():
             for _ in range(100):

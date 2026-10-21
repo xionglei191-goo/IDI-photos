@@ -92,7 +92,7 @@ class WorkspaceTools(ProjectAgentTools):
                 self.related[case['id']] = {'case_id': case['id'], 'label': case.get('platform_report_code') or case.get('short_code') or case['title'],
                     'project_name': case.get('project_name', ''), 'location': ' '.join(str(case.get(k) or '') for k in ('building', 'unit', 'room')).strip()}
         if name == 'search_cases':
-            output['scope'] = '仅当前对话选择的项目；未找到不代表其他项目或官网不存在'
+            output['scope'] = output['scope'].replace('当前群绑定项目', '当前对话选择的项目')
         return output, images
 
 
@@ -240,7 +240,7 @@ class WorkspaceChat:
         context = None
         try:
             context = WorkspaceTools(self, task)
-            messages = [{'role': 'system', 'content': SYSTEM}]
+            messages = [{'role': 'system', 'content': SYSTEM + '\n' + context.dates.system_prompt()}]
             messages += self.memory.context.prepare(task, 'workspace', context.project_ids, self.request_model,
                 lambda: self.check_task(task), usage, token_limit=MAX_TOKENS)
             messages.append({'role': 'user', 'content': dump(context.initial())})
@@ -270,7 +270,12 @@ class WorkspaceChat:
                 if not calls:
                     if not isinstance(message.get('content'), str) or not message['content'].strip():
                         raise DomainError('模型没有返回有效答复')
-                    answer = message['content'].strip()[:4000]
+                    try:
+                        answer = context.dates.finish(message['content'].strip()[:4000], limit=4000)
+                    except DomainError as exc:
+                        messages += [{'role': 'assistant', 'content': message['content']},
+                                     {'role': 'user', 'content': '服务器日期校验未通过：' + str(exc)}]
+                        continue
                     break
                 if not isinstance(calls, list) or len(calls) > 4 or (len(calls) > 1 and any(c.get('function', {}).get('name') == 'finish_reply' for c in calls)):
                     raise DomainError('模型工具调用格式异常，请重试')

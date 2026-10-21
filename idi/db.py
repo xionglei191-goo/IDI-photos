@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ def rowdict(row):
 class Database:
     def __init__(self, path: Path):
         self.path = path
+        self._reads = threading.local()
 
     def connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -38,6 +40,10 @@ class Database:
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
+        snapshot = getattr(self._reads, "snapshot", None)
+        if snapshot is not None:
+            yield snapshot
+            return
         con = self.connect()
         try:
             yield con
@@ -45,7 +51,26 @@ class Database:
             con.close()
 
     @contextmanager
+    def read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        """Reuse one consistent, read-only connection within this worker thread."""
+        snapshot = getattr(self._reads, "snapshot", None)
+        if snapshot is not None:
+            yield snapshot
+            return
+        con = self.connect()
+        try:
+            con.execute("PRAGMA query_only=ON")
+            con.execute("BEGIN")
+            self._reads.snapshot = con
+            yield con
+        finally:
+            self._reads.snapshot = None
+            con.close()
+
+    @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
+        if getattr(self._reads, "snapshot", None) is not None:
+            raise RuntimeError("Cannot write inside a read-only database snapshot")
         with self.read() as con:
             con.execute("BEGIN IMMEDIATE")
             try:
@@ -81,6 +106,9 @@ class Database:
                                 updated = [{**rule, 'per_visit': rule['photo_group'] in ('work_checkin', 'construction')} for rule in original]
                                 con.execute("UPDATE templates SET requirements=?,updated_at=? WHERE id='insurer-v2'", (dump(updated), now()))
                                 audit(con, 'template', 'insurer-v2', 'visit_requirements', original, updated, 'migration')
+                        if version == 30:
+                            from .checkin_copies import migrate_legacy_copies
+                            migrate_legacy_copies(con)
                         con.execute('INSERT INTO schema_version VALUES(?,?)', (version, now()))
                         con.commit()
                     except BaseException:
@@ -129,4 +157,8 @@ class Database:
 
 
 def audit(con, entity_type: str, entity_id: str, action: str, before=None, after=None, actor="local"):
+    from .identity import current
+    person = current()
+    if person:
+        actor = 'user:' + person.id
     con.execute("INSERT INTO audit VALUES(?,?,?,?,?,?,?,?)", (uid(), entity_type, entity_id, action, dump(before) if before is not None else None, dump(after) if after is not None else None, actor, now()))

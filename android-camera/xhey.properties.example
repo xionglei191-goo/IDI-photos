@@ -1,0 +1,6 @@
+# Optional path overrides; the defaults work after extracting the supplied ZIP.
+# No credential belongs in this file. Do not mix SDK or resource versions.
+sdkDir=xhey-sdk/1.3.70/XheyCameraSDK-v1.3.70.9b61b4a6.Android
+assetsParent=xhey-sdk/1.3.70/XheyCameraSDK-v1.3.70.9b61b4a6.Android
+# Only XheyCameraSDKAssets/** is copied into APK assets; the AAR is a dependency.
+cameraXVersion=1.4.2

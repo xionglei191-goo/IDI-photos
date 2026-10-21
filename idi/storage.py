@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+from contextlib import nullcontext
 import mimetypes
 import os
 import re
@@ -38,14 +39,19 @@ class Storage:
             raise ValueError("档案路径越界")
         return path
 
-    def put(self, data: bytes, name: str) -> dict:
+    def put(self, data: bytes, name: str, *, connection=None) -> dict:
+        with (self.db.tx() if connection is None else nullcontext(connection)) as con:
+            return self._put(data, name, con)
+
+    def _put(self, data: bytes, name: str, con) -> dict:
         if not data or len(data) > self.settings.max_file_bytes:
             raise ValueError("文件为空或超过单文件大小限制")
         suffix = Path(name).suffix.lower()
         if suffix not in ALLOWED_EXTS:
             raise ValueError(f"不支持的文件类型：{suffix or '无扩展名'}")
         digest = hashlib.sha256(data).hexdigest()
-        existing = self.db.one("SELECT * FROM blobs WHERE hash=?", (digest,))
+        found = con.execute("SELECT * FROM blobs WHERE hash=?", (digest,)).fetchone()
+        existing = dict(found) if found else None
         if existing:
             if self.resolve(existing["stored_path"]).is_file():
                 if not self.verify(existing):
@@ -79,8 +85,7 @@ class Storage:
         blob = {"hash": digest, "stored_path": stored, "thumbnail_path": thumb, "extension": suffix,
                 "mime_type": mimetypes.guess_type(name)[0] or "application/octet-stream", "media_type": media_type,
                 "size_bytes": len(data), "width": width, "height": height, "created_at": now()}
-        with self.db.tx() as con:
-            con.execute("INSERT OR IGNORE INTO blobs(hash,stored_path,thumbnail_path,extension,mime_type,media_type,size_bytes,width,height,created_at) VALUES(:hash,:stored_path,:thumbnail_path,:extension,:mime_type,:media_type,:size_bytes,:width,:height,:created_at)", blob)
+        con.execute("INSERT OR IGNORE INTO blobs(hash,stored_path,thumbnail_path,extension,mime_type,media_type,size_bytes,width,height,created_at) VALUES(:hash,:stored_path,:thumbnail_path,:extension,:mime_type,:media_type,:size_bytes,:width,:height,:created_at)", blob)
         return {**blob, "exif_time": exif_time}
 
     @staticmethod

@@ -20,9 +20,10 @@ from .case_codes import normalize_code
 from .storage import Storage
 from .connectors.secret_store import VisionSecretStore
 from .model_runtime import ModelRuntime
+from .photo_dedup import watermark_from_ocr
 
 _ISSUES = [set(("油漆", "起皮", "起泡", "乳胶漆", "批灰")), set(("渗水", "渗漏", "漏水", "防水")), set(("管道", "水管", "管件")), set(("裂缝", "开裂")), set(("空鼓", "地砖", "瓷砖")), set(("门窗", "窗框", "玻璃"))]
-_WATERMARK_LABELS = r"施工项目|维修项目|小区|工程名称|施工区域|维修区域|施工位置|报修位置|施工内容|维修内容|打卡内容|案件编号|报修编号|报案号|案件号|短编号|编号|时间|时[^\u4e00-\u9fff]{0,2}间|日期|地点|经度|纬度|拍摄|地址|备注"
+_WATERMARK_LABELS = r"施工项目|维修项目|小区|工程名称|施工区域|维修区域|施工位置|报修位置|施工内容|维修内容|打卡内容|案件编号|报修编号|报案号|案件号|短编号|防伪码|水印码|编号|时间|时[^\u4e00-\u9fff]{0,2}间|日期|地点|经度|纬度|拍摄|地址|备注"
 _SHORT_CODE = r"[A-Z0-9]+-[A-Z0-9]+-(?:U[A-Z0-9]+-)?[A-Z0-9]+-\d{2,4}"
 
 
@@ -37,6 +38,9 @@ def extract_fields(text: str) -> dict:
     labelled_text = re.sub(r"时[^\u4e00-\u9fff]{0,3}间(?=[:：]\s*20\d{2}[.\-/年])", '时间', joined)
     dense = compact(re.sub(r"(?m)^间[:：](?=\s*20\d{2}[.\-/年])", '时间：', labelled_text))
     result = {}
+    watermark = watermark_from_ocr(text)
+    if watermark['code']:
+        result['watermark_code'] = watermark['code']
     stamp = re.search(r"(20\d{2})[.\-/年](\d{1,2})[.\-/月](\d{1,2})日?[\sT]*(\d{1,2})[:：](\d{2})(?:[:：](\d{2}))?", joined)
     if stamp:
         try:
@@ -377,7 +381,7 @@ class Recognizer:
         auto = top[0]["case_id"] if top and top[0]["eligible"] and (len(top) == 1 or top[0]["score"] - top[1]["score"] >= 20) else None
         return top, auto
 
-    def recognize(self, photo_id, use_vision=False):
+    def recognize(self, photo_id, use_vision=False, *, force=False):
         photo = self.domain.photo(photo_id)
         if photo["media_type"] != "image":
             raise DomainError("当前只支持图片识别")
@@ -395,7 +399,11 @@ class Recognizer:
             else:
                 if not config.get("local_ocr", True):
                     raise DomainError("本地OCR已关闭")
-                text, evidence = self.local_ocr(path)
+                cached = None if force else self.db.one('SELECT * FROM photo_ocr_cache WHERE blob_hash=?', (photo['blob_hash'],))
+                if cached:
+                    text, evidence = cached['raw_text'], json.loads(cached['evidence'])
+                else:
+                    text, evidence = self.local_ocr(path)
                 fields = extract_fields(text)
                 fields.update(extract_checkin_role(fields, evidence))
             context_text = "\n".join([text, *[s.get("metadata", {}).get("context_text", "") for s in photo["sources"]]])
@@ -403,10 +411,16 @@ class Recognizer:
             candidates, auto_case = self.match(context_text, match_fields, photo["project_id"])
             with self.db.tx() as con:
                 current = rowdict(con.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone())
+                if current is None:
+                    raise DomainError('照片已删除，未保存识别结果', 404)
+                if current['blob_hash'] != photo['blob_hash']:
+                    raise DomainError('照片原图已更新，旧版识别结果已丢弃，请重新识别', 409)
                 confirmed = set(json.loads(current["confirmed_fields"]))
                 update = {}
                 classification = {k: fields[k] for k in ('stage', 'role', 'photo_group') if fields.get(k) not in (None, '', 'unknown')}
-                classification_conflict = any(k in confirmed and current[k] != v for k, v in classification.items())
+                from .checkin_copies import copy_purpose_conflicts
+                classification_conflict = bool(copy_purpose_conflicts(current, fields,
+                    {k for k, v in classification.items() if k in confirmed and current[k] != v}))
                 if not classification_conflict:
                     update.update({k: v for k, v in classification.items() if k not in confirmed})
                 for key in ("stage", "role", "photo_group", "part", "process", "watermark_time"):
@@ -416,23 +430,32 @@ class Recognizer:
                     if value and key not in confirmed and current[key] in (None, "", "unknown"):
                         update[key] = value
                 if not current["case_id"] and "case_id" not in confirmed and auto_case:
-                    other = con.execute("SELECT id FROM photos WHERE case_id=? AND blob_hash=?", (auto_case, photo["blob_hash"])).fetchone()
+                    other = con.execute("SELECT id FROM photos WHERE case_id=? AND blob_hash=? AND reuse_source_id IS NULL", (auto_case, photo["blob_hash"])).fetchone()
                     if not other:
                         update["case_id"] = auto_case
                         update["project_id"] = con.execute("SELECT project_id FROM cases WHERE id=?", (auto_case,)).fetchone()[0]
                 if current["recognition_state"] != "confirmed":
                     explicit_id = any(match_fields.get(k) for k in ('short_code', 'platform_report_code', 'identifier_conflict'))
-                    conflict = classification_conflict or any(c.get('needs_review') for c in candidates) or bool(explicit_id and (not auto_case or (current["case_id"] and current["case_id"] != auto_case)))
+                    conflict = bool(current['watermark_dedup_reason']) or classification_conflict or any(c.get('needs_review') for c in candidates) or bool(explicit_id and (not auto_case or (current["case_id"] and current["case_id"] != auto_case)))
                     update["recognition_state"] = "conflict" if conflict else "recognized"
                 update.update(updated_at=now(), revision=current["revision"] + 1)
                 con.execute("UPDATE photos SET " + ",".join(f"{key}=?" for key in update) + " WHERE id=?", (*update.values(), photo_id))
-                con.execute("INSERT INTO recognitions VALUES(?,?,?,?,?,?,?,?,?)", (uid(), photo_id, provider, "completed", text, dump({"fields": fields, "evidence": evidence}), dump(candidates), None, now()))
+                if not use_vision and current['watermark_code_source'] not in ('sdk', 'verified'):
+                    from .photo_dedup import PhotoDedup
+                    identity = watermark_from_ocr(text, evidence)
+                    reason = current['watermark_dedup_reason'] or (
+                        identity['reason'] if current['recognition_state'] != 'confirmed' else '')
+                    PhotoDedup.remember(con, photo_id, identity, reason)
+                    if identity['reason'] and current['recognition_state'] != 'confirmed':
+                        con.execute("UPDATE photos SET recognition_state='conflict' WHERE id=?", (photo_id,))
+                con.execute("INSERT INTO recognitions VALUES(?,?,?,?,?,?,?,?,?)", (uid(), photo_id, provider, "completed", text, dump({"fields": fields, "evidence": evidence, "blob_hash": photo['blob_hash']}), dump(candidates), None, now()))
                 audit(con, "photo", photo_id, "recognition", current, update, actor=provider)
             return {"photo_id": photo_id, "fields": fields, "auto_assigned": bool(update.get("case_id")), "candidates": candidates}
         except Exception as error:
             with self.db.tx() as con:
-                con.execute("INSERT INTO recognitions VALUES(?,?,?,?,?,?,?,?,?)", (uid(), photo_id, provider, "failed", "", "{}", "[]", str(error)[:2000], now()))
-                con.execute("UPDATE photos SET recognition_state=CASE WHEN recognition_state='confirmed' THEN recognition_state ELSE 'failed' END,updated_at=? WHERE id=?", (now(), photo_id))
+                if con.execute('SELECT 1 FROM photos WHERE id=? AND blob_hash=?', (photo_id, photo['blob_hash'])).fetchone():
+                    con.execute("INSERT INTO recognitions VALUES(?,?,?,?,?,?,?,?,?)", (uid(), photo_id, provider, "failed", "", "{}", "[]", str(error)[:2000], now()))
+                    con.execute("UPDATE photos SET recognition_state=CASE WHEN recognition_state='confirmed' THEN recognition_state ELSE 'failed' END,updated_at=? WHERE id=?", (now(), photo_id))
             raise
 
     def process(self, payload, progress):
@@ -445,7 +468,10 @@ class Recognizer:
                 progress(index + 1, len(ids))
                 continue
             try:
-                self.recognize(photo_id, bool(payload.get("use_vision")))
+                if payload.get('force'):
+                    self.recognize(photo_id, bool(payload.get("use_vision")), force=True)
+                else:
+                    self.recognize(photo_id, bool(payload.get("use_vision")))
                 success.append(photo_id)
             except Exception as error:
                 failures.append({"photo_id": photo_id, "error": str(error)[:2000]})
