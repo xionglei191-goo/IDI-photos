@@ -87,7 +87,7 @@ class ReviewNotifications:
             lines.append('已保存：' + '；'.join(files))
         if plan.get('pending_fields'):
             lines.append('待管理员确认：' + '、'.join(plain(f['label']) for f in plan['pending_fields']) + '。')
-            lines.append('本环节照片已齐，已自动填写可确定内容。请在 IDI 工作台的“拟提交”中点击“核对拟提交信息”，补齐待确认字段并审核；确认后系统自动正式提交。')
+            lines.append('本环节已收照片已合并，已自动填写可确定内容。请在 IDI 工作台的“拟提交”中点击“核对拟提交信息”，确认照片是否传齐、补齐待确认字段并审核；确认后系统自动正式提交。')
         else:
             lines.append('本环节资料已收集并保存，请在 IDI 工作台的“拟提交”中点击“核对拟提交信息”，核对字段和照片后确认提交。')
         settings = self.followup.settings

@@ -14,6 +14,7 @@ class FeishuHistory:
         self.agent, self.db = agent, agent.db
 
     def _groups(self, query=''):
+        scope, scope_args = self.agent.visible_task_scope()
         rows = self.db.all("""SELECT t.connector_id,t.chat_id,
             CASE WHEN t.kind='brief' THEN 'brief' ELSE 'group' END session_kind,
             CASE WHEN t.kind='brief' THEN COALESCE(t.project_id,'') ELSE '' END session_project,
@@ -28,8 +29,9 @@ class FeishuHistory:
             FROM feishu_agent_tasks t JOIN connectors c ON c.id=t.connector_id
             LEFT JOIN projects p ON p.id=t.project_id
             LEFT JOIN feishu_agent_outbox o ON o.task_id=t.id
+            WHERE """ + scope + """
             GROUP BY t.connector_id,t.chat_id,session_kind,session_project
-            ORDER BY latest_sequence DESC""", (query.strip(), query.strip()))
+            ORDER BY latest_sequence DESC""", (query.strip(), query.strip(), *scope_args))
         for row in rows:
             row['id'] = 'fs_' + signature([row['connector_id'], row['chat_id'], row['session_kind'], row['session_project']])[:24]
         return rows

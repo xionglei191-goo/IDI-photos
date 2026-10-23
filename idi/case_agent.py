@@ -157,6 +157,7 @@ class CaseAgent:
         row = self.db.one('SELECT * FROM case_agent_runs WHERE id=?', (run_id,))
         if not row:
             raise DomainError('审阅记录不存在', 404)
+        self.domain.case(row['case_id'])
         snapshot = json.loads(row.pop('snapshot'))
         row['result'] = json.loads(row['result']) if row['result'] else None
         row['usage'] = json.loads(row['usage'])
@@ -179,6 +180,8 @@ class CaseAgent:
                 'limits': {'steps': MAX_STEPS, 'images': MAX_IMAGES, 'seconds': MAX_SECONDS}}
 
     def request(self, case_id, force=False):
+        from .identity import current, require_project
+        require_project(self.domain.case(case_id)['project_id'], manage=True)
         config = self.recognizer.status()
         if not config['vision_ready']:
             raise DomainError('请先在识别设置中配置并启用大模型接口')
@@ -201,8 +204,8 @@ class CaseAgent:
                     if con.execute("SELECT COUNT(*) FROM case_agent_runs WHERE state IN ('queued','running')").fetchone()[0] >= 30:
                         raise DomainError('待审阅任务较多，请稍后重试', 409)
                     run_id, cached = uid(), False
-                    con.execute('INSERT INTO case_agent_runs(id,case_id,signature,snapshot,model,created_at) VALUES(?,?,?,?,?,?)',
-                                (run_id, case_id, signature, dump(snapshot), config['model'], now()))
+                    con.execute('INSERT INTO case_agent_runs(id,case_id,signature,snapshot,model,created_at,user_id) VALUES(?,?,?,?,?,?,?)',
+                                (run_id, case_id, signature, dump(snapshot), config['model'], now(), current().id if current() else None))
                     audit(con, 'case_agent', run_id, 'request', after={'case_id': case_id, 'signature': signature, 'model': config['model']})
         self._wake.set()
         return {**self.get(run_id), 'cached': cached}
@@ -222,6 +225,12 @@ class CaseAgent:
             con.execute('INSERT INTO case_agent_steps VALUES(?,?,?,?,?,?,?)', (uid(), run_id, step, name, dump(arguments), outcome[:500], now()))
 
     def _check(self, run, started):
+        if run.get('user_id'):
+            from .workspace_scope import user_principal
+            person = user_principal(self.db, run['user_id'])
+            case = self.db.one('SELECT project_id FROM cases WHERE id=?', (run['case_id'],))
+            if not case or not person.allows(case['project_id'], manage=True):
+                raise DomainError('项目管理权限已变化，审阅已停止', 403)
         if self._stop.is_set():
             raise DomainError('服务停止，审阅未完成；可重新审阅')
         if time.monotonic() - started >= MAX_SECONDS:

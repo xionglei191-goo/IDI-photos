@@ -29,7 +29,7 @@ TOOLS = [
     tool('list_projects', '列出本群授权查询的项目引用、名称和案件数。'),
     tool('read_project_summary', '读取指定项目的案件阶段、今日收图、待核对事项和官网草稿统计；多项目群请先选择项目引用。',
          {'project_ref': {**TEXT, 'description': '项目清单中的 J001 等引用；单项目群可省略'}}),
-    tool('search_cases', '在当前群项目内按案件号、报案号、短编号、楼栋房号或问题分页查找案件，可筛选阶段与日期。新增报案按 report_at，新增入库按 created_at，台账变化按 updated_at；query 空串列出全部候选。',
+    tool('search_cases', '在当前群项目内按案件号、报案号、短编号、楼栋房号或问题分页查找案件，可筛选阶段与日期。新增报案按 report_at，新增入库按 created_at，台账记录刷新按 updated_at；query 空串列出全部候选。更新时间包含同步刷新，不能作为业务进展；按日期查询进展使用 read_case_progress。',
          {'query': {**TEXT, 'maxLength': 160}, 'project_ref': {**TEXT, 'description': '可选，限定本群 J001 等项目引用'},
           **PAGE, **DATES, 'date_basis': {'type': 'string', 'enum': list(CASE_DATE_LABELS)},
           'workflow_stage': {'type': 'string', 'enum': list(WORKFLOW_STAGES)}}, ['query']),

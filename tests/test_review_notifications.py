@@ -75,7 +75,7 @@ def test_complete_photos_notify_pending_fields_once_then_require_fresh_review(se
     notifier, feedback = services['review_notifications'], channel[1]
     assert notifier.run_once() == 1
     assert '待管理员确认：维修方式' in feedback.sent[0][1]['text']
-    assert '照片已齐' in feedback.sent[0][1]['text']
+    assert '已收照片已合并' in feedback.sent[0][1]['text']
     tick(auto, case['id'])
     notifier.recover()
     assert notifier.run_once() == 0 and len(feedback.sent) == 1

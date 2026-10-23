@@ -3,12 +3,14 @@ import { Clock3, LoaderCircle, RefreshCw } from 'lucide-react';
 import { message, put } from './api';
 import type { Job } from './types';
 import type { SyncStatus } from './workflowTypes';
+import usePermissions from './usePermissions';
 
 export default function SyncControls({ value, fullSync, sync, refresh, notify, mode = 'manual' }: {
   value?: SyncStatus; fullSync?: Job; sync: () => Promise<void>; refresh: () => void;
   notify: (text: string, error?: boolean) => void;
   mode?: 'manual' | 'policy';
 }) {
+  const { isAdmin } = usePermissions();
   const [schedule, setSchedule] = useState(value?.schedule);
   const [saving, setSaving] = useState(false), [starting, setStarting] = useState(false);
   const toggling = useRef(false), dispatching = useRef(false);
@@ -36,13 +38,13 @@ export default function SyncControls({ value, fullSync, sync, refresh, notify, m
   }
 
   return <div className="sync-actions" role="group" aria-label="官网同步">
-    {mode === 'policy' && <button className="auto-sync-button" disabled={!schedule || saving} aria-pressed={schedule?.enabled ?? false} aria-busy={saving} title={autoTitle} onClick={() => void toggle()}>
+    {mode === 'policy' && <button className="auto-sync-button" disabled={!isAdmin || !schedule || saving} aria-pressed={schedule?.enabled ?? false} aria-busy={saving} title={isAdmin ? autoTitle : '同步策略由系统管理员维护'} onClick={() => void toggle()}>
       {saving ? <LoaderCircle size={16} className="spin" aria-hidden="true" /> : <Clock3 size={16} aria-hidden="true" />}
       自动同步 <small>{saving ? '保存中' : !schedule ? '读取中' : schedule.enabled ? '已开启' : '已暂停'}</small>
     </button>}
     {mode === 'manual' && <button className="primary" disabled={starting || !!fullSync} aria-busy={starting || !!fullSync} title="立即完整同步官网台账；自动同步进行中时会排队执行" onClick={() => void manual()}>
       <RefreshCw size={16} className={starting || fullSync ? 'spin' : ''} aria-hidden="true" />
-      {starting ? '正在启动' : fullSync ? fullSync.state === 'queued' ? '等待同步' : '同步中' : '手动同步'}
+      {starting ? '正在启动' : fullSync ? fullSync.state === 'queued' ? '等待同步' : '同步中' : isAdmin ? '手动同步' : '刷新清单'}
     </button>}
   </div>;
 }

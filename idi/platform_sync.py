@@ -44,6 +44,20 @@ class PlatformSync:
         return self.status()
 
     def status(self):
+        from .identity import current, project_filter
+        if current() and not current().admin:
+            policy, session = self.policy(), self.client.status()
+            lists = self.db.setting('platform_lists')
+            if lists:
+                scope, args = project_filter('c.project_id')
+                counts = {r['scope']: r['n'] for r in self.db.all('SELECT e.scope,COUNT(*) n FROM platform_list_entries e JOIN cases c ON c.id=e.case_id WHERE ' + scope + ' GROUP BY e.scope', args)}
+                lists = {k: lists[k] for k in ('read_at', 'coverage') if k in lists}
+                lists['counts'] = counts
+            success = self.db.setting('platform_incremental_success')
+            return {'latest': None, 'last_complete': None, 'last_incremental': None, 'lists': lists,
+                    'schedule': {**policy, 'timezone': 'Asia/Shanghai', 'connected': session['connected'],
+                                 'today_requests': 0, 'today_photo_requests': 0, 'photo_backlog': 0,
+                                 'last_success': {'completed_at': success.get('completed_at')} if success else None}}
         latest = self.db.one("SELECT * FROM platform_sync_runs WHERE mode<>'single' ORDER BY started_at DESC,rowid DESC LIMIT 1")
         full = self.db.one("SELECT * FROM platform_sync_runs WHERE mode='full' AND state='completed' ORDER BY finished_at DESC LIMIT 1")
         daily = self.db.one("SELECT * FROM platform_sync_runs WHERE mode='incremental' ORDER BY started_at DESC,rowid DESC LIMIT 1")

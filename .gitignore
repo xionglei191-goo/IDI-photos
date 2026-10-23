@@ -29,6 +29,7 @@ deploy/vps/users.caddy
 inbox/
 
 # Local acceptance evidence and user-provided case material.
+.codex-attachments/
 design/
 docs/validation.md
 fixtures/sample-annotations.json

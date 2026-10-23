@@ -5,12 +5,13 @@ import re
 import hashlib
 import json
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from .platform_contract import STAGES
 
 
-PREFILL_RULES_VERSION = 'automatic-prefill-v3'
+PREFILL_RULES_VERSION = 'automatic-prefill-v4'
+WORK_START_CURRENT_TIME_SOURCE = '没有有效施工打卡水印时间，按自动填写时的北京时间填入；请核对实际时间'
 
 ENGINEERING_TERMS = {
     '地基基础和主体结构': ('地基', '基础沉降', '主体结构', '承重', '梁柱', '楼板结构'),
@@ -71,9 +72,11 @@ def without_automatic_remote(link, stage, sources, fields):
     link = deepcopy(link)
     remote = link.get('snapshot', {}).get(stage, {})
     for key, source in sources.items():
+        if source.get('source') in ('官网已保存的现场查勘记录', '官网已保存的修复成果记录'):
+            continue
         if source['origin'] == 'automatic' and key in fields and key in remote and canonical_value(fields[key], remote[key]) == canonical_value(fields[key], source['value']):
-            # A draft previously saved by this queue is not independent evidence
-            # for the value that the queue is currently deriving.
+            # Values derived by this queue are not independent evidence. Values
+            # originally read from an official record retain their precedence.
             remote.pop(key)
     return link
 
@@ -213,7 +216,7 @@ def survey_suggestions(case, link, photos, selections, values, dictionaries):
     return suggestions, notes
 
 
-def repair_suggestions(case, link, photos, selections, values, dictionaries):
+def repair_suggestions(case, link, photos, selections, values, dictionaries, automatic_sources=None):
     suggestions, notes = {}, {}
     remote = link.get('snapshot', {}).get('repair', {}) if link.get('verified_at') else {}
     for key in ('approachStartWorkDate', 'finishWorkDate'):
@@ -233,6 +236,23 @@ def repair_suggestions(case, link, photos, selections, values, dictionaries):
             continue
         timed = [(p, stamp) for p in candidates if (stamp := _stamp(p.get('watermark_time')))]
         dates = {stamp.date() for _, stamp in timed}
+        if key == 'approachStartWorkDate' and not timed:
+            previous = (automatic_sources or {}).get(key, {})
+            stamp = (_stamp(previous.get('value')) if previous.get('origin') == 'automatic'
+                     and previous.get('source') == WORK_START_CURRENT_TIME_SOURCE else None)
+            # Keep the first fallback stable across retries, even on UTC hosts.
+            stamp = stamp or datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+            suggestions[key] = {'value': stamp.strftime('%Y-%m-%d %H:%M:%S'),
+                'source': WORK_START_CURRENT_TIME_SOURCE, 'photo_ids': [], 'needs_review': True}
+            continue
+        if key == 'approachStartWorkDate' and len(timed) != len(candidates):
+            notes[key] = '部分照片缺少有效水印时间，请核对本次资料。'
+            continue
+        if key == 'approachStartWorkDate':
+            latest = max(dates)
+            candidates = [p for p, stamp in timed if stamp.date() == latest]
+            timed = [(p, stamp) for p, stamp in timed if stamp.date() == latest]
+            dates = {latest}
         if not timed:
             notes[key] = '没有本次' + ('施工打卡' if key == 'approachStartWorkDate' else '完工照片') + '的有效水印时间，请核对实际时间。'
         elif len(dates) > 1:
@@ -242,7 +262,7 @@ def repair_suggestions(case, link, photos, selections, values, dictionaries):
         else:
             photo, stamp = (min if key == 'approachStartWorkDate' else max)(timed, key=lambda pair: (pair[1], pair[0]['id']))
             suggestions[key] = {'value': stamp.strftime('%Y-%m-%d %H:%M:%S'),
-                'source': ('最早施工打卡' if key == 'approachStartWorkDate' else '最后一张完工照片') + '水印：' + photo['original_name'] + '；请核对实际时间',
+                'source': ('最近日期最早施工打卡' if key == 'approachStartWorkDate' else '最后一张完工照片') + '水印：' + photo['original_name'] + '；请核对实际时间',
                 'photo_ids': [p['id'] for p in candidates], 'needs_review': True}
     start = _stamp(values.get('approachStartWorkDate') or suggestions.get('approachStartWorkDate', {}).get('value'))
     end = _stamp(values.get('finishWorkDate') or suggestions.get('finishWorkDate', {}).get('value'))
@@ -252,7 +272,7 @@ def repair_suggestions(case, link, photos, selections, values, dictionaries):
     return suggestions, notes
 
 
-def stage_suggestions(stage, case, link, photos, selections, values, dictionaries, defaults=None):
+def stage_suggestions(stage, case, link, photos, selections, values, dictionaries, defaults=None, automatic_sources=None):
     if stage == 'survey':
         suggestions, notes = survey_suggestions(case, link, photos, selections, values, dictionaries)
         key = 'estimateRestorationCostCode'
@@ -264,5 +284,5 @@ def stage_suggestions(stage, case, link, photos, selections, values, dictionarie
             notes.pop(key, None)
         return suggestions, notes
     if stage == 'repair':
-        return repair_suggestions(case, link, photos, selections, values, dictionaries)
+        return repair_suggestions(case, link, photos, selections, values, dictionaries, automatic_sources)
     return {}, {}

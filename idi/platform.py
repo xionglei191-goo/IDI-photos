@@ -290,7 +290,7 @@ class PlatformPreparation:
                 values.pop(key, None)
             evidence_link = without_automatic_remote(link, stage, owned, fields)
             suggestions, notes = stage_suggestions(stage, case, evidence_link,
-                [p for p in photos if p['id'] in allowed_photo_ids], files, values, self.dictionaries()['items'], self.prefill_defaults())
+                [p for p in photos if p['id'] in allowed_photo_ids], files, values, self.dictionaries()['items'], self.prefill_defaults(), owned)
             signature = input_signature(case, photos, self.prefill_defaults())
             automatic_sources = {}
             for key, field in fields.items():
@@ -614,7 +614,8 @@ class PlatformPreparation:
             if access['editable'] and source['current'] and source['stale']:
                 issue(key, fields_by_key[key]['label'] + '的自动填写依据已变化，等待重新填写或人工核对后保存。')
         errors = sum(i["severity"] == "error" for i in issues)
-        suggestions, suggestion_notes = stage_suggestions(stage, case, link, photos, selections, values, dictionaries, self.prefill_defaults()) if access['editable'] else ({}, {})
+        suggestions, suggestion_notes = stage_suggestions(stage, case, link, photos, selections, values, dictionaries,
+            self.prefill_defaults(), {key: source for key, source in sources.items() if source['current']}) if access['editable'] else ({}, {})
         return {"case": case, "stage": stage, "label": definition["label"], "guide_page": definition["guide_page"],
                 "contract_version": VERSION, "mode": self.client.status()['mode'], "remote_written": False,
                 "link": link, "draft": saved, "values": values, "fields": definition["fields"], "access": access,

@@ -1,3 +1,4 @@
+import usePermissions from './usePermissions';
 import { useEffect, useRef, useState } from 'react';
 import { CloudUpload, FileCheck2 } from 'lucide-react';
 import { api, message, post, put } from './api';
@@ -8,7 +9,7 @@ import type { ReviewBatch } from './workflowTypes';
 import './automatic-uploads.css';
 
 interface UploadItem {
-  case_id: string; enabled: boolean; state: string; stage: string; workflow_stage?: string; short_code: string; platform_report_code: string;
+  case_id: string; project_id: string; enabled: boolean; state: string; stage: string; workflow_stage?: string; short_code: string; platform_report_code: string;
   project_name: string; title: string; review_id: string | null; save_review_id: string | null;
   notification?: ReviewNotification | null;
   detail: { reason?: string; issues?: string[]; pending_count?: number; pending_reasons?: string[]; saved_count?: number; files?: { label: string; count: number }[];
@@ -19,7 +20,7 @@ interface UploadItem {
 interface ReviewNotification { id?: string; state: string; name?: string; chat_name?: string; error?: string; message?: string; sent_at?: string }
 interface ProjectConnection { project_id: string; project_name: string; state: string; connected: boolean }
 interface UploadStatus {
-  policy: { enabled: boolean; notify_review_ready?: boolean }; items: UploadItem[]; counts: Record<string, number>; connected: boolean; write_enabled: boolean;
+  policy: { enabled: boolean; notify_review_ready?: boolean; proposal_quiet_seconds?: number }; items: UploadItem[]; counts: Record<string, number>; connected: boolean; write_enabled: boolean;
   account_scope?: 'project' | 'company'; company_connected?: boolean; project_connections?: ProjectConnection[]; can_configure_project_accounts?: boolean;
 }
 const PROJECT_CONNECTION: Record<string, string> = {
@@ -39,7 +40,7 @@ function notificationText(value: ReviewNotification) {
 function savedContent(item: UploadItem) {
   const files = (item.detail.files || []).filter(file => file.count > 0).map(file => `${file.label} × ${file.count}`);
   // Filled draft fields are only known to be saved after the save/readback cycle.
-  const fields = item.save_review_id && ['needs_fields', 'awaiting_confirmation'].includes(item.state)
+  const fields = item.save_review_id && ['needs_fields', 'collecting_photos', 'awaiting_confirmation'].includes(item.state)
     ? (item.detail.filled_fields || []).map(field => field.label) : [];
   return [...files, ...fields].join(' · ');
 }
@@ -49,6 +50,8 @@ export default function AutomaticUploads({ currentCase, cases = [], openCase, le
   openProjectAccount?: (projectId: string) => void;
   view?: 'proposals' | 'progress' | 'policy'; suppressed?: boolean; cases?: Case[];
 }) {
+  const { isAdmin, canManage } = usePermissions();
+  const manageable = (id: string) => isAdmin || canManage(cases.find(c => c.id === id)?.project_id || (currentCase?.id === id ? currentCase.project_id : data?.items.find(i => i.case_id === id)?.project_id));
   const [data, setData] = useState<UploadStatus | null>(null), [error, setError] = useState(''), [busy, setBusy] = useState(false);
   const [review, setReview] = useState<ReviewBatch | null>(null);
   const [delivery, setDelivery] = useState<ReviewNotification | null>(null);
@@ -65,7 +68,7 @@ export default function AutomaticUploads({ currentCase, cases = [], openCase, le
         setData(next); setError('');
         const fresh = view === 'proposals' ? next.items.filter(i => i.enabled && i.state === 'awaiting_confirmation' && i.review_id && !seen.current.has(i.review_id)) : [];
         fresh.forEach(i => seen.current.add(i.review_id!));
-        if (fresh.length) notify(`${fresh[0].short_code || fresh[0].platform_report_code} 的${fresh[0].stage === 'survey' ? '查勘' : '修复成果'}照片已齐，请核对拟提交信息${fresh.length > 1 ? `，另有 ${fresh.length - 1} 案待确认` : ''}`);
+        if (fresh.length) notify(`${fresh[0].short_code || fresh[0].platform_report_code} 的${fresh[0].stage === 'survey' ? '查勘' : '修复成果'}照片已合并，请确认是否传齐并核对拟提交信息${fresh.length > 1 ? `，另有 ${fresh.length - 1} 案待确认` : ''}`);
       } catch (e) { if (alive) setError(message(e)); } finally { loading = false; }
     }
     void poll(); const timer = window.setInterval(() => void poll(), 3000);
@@ -90,30 +93,30 @@ export default function AutomaticUploads({ currentCase, cases = [], openCase, le
   const savedItems = (data?.items || []).map(item => ({ item, content: savedContent(item) })).filter(row => row.content);
   const accountIssues = (data?.project_connections || []).filter(account => account.state !== 'connected');
   function caseActions(item: UploadItem) {
-    return <><button disabled={busy} onClick={() => void enroll(item.case_id, true)}>{item.enabled ? '重新检查' : '恢复本案'}</button>{!!item.enabled && <button className="text-button" disabled={busy} onClick={() => void enroll(item.case_id, false)}>暂停本案</button>}</>;
+    return <><button disabled={busy || !manageable(item.case_id)} onClick={() => void enroll(item.case_id, true)}>{item.enabled ? '重新检查' : '恢复本案'}</button>{!!item.enabled && <button className="text-button" disabled={busy || !manageable(item.case_id)} onClick={() => void enroll(item.case_id, false)}>暂停本案</button>}</>;
   }
   if (suppressed || (view === 'proposals' && !ready.length)) return null;
   if (view === 'policy') return <section aria-label="自动保存设置" className="settings-card">
     <h3><CloudUpload size={17} aria-hidden="true" />照片上传与官网草稿</h3>
-    <p>按本环节逐步上传、保存并自动填写。照片齐全后显示拟提交事项，由管理人员核对、补齐待确认字段后确认提交。</p>
-    {data ? <label className="check"><input type="checkbox" aria-label="启用自动上传" disabled={busy} checked={data.policy.enabled} onChange={() => void toggle()} />自动上传并保存官网草稿</label> : <p>正在读取设置…</p>}
-    {data && <><label className="check"><input type="checkbox" aria-label="飞书核对提醒" disabled={busy} checked={!!data.policy.notify_review_ready} onChange={() => void toggleNotifications()} />资料齐备待核对时，在飞书群 @ 项目负责人</label><p className="muted">使用“项目跟进”中已绑定的群和负责人，同一份拟提交资料只提醒一次。请先启用自动上传；未绑定负责人的项目会显示待绑定提示。</p></>}
+    <p>按本环节逐步上传、保存并自动填写。同一案件连续 {data?.policy.proposal_quiet_seconds ?? 300} 秒没有新照片后，合并生成拟提交事项；收到新照片重新计时。由管理人员确认是否传齐、核对内容后提交。</p>
+    {data ? <label className="check"><input type="checkbox" aria-label="启用自动上传" disabled={busy || !isAdmin} checked={data.policy.enabled} onChange={() => void toggle()} />自动上传并保存官网草稿</label> : <p>正在读取设置…</p>}
+    {data && <><label className="check"><input type="checkbox" aria-label="飞书核对提醒" disabled={busy || !isAdmin} checked={!!data.policy.notify_review_ready} onChange={() => void toggleNotifications()} />资料齐备待核对时，在飞书群 @ 项目负责人</label><p className="muted">使用“项目跟进”中已绑定的群和负责人，同一份拟提交资料只提醒一次。请先启用自动上传；未绑定负责人的项目会显示待绑定提示。</p></>}
     <ErrorBox error={error} />
-    <details className="settings-history"><summary>已有案件加入自动保存</summary><p>新归案照片会自动加入；历史案件按需选择启用。</p><label>选择已有案件<select aria-label="已有案件自动保存" value={selectedCaseId} onChange={e => setSelectedCaseId(e.target.value)}><option value="">选择案件</option>{cases.filter(c => c.platform_linked).map(c => <option key={c.id} value={c.id}>{c.short_code || c.platform_report_code} · {c.title}</option>)}</select></label>{selectedCase?.platform_linked && <div className="upload-case-enroll"><span>{current?.enabled ? '已加入自动保存' : current ? '本案已暂停' : '尚未加入自动保存'}</span><div className="upload-actions">{current ? caseActions(current) : <button disabled={busy} onClick={() => void enroll(selectedCase.id)}>启用本案自动上传</button>}</div></div>}</details>
+    <details className="settings-history"><summary>已有案件加入自动保存</summary><p>新归案照片会自动加入；历史案件按需选择启用。</p><label>选择已有案件<select aria-label="已有案件自动保存" value={selectedCaseId} onChange={e => setSelectedCaseId(e.target.value)}><option value="">选择案件</option>{cases.filter(c => c.platform_linked).map(c => <option key={c.id} value={c.id}>{c.short_code || c.platform_report_code} · {c.title}</option>)}</select></label>{selectedCase?.platform_linked && <div className="upload-case-enroll"><span>{current?.enabled ? '已加入自动保存' : current ? '本案已暂停' : '尚未加入自动保存'}</span><div className="upload-actions">{current ? caseActions(current) : <button disabled={busy || !canManage(selectedCase.project_id)} onClick={() => void enroll(selectedCase.id)}>启用本案自动上传</button>}</div></div>}</details>
   </section>;
   return <section className={`automatic-uploads${view === 'progress' ? ' upload-progress' : ''}`} aria-label={view === 'proposals' ? '拟提交事项' : '后台保存进度'}>
     {view === 'proposals' && <ErrorBox error={error} />}
     {view === 'proposals' && <><div className="upload-summary"><FileCheck2 size={18} aria-hidden="true" /><strong>拟提交</strong><span className="upload-summary-copy">资料已保存，等待管理人员确认提交</span><span className="grow" /><strong className="upload-ready-count">{ready.length} 案待确认</strong></div>
     {ready.map(item => <article key={item.case_id} className="upload-case upload-case-ready">
       <div className="upload-case-main"><div className="row wrap"><button className="text-button upload-case-code" onClick={() => openCase(item.case_id)}>{item.short_code || item.platform_report_code}</button><span className="upload-stage">{(item.stage || item.workflow_stage) === 'survey' ? '查勘' : '修复成果'}</span><span className="upload-state">待管理人员确认</span></div>
-        <p>{item.detail.pending_fields?.length ? `照片已齐，待确认：${item.detail.pending_fields.map(f => f.label).join('、')}。` : '本环节资料已保存，核对后正式提交。'}</p>
+        <p>{item.detail.pending_fields?.length ? `已收照片已合并，待确认：${item.detail.pending_fields.map(f => f.label).join('、')}。请确认是否传齐。` : '本环节资料已保存，请确认照片是否传齐，核对后正式提交。'}</p>
         {!!item.detail.files?.length && <small>{item.detail.files.map(f => `${f.label} ${f.count}`).join(' · ')}</small>}
         {item.notification && <div className="upload-notification"><small role="status">{notificationText(item.notification)}</small>
-          {item.notification.state === 'failed' && <button className="text-button" disabled={busy} onClick={() => void resolveNotification(item.notification!)}>重试飞书提醒</button>}
-          {item.notification.state === 'unknown' && <button className="text-button" disabled={busy} onClick={() => { setError(''); setDelivery(item.notification!); }}>核对提醒送达情况</button>}
+          {item.notification.state === 'failed' && <button className="text-button" disabled={busy || !isAdmin} onClick={() => void resolveNotification(item.notification!)}>重试飞书提醒</button>}
+          {item.notification.state === 'unknown' && <button className="text-button" disabled={busy || !isAdmin} onClick={() => { setError(''); setDelivery(item.notification!); }}>核对提醒送达情况</button>}
         </div>}
       </div>
-      <div className="upload-actions"><button className="primary" disabled={busy} onClick={() => void openReview(item.review_id!)}><FileCheck2 size={15} aria-hidden="true" />核对拟提交信息</button></div>
+      <div className="upload-actions"><button className="primary" disabled={busy || !manageable(item.case_id)} onClick={() => void openReview(item.review_id!)}><FileCheck2 size={15} aria-hidden="true" />核对拟提交信息</button></div>
     </article>)}</>}
     {view === 'progress' && <div className="upload-background">
       <ErrorBox error={error} />
@@ -136,8 +139,8 @@ export default function AutomaticUploads({ currentCase, cases = [], openCase, le
     {review && <ReviewBatchDialog initial={review} close={() => setReview(null)} changed={() => { refresh(); void load().catch(e => setError(message(e))); }} notify={notify} />}
     {delivery && <Modal title="核对飞书提醒送达情况" close={() => { if (!busy) setDelivery(null); }} footer={<>
       <button disabled={busy} onClick={() => setDelivery(null)}>取消</button>
-      <button disabled={busy} onClick={() => void resolveNotification(delivery, false)}>群内未收到，重新发送</button>
-      <button className="primary" disabled={busy} onClick={() => void resolveNotification(delivery, true)}>群内已收到</button>
+      <button disabled={busy || !isAdmin} onClick={() => void resolveNotification(delivery, false)}>群内未收到，重新发送</button>
+      <button className="primary" disabled={busy || !isAdmin} onClick={() => void resolveNotification(delivery, true)}>群内已收到</button>
     </>}><ErrorBox error={error} /><p>请查看“{delivery.chat_name}”内 @ {delivery.name} 的本案核对提醒，确认是否已经收到。</p><p className="muted">发送结果尚未确认，系统会等待核对后再决定是否重发。</p></Modal>}
   </section>;
 }

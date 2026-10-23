@@ -1,3 +1,4 @@
+import usePermissions from './usePermissions';
 import { useEffect, useState } from 'react';
 import { CheckCircle2, FileSearch, LoaderCircle, RefreshCw, Square } from 'lucide-react';
 import { api, message, post } from './api';
@@ -27,6 +28,8 @@ const STATES: Record<string, string> = { queued: '等待审阅', running: '正�
 const KINDS = { visible_issue: '可见问题', needs_check: '待核对', archive_note: '内部归档提示' };
 
 export default function CaseAgentPanel({ value, notify, onDraft }: { value: Case; notify: Notify; onDraft?: (projectId: string) => void }) {
+  const { canManage } = usePermissions();
+  const manageable = canManage(value.project_id);
   const [data, setData] = useState<AgentHistory | null>(null), [run, setRun] = useState<AgentRun | null>(null);
   const [selectedRun, setSelectedRun] = useState(''), [revision, setRevision] = useState(0);
   const [busy, setBusy] = useState(''), [error, setError] = useState(''), [selected, setSelected] = useState<number[]>([]);
@@ -49,7 +52,7 @@ export default function CaseAgentPanel({ value, notify, onDraft }: { value: Case
   useEffect(() => { setSelected([]); setPreview(false); }, [run?.id]);
   const active = data?.history.find(r => ['queued', 'running'].includes(r.state));
   const imageCount = data?.image_count ?? value.photo_count ?? 0;
-  const canAdopt = !!run && run.current && run.state === 'completed' && !['closed', 'direct_payment', 'noncoverage'].includes(value.workflow_stage);
+  const canAdopt = manageable && !!run && run.current && run.state === 'completed' && !['closed', 'direct_payment', 'noncoverage'].includes(value.workflow_stage);
   const findings = run?.result?.findings || [];
   function evidenceText(text: string) { return run ? run.photos.reduce((value, photo, index) => value.replaceAll(photo.id, `照片 ${index + 1}`), text) : text; }
   const chosen = selected.filter(index => findings[index]?.kind === 'visible_issue' && !run?.adopted.includes(index));
@@ -85,7 +88,7 @@ export default function CaseAgentPanel({ value, notify, onDraft }: { value: Case
   }
   return <section className="case-agent" aria-label="案件智能审阅">
     <div className="agent-heading"><div><h2><FileSearch size={20} aria-hidden="true" />案件智能审阅</h2><p>结合维修事项、照片和相关记录，形成可查看依据的审阅建议。</p></div><div className="row wrap">
-      {active ? <button disabled={!!busy} onClick={() => void cancel()}><Square size={14} aria-hidden="true" />停止审阅</button> : <button className="primary" disabled={!!busy || !data?.ready || !imageCount} onClick={() => void start()}><RefreshCw size={16} aria-hidden="true" className={busy === 'start' ? 'spin' : ''} />{busy === 'start' ? '正在排队…' : run ? '重新审阅' : '开始智能审阅'}</button>}
+      {active ? <button disabled={!!busy || !manageable} onClick={() => void cancel()}><Square size={14} aria-hidden="true" />停止审阅</button> : <button className="primary" disabled={!!busy || !manageable || !data?.ready || !imageCount} onClick={() => void start()}><RefreshCw size={16} aria-hidden="true" className={busy === 'start' ? 'spin' : ''} />{busy === 'start' ? '正在排队…' : run ? '重新审阅' : '开始智能审阅'}</button>}
     </div></div>
     <ErrorBox error={error} />
     {data && !data.ready && <p className="agent-notice">请先在“识别设置”配置并启用大模型接口，再审阅案件资料。</p>}

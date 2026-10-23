@@ -15,6 +15,8 @@ import type { Case, Job, Notify, Project, System } from './types';
 import type { PlatformSession } from './platformTypes';
 import type { SyncStatus } from './workflowTypes';
 import './settings-center.css';
+import usePermissions from './usePermissions';
+import ProjectSettingsContent from './ProjectSettingsContent';
 
 export type SettingsSection = 'access' | 'connections' | 'automation' | 'recognition' | 'materials' | 'tasks' | 'backup';
 export interface SettingsTarget { section: SettingsSection; tab?: string; projectId?: string }
@@ -37,6 +39,7 @@ interface Props {
 }
 
 function AutomaticSettings(props: Props) {
+  const { isAdmin } = usePermissions();
   const sync = useData<SyncStatus>('/api/workflow/sync', props.revision);
   const followup = useData<{ config: FollowupConfig }>('/api/followup', props.revision);
   const [editingFollowup, setEditingFollowup] = useState(false);
@@ -46,12 +49,13 @@ function AutomaticSettings(props: Props) {
     <section className="settings-card" aria-label="自动同步设置"><h3>官网台账更新</h3><p>{schedule ? `每天 ${String(schedule.hour).padStart(2, '0')}:${String(schedule.minute).padStart(2, '0')}（北京时间）自动检查官网清单。` : '正在读取更新安排…'}手动同步保留在案件看板。</p><SyncControls value={sync.data || undefined} sync={props.sync} refresh={props.refresh} notify={props.notify} mode="policy" /><ErrorBox error={sync.error} /></section>
     <RuntimeStatus {...runtimeLinks} mode="policy" />
     <AutomaticUploads view="policy" cases={props.cases} currentCase={props.currentCase} openCase={props.openCase} leave={props.leave} refresh={props.refresh} notify={props.notify} login={props.login} />
-    <section className="settings-card" aria-label="项目检查设置"><h3>项目照片检查</h3><p>检查查勘维修案件的照片内容，具体问题在项目跟进中核对。</p>{config && <p className="settings-current">自动检查：{config.auto_review ? '已开启' : '已暂停'} · 照片 AI 审核：{config.ai_review ? '已开启' : '未开启'}</p>}<button disabled={!config} onClick={() => setEditingFollowup(true)}>调整项目检查</button><ErrorBox error={followup.error} /></section>
+    <section className="settings-card" aria-label="项目检查设置"><h3>项目照片检查</h3><p>检查查勘维修案件的照片内容，具体问题在项目跟进中核对。</p>{config && <p className="settings-current">自动检查：{config.auto_review ? '已开启' : '已暂停'} · 照片 AI 审核：{config.ai_review ? '已开启' : '未开启'}</p>}<button disabled={!isAdmin || !config} title={isAdmin ? undefined : '全局检查设置由系统管理员维护'} onClick={() => setEditingFollowup(true)}>调整项目检查</button><ErrorBox error={followup.error} /></section>
     {editingFollowup && config && <FollowupConfigEditor config={config} close={() => setEditingFollowup(false)} saved={() => { props.refresh(); props.notify('项目检查设置已保存'); }} openSettings={() => props.navigate({ section: 'recognition' })} />}
   </div>;
 }
 
 export default function SettingsCenter(props: Props) {
+  const { isAdmin } = usePermissions();
   const { target, navigate, system, projects, cases, jobs, revision, refresh, notify, login, editProject, newProject, registerLeave } = props;
   const accountLeave = useRef<(() => Promise<boolean>) | null>(null), workspaceLeave = useRef<(() => Promise<boolean>) | null>(null);
   const registerAccountLeave = useCallback((callback: (() => Promise<boolean>) | null) => { accountLeave.current = callback; }, []);
@@ -71,9 +75,10 @@ export default function SettingsCenter(props: Props) {
       <nav className="settings-nav" aria-label="设置分类">{SECTIONS.map(item => <button key={item.key} aria-label={item.label} className={target.section === item.key ? 'active' : ''} aria-current={target.section === item.key ? 'page' : undefined} onClick={() => navigate({ section: item.key })}><item.icon size={18} aria-hidden="true" /><span><strong>{item.label}</strong><small>{item.hint}</small></span></button>)}</nav>
       <div className="settings-content">
         <div className="settings-section-heading"><h2>{section.label}</h2><p>{section.hint}</p></div>
-        {target.section === 'access' && <AccessSettings projects={projects} notify={notify} initialProjectId={target.projectId} focusProjectAccount={!!target.projectId} />}
-        {target.section === 'connections' && <PlatformAccountSettings refresh={refresh} notify={notify} registerLeave={registerAccountLeave} />}
-        {target.section === 'connections' && <><section className="settings-card" aria-label="IDI 水印相机"><h3>IDI 水印相机</h3><p>安卓相机通过今日官方 Android 原生 SDK 拍摄，原片上传到电脑归档，不自动提交保司。本地验真为可选项，默认关闭；拍摄前需联网并允许相机和精确定位。</p><div className="row wrap"><a className="button" href="/camera/download">下载安卓安装包</a><a className="button" href="/camera-setup" target="_blank" rel="noreferrer">管理手机连接</a></div><p className="muted">系统管理员登录后可在此管理手机连接，选择人员和项目并生成配对码。</p></section><Connections embedded projects={projects} cases={cases} revision={revision} refresh={refresh} notify={notify} /></>}
+        {!isAdmin && !['automation', 'tasks'].includes(target.section) && <ProjectSettingsContent key={target.section} target={target} projects={projects} system={system} revision={revision} />}
+        {isAdmin && target.section === 'access' && <AccessSettings projects={projects} notify={notify} initialProjectId={target.projectId} focusProjectAccount={!!target.projectId} />}
+        {isAdmin && target.section === 'connections' && <PlatformAccountSettings refresh={refresh} notify={notify} registerLeave={registerAccountLeave} />}
+        {isAdmin && target.section === 'connections' && <><section className="settings-card" aria-label="IDI 水印相机"><h3>IDI 水印相机</h3><p>安卓相机通过今日官方 Android 原生 SDK 拍摄，原片上传到电脑归档，不自动提交保司。本地验真为可选项，默认关闭；拍摄前需联网并允许相机和精确定位。</p><div className="row wrap"><a className="button" href="/camera/download">下载安卓安装包</a><a className="button" href="/camera-setup" target="_blank" rel="noreferrer">管理手机连接</a></div><p className="muted">系统管理员登录后可在此管理手机连接，选择人员和项目并生成配对码。</p></section><Connections embedded projects={projects} cases={cases} revision={revision} refresh={refresh} notify={notify} /></>}
         {target.section === 'automation' && <AutomaticSettings {...props} />}
         {target.section === 'materials' && <div className="settings-subnav" role="group" aria-label="资料管理分类">{[['projects', '项目管理'], ['templates', '资料要求'], ['archive', '资料目录']].map(([tab, label]) => <button key={tab} aria-pressed={materialTab === tab} onClick={() => navigate({ section: 'materials', tab })}>{label}</button>)}</div>}
         {target.section === 'tasks' && <><div className="settings-subnav" role="group" aria-label="后台任务分类">{[['uploads', '保存进度'], ['runtime', '运行详情'], ['jobs', '任务记录']].map(([tab, label]) => <button key={tab} aria-pressed={taskTab === tab} onClick={() => navigate({ section: 'tasks', tab })}>{label}</button>)}</div>
@@ -81,8 +86,8 @@ export default function SettingsCenter(props: Props) {
           {taskTab === 'runtime' && <RuntimeStatus login={login} settings={() => navigate({ section: 'recognition' })} channels={() => navigate({ section: 'connections' })} />}
           {taskTab === 'jobs' && <JobsWorkspace embedded jobs={jobs} refresh={refresh} notify={notify} />}
         </>}
-        {hasExistingPanel && <SettingsWorkspace embedded initialTab={existingTab} system={system} projects={projects} revision={revision} refresh={refresh} notify={notify} editProject={editProject} newProject={newProject} registerLeave={registerWorkspaceLeave} />}
-        {target.section === 'backup' && <p className="settings-help"><Archive size={15} aria-hidden="true" />备份包含案件、照片原件和报送记录。</p>}
+        {isAdmin && hasExistingPanel && <SettingsWorkspace embedded initialTab={existingTab} system={system} projects={projects} revision={revision} refresh={refresh} notify={notify} editProject={editProject} newProject={newProject} registerLeave={registerWorkspaceLeave} />}
+        {isAdmin && target.section === 'backup' && <p className="settings-help"><Archive size={15} aria-hidden="true" />备份包含案件、照片原件和报送记录。</p>}
       </div>
     </div>
   </section>;

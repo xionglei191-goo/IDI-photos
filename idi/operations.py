@@ -14,6 +14,9 @@ class Operations:
         self.db = services['db']
 
     def status(self):
+        from .identity import current
+        if current() and not current().admin:
+            return self.project_status()
         s, db = self.services, self.db
         storage = {'state': 'available', 'detail': '数据库可读；原件在处理和报送前逐件校验'}
         try:
@@ -37,6 +40,25 @@ class Operations:
                 'rule_states': {r['state']: r['n'] for r in db.all('SELECT state,COUNT(*) n FROM photo_pipeline GROUP BY state')},
                 'ai_queue': queue, 'draft_states': {r['state']: r['n'] for r in db.all('SELECT state,COUNT(*) n FROM rule_draft_intents GROUP BY state')},
                 'ai_tasks': db.all("SELECT a.id,a.photo_id,a.kind,a.source,a.state,a.attempts,a.retry_at,a.error,a.updated_at,c.short_code FROM photo_ai_tasks a JOIN photos p ON p.id=a.photo_id LEFT JOIN cases c ON c.id=p.case_id ORDER BY a.updated_at DESC,a.id DESC LIMIT 30")}
+
+    def project_status(self):
+        from .identity import project_filter
+        s, db = self.services, self.db
+        scope, args = project_filter('p.project_id')
+        recognition = s['recognizer'].status()
+        tasks = db.all('SELECT a.id,a.photo_id,a.kind,a.state,a.attempts,a.error,a.updated_at,c.short_code FROM photo_ai_tasks a JOIN photos p ON p.id=a.photo_id LEFT JOIN cases c ON c.id=p.case_id WHERE ' + scope + ' ORDER BY a.updated_at DESC,a.id DESC LIMIT 30', args)
+        queue = {r['state']: r['n'] for r in db.all('SELECT a.state,COUNT(*) n FROM photo_ai_tasks a JOIN photos p ON p.id=a.photo_id WHERE ' + scope + ' GROUP BY a.state', args)}
+        local = db.one("SELECT r.state,r.error,r.created_at FROM recognitions r JOIN photos p ON p.id=r.photo_id WHERE r.provider='local_ocr' AND " + scope + ' ORDER BY r.created_at DESC LIMIT 1', args)
+        pending = db.one("SELECT COUNT(*) n FROM photos p JOIN blobs b ON p.blob_hash=b.hash WHERE b.media_type='image' AND " + scope + " AND NOT EXISTS(SELECT 1 FROM recognitions r WHERE r.photo_id=p.id AND r.provider='local_ocr' AND r.state='completed')", args)['n']
+        model = {k: recognition['model_health'].get(k) for k in ('state', 'retry_at', 'last_transport_ok', 'last_response_ok')}
+        return {'at': now(), 'worker_enabled': s['settings'].worker_enabled,
+                'storage': {'state': 'available', 'detail': '当前项目档案可读取'},
+                'model': {**model, 'error': '', 'calls': 0, 'active': 0},
+                'policy': s['photo_workflow'].policy(),
+                'ocr': {'enabled': recognition.get('local_ocr', True), 'installed': recognition['local_ocr_available'], 'latest': local, 'pending': pending},
+                'platform': {'connected': s['platform'].client.status()['connected']},
+                'sync': s['workflow'].synchronizer.status(), 'channels': [], 'attachments_pending': 0,
+                'ai_queue': queue, 'ai_tasks': tasks, 'rule_states': {}, 'draft_states': {}, 'scope': 'assigned_projects'}
 
     def photos(self, ids):
         if not ids:

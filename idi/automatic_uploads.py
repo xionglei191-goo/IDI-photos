@@ -16,6 +16,7 @@ from .platform_prefill import PREFILL_RULES_VERSION, canonical_value
 
 log = logging.getLogger(__name__)
 UNRESOLVED = ('submitting', 'saved', 'submitted', 'uncertain')
+PROPOSAL_QUIET_SECONDS = 300
 
 
 class AutomaticUploads:
@@ -27,7 +28,8 @@ class AutomaticUploads:
 
     def policy(self):
         return {'enabled': False, 'activated_at': '', 'notify_review_ready': False,
-                **self.db.setting('automatic_upload_policy', {})}
+                **self.db.setting('automatic_upload_policy', {}),
+                'proposal_quiet_seconds': PROPOSAL_QUIET_SECONDS}
 
     def configure(self, data):
         if not data or set(data) - {'enabled', 'notify_review_ready'} or any(type(v) is not bool for v in data.values()):
@@ -116,7 +118,7 @@ class AutomaticUploads:
             data.append(self.platform.project_accounts.binding(case['project_id']))
         if not proposal:
             session = self.platform.client.status()
-            data += [self.policy().get('enabled'), self.rules.policy(), session['connected'], session.get('account'), self.platform.client.write_enabled,
+            data += [PROPOSAL_QUIET_SECONDS, self.policy().get('enabled'), self.rules.policy(), session['connected'], session.get('account'), self.platform.client.write_enabled,
                      self.db.all('SELECT connector_id,revision,enabled,images_enabled,save_drafts FROM feishu_agent_bindings ORDER BY connector_id')]
         return digest(data)
 
@@ -129,6 +131,20 @@ class AutomaticUploads:
         if row.get('review_id'):
             with self.db.tx() as con:
                 con.execute("UPDATE platform_review_batches SET state='stale' WHERE id=? AND state IN ('prepared','reviewed','failed')", (row['review_id'],))
+
+    def _photo_quiet_remaining(self, case_id):
+        # Track received images, not OCR/field edits or draft revisions. Persist
+        # the deadline so restarts and ordinary polling do not restart the wait.
+        with self.db.tx() as con:
+            photos = [tuple(p) for p in con.execute("SELECT p.id,p.blob_hash FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE p.case_id=? AND b.media_type='image' ORDER BY p.id", (case_id,))]
+            signature = digest(photos)
+            row = con.execute('SELECT photo_signature,proposal_not_before FROM automatic_upload_cases WHERE case_id=?', (case_id,)).fetchone()
+            deadline = row['proposal_not_before']
+            if signature != row['photo_signature']:
+                deadline = time.time() + PROPOSAL_QUIET_SECONDS if photos else 0
+                con.execute('UPDATE automatic_upload_cases SET photo_signature=?,proposal_not_before=? WHERE case_id=?',
+                            (signature, deadline, case_id))
+        return max(0, deadline - time.time())
 
     def _record(self, case_id, state, detail, *, review_id=None, guard='', save_id=None, retry=0, attempts=0):
         with self.db.tx() as con:
@@ -285,6 +301,7 @@ class AutomaticUploads:
         if case['workflow_stage'] not in ('survey', 'repair'):
             return self._record(case_id, 'complete' if case['workflow_stage'] == 'closed' else 'waiting_stage',
                 {'reason': '修复成果已提交；业主验收仍需实际验收日期和签字 PDF' if case['workflow_stage'] == 'acceptance' else '等待进入查勘或修复成果环节'})
+        self._photo_quiet_remaining(case_id)
         # Revisit only enrolled cases, including next-stage photos received earlier.
         for p in self.db.all("SELECT p.id FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE p.case_id=? AND b.media_type='image' ORDER BY p.created_at,p.id", (case_id,)):
             self.rules.process(p['id'], revisit=True)
@@ -334,10 +351,15 @@ class AutomaticUploads:
                 reason = '已保存可用照片；补齐资料后生成拟提交信息' if detail['saved_count'] else '已自动填写可确定字段；等待补齐本环节资料' if detail['filled_fields'] else '等待本环节照片及必要资料'
                 return self._record(case_id, 'needs_fields', {**detail, 'reason': reason,
                     'pending_reasons': list(dict.fromkeys(p.get('reason') or '照片用途待核对' for p in pending))}, guard=guard)
+            remaining = self._photo_quiet_remaining(case_id)
+            if remaining:
+                return self._record(case_id, 'collecting_photos', {**detail,
+                    'reason': f'照片已保存；连续 {PROPOSAL_QUIET_SECONDS} 秒无新照片后合并生成拟提交信息',
+                    'proposal_not_before': self.get(case_id)['proposal_not_before']}, retry=remaining)
             proposal = self.reviews.prepare(case_id, stage, plan['draft']['revision'], review_only=bool(issues))
             return self._record(case_id, 'awaiting_confirmation', {**detail,
                 'pending_fields': proposal['snapshot'].get('pending_fields', []),
-                'reason': '照片已齐，请核对自动填写内容并补齐待确认字段' if issues else '资料已齐，请核对拟提交信息；确认后正式提交'},
+                'reason': '已收照片已合并，请确认是否传齐并补齐待确认字段' if issues else '已收资料已合并，请核对照片和拟提交信息；确认后正式提交'},
                 review_id=proposal['id'], guard=guard)
 
     def start(self):

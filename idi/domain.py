@@ -284,6 +284,11 @@ class Domain:
         for recognition in result["recognitions"]:
             recognition["suggestions"] = json.loads(recognition["suggestions"])
             recognition["candidates"] = json.loads(recognition["candidates"])
+            from .identity import current
+            person = current()
+            if person and not person.admin:
+                allowed = {c['id'] for c in self.cases()}
+                recognition['candidates'] = [c for c in recognition['candidates'] if c.get('case_id') in allowed]
         return result
 
     def update_photo(self, photo_id: str, data: dict, actor="local"):

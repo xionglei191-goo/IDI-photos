@@ -27,8 +27,8 @@ android {
         // The supplied SDK has ARM binaries only. Do not let CameraX's x86
         // libraries select a process ABI with no matching vendor library.
         ndk { abiFilters += setOf("arm64-v8a", "armeabi-v7a") }
-        versionCode = 11
-        versionName = "0.5.2"
+        versionCode = 12
+        versionName = "0.5.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("boolean", "XHEY_SDK_PRESENT", xheyPresent.toString())
         buildConfigField("String", "XHEY_SDK_VERSION", "\"1.3.70.9b61b4a6\"")

@@ -50,7 +50,7 @@ test('review edits missing and existing fields inline then submits once', async 
   page.on('request', req => { if (req.method() === 'PUT' || /\/review\/survey$/.test(req.url())) extraWrites.push(req.url()); });
   await page.goto('/');
   const panel = page.getByRole('region', { name: '拟提交事项', exact: true });
-  await expect(panel.getByText('照片已齐，待确认：维修方式。')).toBeVisible();
+  await expect(panel.getByText('已收照片已合并，待确认：维修方式。请确认是否传齐。')).toBeVisible();
   await panel.getByRole('button', { name: '核对拟提交信息', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '现场查勘 · 预提交审核', exact: true });
   await expect(dialog.getByText('照片已齐，以下字段仍需管理员确认')).toHaveCount(0);
@@ -218,7 +218,7 @@ test('background saves stay quiet until a complete proposal is ready', async ({ 
   await page.getByRole('button', { name: '返回工作台', exact: true }).click();
   await expect(panel).toHaveCount(0);
 
-  for (const state of ['saving', 'readback_pending']) {
+  for (const state of ['saving', 'readback_pending', 'collecting_photos']) {
     status.items[0].state = state;
     status.counts = { [state]: 1 };
     status.items[0].detail.saved_count = 3;

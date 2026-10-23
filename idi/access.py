@@ -234,10 +234,62 @@ class Access:
             return
         if path in ('/api/auth/me', '/api/auth/logout', '/api/auth/password'):
             return
+        if path.startswith('/api/workspace-chat') and (path == '/api/workspace-chat' or path.startswith('/api/workspace-chat/')):
+            if 'manager' not in person.projects.values():
+                raise DomainError('网页助手需要项目管理权限', 403)
+            return  # The chat service binds ownership and rechecks live scope.
         if read and path in ('/api/system', '/api/projects', '/api/cases', '/api/photos', '/api/summary',
                              '/api/jobs', '/api/workflow/board', '/api/workflow/sync', '/api/platform/session',
                              '/api/platform/contract', '/api/templates', '/api/access/website-operations',
-                             '/api/workflow/uploads'):
+                             '/api/workflow/uploads', '/api/operations', '/api/followup',
+                             '/api/followup/issues', '/api/followup/feedback', '/api/packages'):
+            return
+        if read and (path in ('/api/feishu-agent', '/api/feishu-agent/sessions') or
+                     re.fullmatch(r'/api/feishu-agent/(?:tasks|sessions)/[^/]+', path)):
+            return  # Each record is filtered against its frozen project scope.
+        match = re.fullmatch(r'/api/feishu-agent/projects/([^/]+)/brief-preview', path)
+        if match and read:
+            require_project(match[1])
+            return
+        match = re.fullmatch(r'/api/agent/cases/([^/]+)(/review)?', path)
+        if match and (read or method == 'POST' and match[2]):
+            self.resource('cases', match[1], manage=not read)
+            return
+        match = re.fullmatch(r'/api/agent/runs/([^/]+)(/(?:cancel|adopt))?', path)
+        if match and (read or method == 'POST' and match[2]):
+            row = self.db.one('SELECT case_id FROM case_agent_runs WHERE id=?', (match[1],))
+            if not row:
+                raise DomainError('审阅记录不存在', 404)
+            self.resource('cases', row['case_id'], manage=not read)
+            return
+        if path in ('/api/packages', '/api/packages/preview') and method == 'POST':
+            data = await request.json()
+            if not data.get('photo_ids'):
+                raise DomainError('请选择本项目照片', 403)
+            self._body_scope(data, True)
+            if data.get('parent_id'):
+                row = self.db.one('SELECT case_id FROM packages WHERE id=?', (data['parent_id'],))
+                if not row:
+                    raise DomainError('资料包不存在', 404)
+                self.resource('cases', row['case_id'], manage=True)
+            return
+        match = re.fullmatch(r'/api/packages/([^/]+)(/(?:download|document|events|receipt))?', path)
+        if match:
+            row = self.db.one('SELECT case_id FROM packages WHERE id=?', (match[1],))
+            if not row:
+                raise DomainError('资料包不存在', 404)
+            self.resource('cases', row['case_id'], manage=not read)
+            return
+        match = re.fullmatch(r'/api/receipts/([^/]+)/attachment', path)
+        if match and read:
+            row = self.db.one('SELECT p.case_id FROM package_events e JOIN packages p ON p.id=e.package_id WHERE e.id=?', (match[1],))
+            if not row:
+                raise DomainError('回执不存在', 404)
+            self.resource('cases', row['case_id'])
+            return
+        match = re.fullmatch(r'/api/followup/issues/([^/]+)/(dismiss|confirm)', path)
+        if match and method == 'POST':
+            self.resource('followup_issues', match[1], manage=True)
             return
         if path == '/api/import/upload' and method == 'POST':
             return  # multipart scope is checked before staging any files
@@ -267,6 +319,15 @@ class Access:
             row = self.db.one('SELECT user_id FROM jobs WHERE id=?', (match[1],))
             if not row or row['user_id'] != person.id:
                 raise DomainError('没有此任务的访问权限', 403)
+            return
+        match = re.fullmatch(r'/api/imports/([^/]+)', path)
+        if match and read:
+            row = self.db.one('SELECT user_id,project_id,case_id FROM import_batches WHERE id=?', (match[1],))
+            if not row or row['user_id'] != person.id:
+                raise DomainError('没有此导入记录的访问权限', 403)
+            require_project(row['project_id'])
+            if row['case_id']:
+                self.resource('cases', row['case_id'])
             return
         match = re.fullmatch(r'/api/(?:workflow/|platform/)?cases/([^/]+)(/.*)?', path)
         if match:

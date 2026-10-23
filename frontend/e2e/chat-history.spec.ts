@@ -4,6 +4,15 @@ const KEY = 'a'.repeat(48), LATEST = '1'.repeat(32), OLDER = '2'.repeat(32);
 const IDENTITY = 'idi-workspace-chat-key', POINTER = 'idi-workspace-chat-thread', SELECTION = 'idi-workspace-chat-selection-v1';
 const answer = '已保存的答复：本次核对记录仍可继续查看。';
 const olderAnswer = '较早的答复：请按案件编号查询。';
+test.beforeEach(async ({ request, context }) => {
+  const status = await (await request.get('/api/auth/status')).json();
+  const result = await request.post(status.setup_required ? '/api/auth/setup' : '/api/auth/login', {
+    headers: { 'X-IDI-Request': '1' },
+    data: { username: 'workbench-admin', display_name: '管理界面对照', password: 'isolated-project-workbench-password' },
+  });
+  expect(result.ok(), await result.text()).toBeTruthy();
+  await context.addCookies((await request.storageState()).cookies);
+});
 function thread(id: string, question: string, text: string) {
   return { id, title: question, project_id: null, case_id: null, context_label: '全部项目', updated_at: '2026-10-17T03:00:00+00:00',
     turns: [{ id: id + 'turn', question, answer: text, state: 'completed', progress: '已完成', error: null, created_at: '2026-10-17T03:00:00+00:00', steps: [], sources: [] }] };

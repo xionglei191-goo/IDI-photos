@@ -25,12 +25,12 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import org.json.JSONObject;
 
-/** Saves the SDK's bytes before dismissing its confirmation screen. */
+/** Saves each SDK photo before opening the next capture in the same field session. */
 public final class NativeCameraActivity extends ComponentActivity {
   CaptureStore store;
-  String captureId;
+  String captureId, sessionId;
   TextView status, retry;
-  boolean launched, saving, ended, requesting, showEditor = true;
+  boolean launched, saving, ended, requesting, pendingPhotoContinuation, showEditor = true;
   final android.os.Handler launchHandler = new android.os.Handler(android.os.Looper.getMainLooper());
   ActivityResultLauncher<Intent> camera;
   final EventBus.EventBusDelegate listener = (name, payload) -> {
@@ -45,7 +45,9 @@ public final class NativeCameraActivity extends ComponentActivity {
     super.onCreate(state);
     WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
     store = CaptureStore.get(this);
-    captureId = getIntent().getStringExtra("capture_id");
+    sessionId = getIntent().getStringExtra("capture_id");
+    captureId = store.prefs.getString("native_series_" + sessionId,
+        state == null ? sessionId : state.getString("capture_id", sessionId));
     CaptureStore.Item item = captureId == null ? null : store.item(captureId);
     if (item == null || !"xhey_sdk".equals(item.meta.optString("source"))) { finish(); return; }
     store.activeCaptures.add(captureId);
@@ -53,7 +55,14 @@ public final class NativeCameraActivity extends ComponentActivity {
     EventBus.registerEvent(EventBus.EventName.kCameraActivityWillDismiss, listener);
     camera = registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
       launched = false;
-      if (ended || saving) return;
+      if (ended) return;
+      if (pendingPhotoContinuation) {
+        pendingPhotoContinuation = false;
+        saving = false;
+        continuePhotos(captureId);
+        return;
+      }
+      if (saving) return;
       if (store.original(captureId).isFile()) { recover(); return; }
       if (result.getResultCode() == EditableCameraActivity.WATERMARK_EDITED
           && result.getData() != null
@@ -89,10 +98,10 @@ public final class NativeCameraActivity extends ComponentActivity {
     getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
       @Override public void handleOnBackPressed() { cancel(); }
     });
-    launched = state != null && state.getBoolean("launched");
-    showEditor = state == null || state.getBoolean("show_editor", true);
-    if (store.original(captureId).isFile()) recover();
-    else if (!launched) open();
+    launched = state != null && state.getBoolean("launched")
+        && captureId.equals(state.getString("capture_id", sessionId));
+    showEditor = captureId.equals(sessionId) && (state == null || state.getBoolean("show_editor", true));
+    if (!launched) open();
   }
 
   private void open() {
@@ -106,13 +115,15 @@ public final class NativeCameraActivity extends ComponentActivity {
     store.state(captureId, "awaiting_sdk", "");
     store.activeCaptures.add(captureId);
     CaptureStore.Item item = store.item(captureId);
+    final String id = captureId;
+    final boolean edit = showEditor;
     CaptureStore.io.execute(() -> {
       try {
         JSONObject session = CameraApi.request(item.server, "/api/camera/native-session", store.token(item.device), item.meta);
         if (item.video() && !"video".equals(session.optString("media_type")))
           throw new Exception("电脑端尚未支持录像，请更新工作台后重试");
-        Intent intent = ConfiguredXheyAdapter.intent(this, session, captureId, getIntent().getBooleanExtra("emulator_test", false));
-        intent.putExtra(EditableCameraActivity.SHOW_EDITOR, showEditor);
+        Intent intent = ConfiguredXheyAdapter.intent(this, session, id, getIntent().getBooleanExtra("emulator_test", false));
+        intent.putExtra(EditableCameraActivity.SHOW_EDITOR, edit);
         runOnUiThread(() -> launchAfterRelease(intent, android.os.SystemClock.uptimeMillis() + 10000));
       } catch (Exception | LinkageError error) {
         runOnUiThread(() -> {
@@ -158,20 +169,28 @@ public final class NativeCameraActivity extends ComponentActivity {
       return;
     }
     saving = true;
+    final String id = captureId;
     store.activeCaptures.add(captureId);
     store.state(captureId, "capturing", "");
     status.setText("正在保存官方原片…");
     CaptureStore.io.execute(() -> {
       try {
-        persist(store, captureId, image);
-        store.state(captureId, "queued", "");
-        UploadWorker.enqueue(getApplicationContext(), captureId, false);
+        persist(store, id, image);
+        store.state(id, "queued", "");
+        UploadWorker.enqueue(getApplicationContext(), id, false);
         runOnUiThread(() -> {
-          if (vendor != null && !vendor.isDestroyed()) vendor.dismiss();
-          complete();
+          if (vendor != null && !vendor.isDestroyed() && launched) {
+            // Consume this SDK result before another capture can reuse its static slot.
+            CameraActivity.getResult();
+            pendingPhotoContinuation = true;
+            vendor.dismiss();
+          } else {
+            saving = false;
+            continuePhotos(id);
+          }
         });
       } catch (Exception error) {
-        store.state(captureId, store.original(captureId).isFile() ? "rendering" : "capture_failed",
+        store.state(id, store.original(id).isFile() ? "rendering" : "capture_failed",
             "原片保存未完成，请检查手机空间后重试");
         runOnUiThread(() -> {
           saving = false;
@@ -183,7 +202,7 @@ public final class NativeCameraActivity extends ComponentActivity {
                 .setCancelable(false).show();
           } else fail("原片保存未完成，请返回记录页核对");
         });
-      } finally { store.activeCaptures.remove(captureId); }
+      } finally { store.activeCaptures.remove(id); }
     });
   }
 
@@ -193,17 +212,18 @@ public final class NativeCameraActivity extends ComponentActivity {
     try { video = ConfiguredXheyAdapter.video(result); }
     catch (Exception error) { fail(error.getMessage()); return; }
     saving = true;
+    final String id = captureId;
     store.activeCaptures.add(captureId);
     store.state(captureId, "capturing", "");
     status.setText("正在保存视频原片…");
     CaptureStore.io.execute(() -> {
       try {
-        OfficialVideoWriter.save(store, captureId, video);
-        store.state(captureId, "queued", "");
-        UploadWorker.enqueue(getApplicationContext(), captureId, false);
+        OfficialVideoWriter.save(store, id, video);
+        store.state(id, "queued", "");
+        UploadWorker.enqueue(getApplicationContext(), id, false);
         runOnUiThread(this::complete);
       } catch (Exception error) {
-        store.state(captureId, "capture_failed", "视频保存未完成：" + UploadWorker.safeMessage(error));
+        store.state(id, "capture_failed", "视频保存未完成：" + UploadWorker.safeMessage(error));
         runOnUiThread(() -> {
           saving = false;
           status.setText("视频文件已保留，请释放手机空间后重试保存");
@@ -211,7 +231,7 @@ public final class NativeCameraActivity extends ComponentActivity {
           retry.setOnClickListener(view -> recover());
           retry.setVisibility(View.VISIBLE);
         });
-      } finally { store.activeCaptures.remove(captureId); }
+      } finally { store.activeCaptures.remove(id); }
     });
   }
 
@@ -231,21 +251,40 @@ public final class NativeCameraActivity extends ComponentActivity {
   private void recover() {
     if (saving || ended) return;
     saving = true;
+    final String id = captureId;
     store.activeCaptures.add(captureId);
     CaptureStore.io.execute(() -> {
       try {
-        if (store.item(captureId).video()) OfficialVideoWriter.recover(store, captureId);
-        else OfficialPhotoWriter.recover(store, captureId);
-        CaptureStore.Item item = store.item(captureId);
+        if (store.item(id).video()) OfficialVideoWriter.recover(store, id);
+        else OfficialPhotoWriter.recover(store, id);
+        CaptureStore.Item item = store.item(id);
         if (item.state.equals("awaiting_sdk") || item.state.equals("capturing")
             || item.state.equals("rendering") || item.state.equals("capture_failed"))
-          store.state(captureId, "queued", "");
+          store.state(id, "queued", "");
         UploadWorker.pending(getApplicationContext());
-        runOnUiThread(this::complete);
+        runOnUiThread(() -> {
+          saving = false;
+          if (item.video()) complete(); else continuePhotos(id);
+        });
       } catch (Exception error) {
         runOnUiThread(() -> { saving = false; fail("原片已保留，预览恢复失败，请返回记录页核对"); });
-      } finally { store.activeCaptures.remove(captureId); }
+      } finally { store.activeCaptures.remove(id); }
     });
+  }
+
+  private void continuePhotos(String savedId) {
+    if (ended || isDestroyed() || !savedId.equals(captureId)) return;
+    try {
+      captureId = store.nextOfficialPhoto(savedId, sessionId);
+      store.activeCaptures.remove(savedId);
+      store.activeCaptures.add(captureId);
+      showEditor = false;
+      status.setText("原片已保存，正在准备下一张…");
+      Toast.makeText(this, "已保存，继续拍下一张", Toast.LENGTH_SHORT).show();
+      open();
+    } catch (Exception error) {
+      fail("原片已保存，下一张准备失败：" + UploadWorker.safeMessage(error));
+    }
   }
 
   private void fail(String message) {
@@ -265,6 +304,7 @@ public final class NativeCameraActivity extends ComponentActivity {
   private void complete() {
     saving = false;
     ended = true;
+    store.prefs.edit().remove("native_series_" + sessionId).commit();
     if (!isDestroyed()) {
       setResult(RESULT_OK, new Intent().putExtra("capture_id", captureId));
       finish();
@@ -275,6 +315,7 @@ public final class NativeCameraActivity extends ComponentActivity {
     if (saving) { Toast.makeText(this, "正在保存原片，请稍候", Toast.LENGTH_SHORT).show(); return; }
     if (ended) return;
     ended = true;
+    store.prefs.edit().remove("native_series_" + sessionId).commit();
     store.cancelEmptyOfficialCapture(captureId);
     setResult(store.original(captureId).isFile() ? RESULT_OK : RESULT_CANCELED,
         new Intent().putExtra("capture_id", captureId));
@@ -282,6 +323,7 @@ public final class NativeCameraActivity extends ComponentActivity {
   }
 
   @Override protected void onSaveInstanceState(Bundle out) {
+    out.putString("capture_id", captureId);
     out.putBoolean("launched", launched);
     out.putBoolean("show_editor", showEditor);
     super.onSaveInstanceState(out);

@@ -1,3 +1,4 @@
+import usePermissions from './usePermissions';
 import { useEffect, useState } from 'react';
 import { Activity, RefreshCw } from 'lucide-react';
 import { api, message, post, put } from './api';
@@ -41,6 +42,7 @@ function AutomaticSaveStatus({ openDetails }: { openDetails?: () => void }) {
 }
 
 export default function RuntimeStatus({ login, settings, channels, mode = 'details', openDetails, openUploads }: { login: () => void; settings: () => void; channels: () => void; mode?: 'summary' | 'details' | 'policy'; openDetails?: () => void; openUploads?: () => void }) {
+  const { isAdmin } = usePermissions();
   const [data, setData] = useState<Runtime | null>(null), [error, setError] = useState(''), [busy, setBusy] = useState(false), [notice, setNotice] = useState('');
   async function load() { const next = await api<Runtime>('/api/operations'); setData(next); setError(''); }
   useEffect(() => {
@@ -62,13 +64,13 @@ export default function RuntimeStatus({ login, settings, channels, mode = 'detai
     <span>本地 OCR：{!data.ocr.enabled ? '已关闭' : !data.ocr.installed ? '未安装' : data.ocr.latest?.state === 'failed' ? '最近识别失败' : data.ocr.latest ? '最近识别成功' : '待首次识别'}</span>
     <span>AI：{MODEL[data.model.state] || '待核对'}{waiting > 0 && ` · ${waiting} 项待处理`}</span>
     <span>公司官网：{data.platform.connected ? '已连接' : '待登录'}</span>
-    <span>收图入口：{failed ? `${failed} 项异常` : capture.length ? `${capture.length} 项启用` : '未启用'}</span>
+    <span>收图入口：{!isAdmin ? '系统统一管理' : failed ? `${failed} 项异常` : capture.length ? `${capture.length} 项启用` : '未启用'}</span>
   </> : <span>{error ? '运行状态暂时无法读取' : '正在读取运行状态…'}</span>;
   if (mode === 'summary') return <section className="runtime-status runtime-status-strip" aria-label="运行状态"><div className="runtime-summary">
     <button className={`runtime-heading${needsAttention ? ' needs-attention' : ''}`} aria-label={needsAttention ? '查看运行状态，有待处理事项' : '查看运行状态'} title="查看运行详情" onClick={openDetails}><Activity size={16} aria-hidden="true" /><strong>运行状态</strong></button>
     <div className="runtime-overview">{overview}<AutomaticSaveStatus openDetails={openUploads || openDetails} /></div>
   </div></section>;
-  if (mode === 'policy') return <section className="settings-card" aria-label="资料整理设置"><h3>照片归档后自动整理</h3><p>按已核实的编号、归属和照片用途处理，保留人工修改和排除记录。</p>{data ? <div className="runtime-switches"><label><input type="checkbox" checked={data.policy.rules_enabled} disabled={busy} onChange={e => void act('/api/operations/policy', '规则整理开关已保存。', { rules_enabled: e.target.checked })} />自动规则整理</label><label><input type="checkbox" checked={data.policy.auto_drafts} disabled={busy} onChange={e => void act('/api/operations/policy', '自动准备草稿开关已保存。', { auto_drafts: e.target.checked })} />明确资料自动准备草稿</label></div> : <p>正在读取设置…</p>}{notice && <p role="status">{notice}</p>}<ErrorBox error={error} /></section>;
+  if (mode === 'policy') return <section className="settings-card" aria-label="资料整理设置"><h3>照片归档后自动整理</h3><p>按已核实的编号、归属和照片用途处理，保留人工修改和排除记录。</p>{data ? <div className="runtime-switches"><label><input type="checkbox" checked={data.policy.rules_enabled} disabled={busy || !isAdmin} onChange={e => void act('/api/operations/policy', '规则整理开关已保存。', { rules_enabled: e.target.checked })} />自动规则整理</label><label><input type="checkbox" checked={data.policy.auto_drafts} disabled={busy || !isAdmin} onChange={e => void act('/api/operations/policy', '自动准备草稿开关已保存。', { auto_drafts: e.target.checked })} />明确资料自动准备草稿</label></div> : <p>正在读取设置…</p>}{notice && <p role="status">{notice}</p>}<ErrorBox error={error} /></section>;
   return <section className="runtime-status" aria-label="运行详情">
     <div className="runtime-summary"><Activity size={16} aria-hidden="true" /><strong>运行概况</strong><span className="runtime-overview">{overview}</span></div>
     <div className="runtime-content">
@@ -77,15 +79,15 @@ export default function RuntimeStatus({ login, settings, channels, mode = 'detai
         <div className="runtime-grid"><section><h3>模型与恢复</h3><p>{data.model.error || '未发出额外健康探测。有效响应表示结构检查通过，识别内容仍需核对。'}</p>
           {data.model.retry_at && <p>最早恢复时间：{dateTime(data.model.retry_at)}</p>}
           <p>最近接口响应：{data.model.last_transport_ok ? dateTime(data.model.last_transport_ok) : '尚无记录'}<br />最近有效结果：{data.model.last_response_ok ? dateTime(data.model.last_response_ok) : '尚无记录'}</p>
-          <div className="runtime-actions"><button disabled={busy || ['disabled', 'unconfigured'].includes(data.model.state)} onClick={() => void act('/api/operations/model/retry', '已允许下一次模型调用；未重跑旧对话或发送消息。')}>允许重新尝试</button><button onClick={settings}>模型设置</button></div>
+          <div className="runtime-actions"><button disabled={busy || !isAdmin || ['disabled', 'unconfigured'].includes(data.model.state)} onClick={() => void act('/api/operations/model/retry', '已允许下一次模型调用；未重跑旧对话或发送消息。')}>允许重新尝试</button><button onClick={settings}>模型设置</button></div>
         </section><section><h3>资料与外部入口</h3><p>{data.storage.detail}{data.storage.free_bytes != null && `；剩余 ${(data.storage.free_bytes / 1024 ** 3).toFixed(1)} GB`}</p>
           <p>{data.ocr.latest?.error || '本地 OCR 与外部 AI 独立。'}未有成功 OCR 记录 {data.ocr.pending} 项。</p>
           <p>最近增量同步：{data.sync.schedule.last_success?.completed_at ? dateTime(data.sync.schedule.last_success.completed_at) : '尚无成功记录'}</p>
-          <div className="runtime-actions"><button disabled={busy || !data.ocr.enabled} onClick={() => void act('/api/operations/ocr/retry', '有效且未完成的识别已排队，每批最多 100 项。')}>重试未完成识别</button><button onClick={login}>连接公司官网</button><button onClick={channels}>收图入口与回执</button></div>
+          <div className="runtime-actions"><button disabled={busy || !isAdmin || !data.ocr.enabled} onClick={() => void act('/api/operations/ocr/retry', '有效且未完成的识别已排队，每批最多 100 项。')}>重试未完成识别</button><button disabled={!isAdmin} onClick={login}>连接公司官网</button><button onClick={channels}>收图入口与回执</button></div>
         </section></div>
         {!!data.channels.length && <ul className="runtime-task-list">{data.channels.map(channel => <li key={channel.id}><div><strong>{channel.name} · {channel.enabled ? '已启用' : '已暂停'}</strong><p>{channel.error || '当前未记录接收异常'} · 附件待处理 {(channel.counts.pending || 0) + (channel.counts.failed || 0)} 项 · 最近归档 {channel.last_saved ? dateTime(channel.last_saved) : '尚无记录'}</p></div></li>)}</ul>}
         <p className="muted">官网保存仍使用原群的授权；正式提交由人工确认。模型恢复只补有效照片分析，不补发旧对话或日报。</p>
-        {!!data.ai_tasks.length && <details><summary>最近分析记录与重试</summary><ul className="runtime-task-list">{data.ai_tasks.map(task => <li key={task.id}><div><strong>{task.short_code || '待归案资料'} · {task.kind === 'quality' ? '内容检查' : '分类建议'}</strong><p>{AI_STATES[task.state]} · 已尝试 {task.attempts} / 3 次{task.error && ` · ${task.error}`}</p></div>{['failed', 'waiting'].includes(task.state) && <button disabled={busy} onClick={() => void act(`/api/operations/ai/${task.id}/retry`, '已发起新的只读分析，原记录继续保留。')}>重新分析</button>}</li>)}</ul></details>}
+        {!!data.ai_tasks.length && <details><summary>最近分析记录与重试</summary><ul className="runtime-task-list">{data.ai_tasks.map(task => <li key={task.id}><div><strong>{task.short_code || '待归案资料'} · {task.kind === 'quality' ? '内容检查' : '分类建议'}</strong><p>{AI_STATES[task.state]} · 已尝试 {task.attempts} / 3 次{task.error && ` · ${task.error}`}</p></div>{['failed', 'waiting'].includes(task.state) && <button disabled={busy || !isAdmin} onClick={() => void act(`/api/operations/ai/${task.id}/retry`, '已发起新的只读分析，原记录继续保留。')}>重新分析</button>}</li>)}</ul></details>}
       </>}
       <div className="runtime-actions"><button disabled={busy} onClick={() => { setBusy(true); void load().catch(e => setError(message(e))).finally(() => setBusy(false)); }}><RefreshCw size={14} aria-hidden="true" />刷新状态</button>{data && <small>读取于 {dateTime(data.at)}</small>}</div>
       {notice && <p role="status">{notice}</p>}<ErrorBox error={error} />

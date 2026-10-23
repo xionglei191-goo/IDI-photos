@@ -15,6 +15,9 @@ from tests.test_automatic_uploads import tick
 
 def test_member_camera_saves_with_project_account_before_manager_formal_submission(
         platform, services, case, project, client, monkeypatch):
+    # This scenario verifies account routing and formal-submit permissions;
+    # test_proposal_photo_wait covers the separate production 300-second wait.
+    monkeypatch.setattr('idi.automatic_uploads.PROPOSAL_QUIET_SECONDS', 0)
     platform.test_survey['buildingFileInfoList'] = []
     enter_stage(platform, case['id'], 'survey')
     company = platform.client

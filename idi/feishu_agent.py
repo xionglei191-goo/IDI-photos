@@ -21,6 +21,7 @@ from .agent_memory import AgentMemory
 from .context_memory import bounded_tool_result, history_notice
 from .feishu_topics import FeishuTopics, speaker_tag
 from .agent_capabilities import GUIDANCE
+from .agent_dates import parsed
 
 log = logging.getLogger(__name__)
 CHINA = timezone(timedelta(hours=8))
@@ -191,6 +192,17 @@ class FeishuAgent:
                 'error': error, 'next_brief_at': next_due, 'submit_permission': False}
 
     def status(self):
+        from .identity import current
+        person = current()
+        if person and not person.admin:
+            bindings = [self.binding_status(c) for c in self.connectors.list() if c['kind'] == 'feishu']
+            bindings = [b for b in bindings if b['project_ids'] and all(person.allows(p) for p in b['project_ids'])]
+            return {'bindings': bindings,
+                    'projects': [{'id': p['id'], 'name': p['name']} for p in self.domain.projects()],
+                    'model_ready': self.recognizer.status()['vision_ready'],
+                    'platform': {'connected': self.platform.client.status()['connected'], 'write_enabled': False},
+                    'worker_enabled': self.settings.worker_enabled, 'timezone': 'Asia/Shanghai',
+                    'tasks': self.tasks(), 'permissions': {'submit': False}}
         return {'bindings': [self.binding_status(c) for c in self.connectors.list() if c['kind'] == 'feishu'],
                 'projects': self.db.all('SELECT id,name,(SELECT COUNT(*) FROM cases c WHERE c.project_id=p.id) case_count FROM projects p ORDER BY name,id'),
                 'model_ready': self.recognizer.status()['vision_ready'], 'platform': self.platform.client.status(),
@@ -200,7 +212,29 @@ class FeishuAgent:
     def tasks(self):
         return self.record_rows()
 
+    def visible_task_scope(self):
+        from .identity import current
+        person = current()
+        if person is None or person.admin:
+            return '1=1', []
+        ids = list(person.projects)
+        if not ids:
+            return '0=1', []
+        marks = ','.join('?' for _ in ids)
+        # Never split a reply which may discuss several projects. All frozen
+        # projects and current image/draft references must remain accessible.
+        scope = ("json_type(t.input_json,'$.allowed_project_ids')='array' AND "
+                 "json_array_length(t.input_json,'$.allowed_project_ids')>0 AND "
+                 "NOT EXISTS(SELECT 1 FROM json_each(t.input_json,'$.allowed_project_ids') s WHERE s.value NOT IN (" + marks + ")) AND "
+                 "(t.project_id IS NULL OR t.project_id IN (" + marks + ")) AND "
+                 "NOT EXISTS(SELECT 1 FROM json_each(t.input_json,'$.photo_ids') i LEFT JOIN photos p ON p.id=i.value WHERE p.project_id IS NULL OR p.project_id NOT IN (" + marks + ")) AND "
+                 "NOT EXISTS(SELECT 1 FROM feishu_agent_images i JOIN photos p ON p.id=i.photo_id WHERE i.task_id=t.id AND (p.project_id IS NULL OR p.project_id NOT IN (" + marks + "))) AND "
+                 "NOT EXISTS(SELECT 1 FROM feishu_agent_drafts d JOIN cases c ON c.id=d.case_id WHERE d.task_id=t.id AND c.project_id NOT IN (" + marks + '))')
+        return scope, ids * 5
+
     def record_rows(self, where='', args=(), *, limit=60, full=False):
+        scope, scope_args = self.visible_task_scope()
+        where, args = ('(' + where + ') AND ' if where else '') + scope, (*args, *scope_args)
         # A bounded read-only projection: no member lookup, model request or
         # per-record detail fetch is needed while the history panel polls.
         rows = self.db.all("""SELECT t.id,t.rowid sequence,t.kind,t.state,t.project_id,
@@ -258,6 +292,9 @@ class FeishuAgent:
         return row
 
     def get(self, task_id):
+        scope, args = self.visible_task_scope()
+        if not self.db.one('SELECT t.id FROM feishu_agent_tasks t WHERE t.id=? AND ' + scope, (task_id, *args)):
+            raise DomainError('群助手任务不存在或没有访问权限', 404)
         row = self.db.one('SELECT * FROM feishu_agent_tasks WHERE id=?', (task_id,))
         if not row:
             raise DomainError('群助手任务不存在', 404)
@@ -401,8 +438,20 @@ class FeishuAgent:
         latest_drafts = [d for d in latest_drafts if not followup_only or d['case_id'] in case_ids]
         drafts = Counter(v['review_state'] or json.loads(v['result']).get('state', 'unknown') for v in latest_drafts)
         issues = self.db.all("SELECT kind,COUNT(*) n FROM followup_issues WHERE project_id=? AND state='open'" + scope_sql + ' GROUP BY kind', (project_id, *scope_args))
-        changes = self.db.all('SELECT e.case_id,e.to_stage,e.source,e.event_at,c.short_code,c.platform_report_code,c.title FROM case_events e JOIN cases c ON c.id=e.case_id WHERE c.project_id=? AND e.created_at>=? AND e.created_at<=? ORDER BY e.created_at DESC', (project_id, start, end))
-        changes = [c for c in changes if not followup_only or c['case_id'] in case_ids][:8]
+        events = self.db.all('SELECT e.case_id,e.from_stage,e.to_stage,e.source,e.event_at,e.created_at AS recorded_at,c.short_code,c.platform_report_code,c.title FROM case_events e JOIN cases c ON c.id=e.case_id WHERE c.project_id=? AND e.from_stage IS NOT NULL AND e.from_stage<>e.to_stage', (project_id,))
+        changes = []
+        for change in events:
+            observed = change['source'] in ('platform', 'platform_list')
+            if (not observed and change['source'] != 'manual_record') or (followup_only and change['case_id'] not in case_ids):
+                continue
+            at, recorded = parsed(change['recorded_at'] if observed else change['event_at']), parsed(change['recorded_at'])
+            if not at or not recorded or not parsed(start) <= at <= instant or recorded > instant:
+                continue
+            change.update(time_basis='observed_at' if observed else 'recorded_business_time', evidence_at=at.isoformat(),
+                time_note='官网同步发现变化的时间，实际办理时间未知' if observed else '人工登记的办理时间')
+            changes.append(change)
+        changes.sort(key=lambda change: change['evidence_at'], reverse=True)
+        changes = changes[:8]
         sync = self.workflow.sync_status()
         latest = sync.get('latest') or {}
         return {'project_name': project['name'], 'date': local.date().isoformat(), 'as_of': local.isoformat(),

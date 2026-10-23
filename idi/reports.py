@@ -182,7 +182,9 @@ class Reporter:
         self._package_lock = threading.RLock()
 
     def packages(self, case_id=None):
-        rows = self.db.all("SELECT pk.*,c.project_id,c.title AS case_title,pr.name AS project_name FROM packages pk JOIN cases c ON c.id=pk.case_id JOIN projects pr ON pr.id=c.project_id WHERE pk.state<>'deleted'" + (" AND pk.case_id=?" if case_id else "") + " ORDER BY pk.created_at DESC,pk.version DESC", (case_id,) if case_id else ())
+        from .identity import project_filter
+        scope, args = project_filter('c.project_id')
+        rows = self.db.all("SELECT pk.*,c.project_id,c.title AS case_title,pr.name AS project_name FROM packages pk JOIN cases c ON c.id=pk.case_id JOIN projects pr ON pr.id=c.project_id WHERE pk.state<>'deleted' AND " + scope + (" AND pk.case_id=?" if case_id else "") + " ORDER BY pk.created_at DESC,pk.version DESC", (*args, case_id) if case_id else args)
         for row in rows:
             manifest = json.loads(row.pop("manifest"))
             row["case_title"] = manifest["case"]["title"]
@@ -201,6 +203,7 @@ class Reporter:
         row = self.db.one("SELECT * FROM packages WHERE id=?", (package_id,))
         if not row or row['state'] == 'deleted':
             raise DomainError("报送记录不存在", 404)
+        self.domain.case(row['case_id'])
         row["manifest"] = json.loads(row["manifest"])
         row["events"] = self.db.all("SELECT * FROM package_events WHERE package_id=? ORDER BY created_at", (package_id,))
         row["download_url"] = f"/api/packages/{package_id}/download" if row['state'] in ('ready', 'submitted', 'accepted', 'returned') else None

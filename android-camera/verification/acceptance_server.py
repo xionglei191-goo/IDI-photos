@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import sys
 from pathlib import Path
 
@@ -68,7 +69,13 @@ def prepare(root: Path, mock_xhey=False, live_xhey_config=None, local_only=False
                                      'room': room, 'platform_report_code': number, 'repair_parts': [part]})
             with db.tx() as con:
                 con.execute('UPDATE cases SET workflow_stage=? WHERE id=?', (stage, case['id']))
-    pairing = services['mobile_camera'].create_pairing({'name': '安卓验收模拟器', 'project_ids': [project['id']]})
+    owner = db.one("SELECT id FROM idi_users WHERE username='android-acceptance' AND enabled=1")
+    if owner is None:
+        owner = services['access'].save_user({
+            'username': 'android-acceptance', 'display_name': '安卓隔离验收',
+            'password': secrets.token_urlsafe(24), 'system_role': 'admin'}, bootstrap=True)
+    pairing = services['mobile_camera'].create_pairing({
+        'name': '安卓验收模拟器', 'project_ids': [project['id']], 'user_id': owner['id']})
     root.mkdir(parents=True, exist_ok=True)
     (root / 'pairing.json').write_text(json.dumps(pairing), encoding='utf-8')
     return app

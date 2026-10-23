@@ -1,7 +1,9 @@
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import idi.platform_prefill as prefill_rules
 from idi.domain import DomainError
 from idi.platform_prefill import repair_suggestions
 from tests.test_platform_preparation import platform, enter_stage, draft_data
@@ -177,6 +179,20 @@ def repair_evidence(photos, **extra):
     return {'case': {'id': 'c'}, 'link': {}, 'photos': photos, 'selections': {}, 'values': {}, 'dictionaries': {}, **extra}
 
 
+@pytest.fixture
+def prefill_clock(monkeypatch):
+    current = [datetime(2026, 10, 23, 16, 5, 6, tzinfo=timezone.utc)]
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is not None
+            return current[0].astimezone(tz)
+
+    monkeypatch.setattr(prefill_rules, 'datetime', FrozenDateTime)
+    return current
+
+
 def test_repair_dates_use_first_checkin_and_last_finished_photo_only():
     evidence = repair_evidence([
         repair_photo('b', 'work_checkin', '2026-10-16 10:51'), repair_photo('d', 'work_checkin', '2026-10-16 10:54'),
@@ -188,22 +204,90 @@ def test_repair_dates_use_first_checkin_and_last_finished_photo_only():
     assert not notes and set(suggested) == {'approachStartWorkDate', 'finishWorkDate'}
 
 
-@pytest.mark.parametrize('change', [{'recognition_state': 'conflict'}, {'case_id': 'other'}, {'media_type': 'video'}, {'watermark_time': None}])
-def test_repair_time_cannot_be_inferred_from_invalid_photo_or_import_date(change):
+@pytest.mark.parametrize('change', [{'recognition_state': 'conflict'}, {'case_id': 'other'}, {'media_type': 'video'}, {'watermark_time': None}, {'watermark_time': 'invalid'}])
+def test_repair_start_without_valid_watermark_uses_current_beijing_time(change, prefill_clock):
     p = repair_photo('b', 'work_checkin', '2026-10-16 10:51', created_at='2026-10-16 10:51')
     p.update(change)
     suggested, notes = repair_suggestions(**repair_evidence([p]))
-    assert not suggested and 'approachStartWorkDate' in notes
+    start = suggested['approachStartWorkDate']
+    assert start['value'] == '2026-10-24 00:05:06'
+    assert '北京时间' in start['source'] and start['needs_review'] and start['photo_ids'] == []
+    assert 'approachStartWorkDate' not in notes and 'finishWorkDate' not in suggested
 
 
-def test_repair_multiple_visits_require_selection_and_finished_time_cannot_precede_start():
+def test_repair_multiple_dates_use_earliest_checkin_on_latest_date_and_respect_selection():
     photos = [repair_photo('b1', 'work_checkin', '2026-10-15 10:00'), repair_photo('b2', 'work_checkin', '2026-10-16 10:00'),
-              repair_photo('f', 'completion', '2026-10-16 09:00')]
+              repair_photo('b3', 'work_checkin', '2026-10-16 09:30'), repair_photo('f', 'completion', '2026-10-16 09:00')]
     suggested, notes = repair_suggestions(**repair_evidence(photos))
-    assert 'approachStartWorkDate' not in suggested and '多个日期' in notes['approachStartWorkDate']
+    assert suggested['approachStartWorkDate']['value'] == '2026-10-16 09:30:00'
+    assert suggested['approachStartWorkDate']['photo_ids'] == ['b2', 'b3']
+    assert 'approachStartWorkDate' not in notes
+    assert 'finishWorkDate' not in suggested and '早于' in notes['finishWorkDate']
     suggested, notes = repair_suggestions(**repair_evidence(photos, selections={'buildingFileInfoList': ['b2']}))
     assert suggested['approachStartWorkDate']['value'] == '2026-10-16 10:00:00'
     assert 'finishWorkDate' not in suggested and '早于' in notes['finishWorkDate']
+    suggested, _ = repair_suggestions(**repair_evidence(photos, selections={'buildingFileInfoList': ['b1']}))
+    assert suggested['approachStartWorkDate']['value'] == '2026-10-15 10:00:00'
+
+
+def test_partial_missing_start_times_and_multiple_finish_dates_still_require_review():
+    photos = [repair_photo('b1', 'work_checkin', '2026-10-15 10:00'), repair_photo('b2', 'work_checkin', None),
+              repair_photo('f1', 'completion', '2026-10-16 11:00'), repair_photo('f2', 'completion', '2026-10-17 11:00')]
+    suggested, notes = repair_suggestions(**repair_evidence(photos))
+    assert not suggested
+    assert '部分照片' in notes['approachStartWorkDate'] and '多个日期' in notes['finishWorkDate']
+
+
+def test_repair_start_fallback_is_stable_after_retry_and_official_echo(platform, case, prefill_clock):
+    enter_stage(platform, case['id'], 'repair')
+    first = platform.prefill_draft(case['id'], 'repair', set())['plan']
+    assert first['draft']['values']['approachStartWorkDate'] == '2026-10-24 00:05:06'
+    prefill_clock[0] += timedelta(days=1)
+    assert platform.preview(case['id'], 'repair')['field_suggestions']['approachStartWorkDate']['value'] == '2026-10-24 00:05:06'
+    again = platform.prefill_draft(case['id'], 'repair', set())
+    assert not again['changed'] and again['plan']['draft']['revision'] == first['draft']['revision']
+    platform.test_repair.update(deepcopy(first['business_fields']))
+    enter_stage(platform, case['id'], 'repair')
+    assert not platform.prefill_draft(case['id'], 'repair', set())['changed']
+
+
+def test_valid_checkins_replace_fallback_then_follow_latest_date(platform, services, case, photo, prefill_clock):
+    enter_stage(platform, case['id'], 'repair')
+    first = platform.prefill_draft(case['id'], 'repair', set())['plan']
+    platform.test_repair.update(deepcopy(first['business_fields']))
+    enter_stage(platform, case['id'], 'repair')
+    earlier = confirmed(services, photo, 'red', 'work_checkin', '2026-10-16 09:00', 'building_checkin')
+    plan = platform.prefill_draft(case['id'], 'repair', {earlier['id']})['plan']
+    assert plan['draft']['values']['approachStartWorkDate'] == '2026-10-16 09:00:00'
+    platform.test_repair.update(deepcopy(plan['business_fields']))
+    enter_stage(platform, case['id'], 'repair')
+    later = confirmed(services, photo, 'blue', 'work_checkin', '2026-10-17 10:00', 'door_checkin')
+    plan = platform.prefill_draft(case['id'], 'repair', {earlier['id'], later['id']})['plan']
+    assert plan['draft']['values']['approachStartWorkDate'] == '2026-10-17 10:00:00'
+    assert plan['field_sources']['approachStartWorkDate']['photo_ids'] == [later['id']]
+
+
+@pytest.mark.parametrize('value', ['2026-10-15 08:00:00', ''])
+def test_manual_repair_start_and_clear_remain_protected(platform, services, case, photo, value, prefill_clock):
+    enter_stage(platform, case['id'], 'repair')
+    platform.save_draft(case['id'], 'repair', draft_data(platform, case['id'], 'repair', {'approachStartWorkDate': value}))
+    plan = platform.prefill_draft(case['id'], 'repair', set())['plan']
+    assert plan['draft']['values']['approachStartWorkDate'] == value
+    p = confirmed(services, photo, 'red', 'work_checkin', '2026-10-16 09:00', 'building_checkin')
+    plan = platform.prefill_draft(case['id'], 'repair', {p['id']})['plan']
+    assert plan['draft']['values']['approachStartWorkDate'] == value
+    assert plan['field_sources']['approachStartWorkDate']['origin'] == 'manual'
+
+
+def test_saved_official_start_remains_preferred_over_current_time_or_newer_checkin(platform, services, case, photo, prefill_clock):
+    platform.test_repair['approachStartWorkDate'] = '2026-10-15 08:00:00'
+    enter_stage(platform, case['id'], 'repair')
+    plan = platform.prefill_draft(case['id'], 'repair', set())['plan']
+    assert plan['draft']['values']['approachStartWorkDate'] == '2026-10-15 08:00:00'
+    p = confirmed(services, photo, 'red', 'work_checkin', '2026-10-16 09:00', 'building_checkin')
+    plan = platform.prefill_draft(case['id'], 'repair', {p['id']})['plan']
+    assert plan['draft']['values']['approachStartWorkDate'] == '2026-10-15 08:00:00'
+    assert not platform.prefill_draft(case['id'], 'repair', {p['id']})['changed']
 
 
 def test_explicit_shared_survey_checkin_can_establish_work_start():
@@ -257,6 +341,18 @@ def test_existing_repair_photos_fill_and_save_real_work_times(platform, services
     assert writes[0][1]['finishWorkDate'] == '2026-10-16 11:30:00'
     assert writes[0][1]['repairCrewNumber'] == 1
     assert {f['field'] for f in row['detail']['filled_fields']} == {'approachStartWorkDate', 'finishWorkDate'}
+
+
+def test_missing_work_start_is_saved_once_and_kept_on_queue_retry(platform, services, case, photo, monkeypatch, prefill_clock):
+    auto, _, uploads, writes, _ = setup_flow(services, platform, case, photo, monkeypatch)
+    enter_stage(platform, case['id'], 'repair')
+    row = tick(auto, case['id'])
+    assert not uploads and len(writes) == 1, row
+    assert writes[0][1]['state'] == 0 and writes[0][1]['approachStartWorkDate'] == '2026-10-24 00:05:06'
+    prefill_clock[0] += timedelta(days=1)
+    tick(auto, case['id'])
+    assert len(writes) == 1
+    assert platform.draft(case['id'], 'repair')['values']['approachStartWorkDate'] == '2026-10-24 00:05:06'
 
 
 def test_revoked_group_cannot_supply_automatic_field_evidence(platform, services, case, photo, monkeypatch, bot):

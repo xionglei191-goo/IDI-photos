@@ -65,17 +65,52 @@ final class CaptureStore extends SQLiteOpenHelper {
   }
 
   void create(JSONObject meta, boolean demo) throws JSONException {
+    create(meta, demo ? "demo" : server(), demo ? "demo" : device());
+  }
+
+  private void create(JSONObject meta, String destination, String credential) throws JSONException {
     String id = meta.getString("capture_id");
     if (!directory(id).mkdirs() && !directory(id).isDirectory())
       throw new IllegalStateException("手机存储不可用");
     ContentValues values = new ContentValues();
     values.put("id", id);
     values.put("metadata", meta.toString());
-    values.put("server", demo ? "demo" : server());
-    values.put("device", demo ? "demo" : device());
+    values.put("server", destination);
+    values.put("device", credential);
     values.put("state", "capturing");
     values.put("created_at", System.currentTimeMillis());
     getWritableDatabase().insertOrThrow("captures", null, values);
+  }
+
+  // A saved photo and its successor have different identities. Keep the original
+  // destination even if pairing changes, and never copy the SDK's photo identity.
+  synchronized String nextOfficialPhoto(String previousId, String sessionId) throws Exception {
+    Item previous = item(previousId);
+    if (previous == null || previous.video() || !"xhey_sdk".equals(previous.meta.optString("source"))
+        || !original(previousId).isFile() || !stamped(previousId).isFile())
+      throw new Exception("当前原片尚未保存，不能开始下一张");
+    String key = "next_official_photo_" + previousId;
+    String nextId = prefs.getString(key, "");
+    SQLiteDatabase db = getWritableDatabase();
+    db.beginTransaction();
+    try {
+      if (nextId.isEmpty() || item(nextId) == null) {
+        JSONObject old = previous.meta;
+        JSONObject selected = new JSONObject().put("id", old.getString("case_id"))
+            .put("case_number", old.getString("case_number"))
+            .put("project_name", old.getString("project_name")).put("location", old.getString("location"));
+        JSONObject meta = CameraData.metadata(selected, old.getString("photo_group"),
+            old.optString("part"), old.getString("content"), old.optString("role")).put("source", "xhey_sdk");
+        nextId = meta.getString("capture_id");
+        create(meta, previous.server, previous.device);
+        state(nextId, "awaiting_sdk", "");
+      }
+      if (!prefs.edit().putString(key, nextId).putString("native_series_" + sessionId, nextId)
+          .putString("pending_official_capture", nextId).commit())
+        throw new Exception("下一张拍摄信息未保存，请重试");
+      db.setTransactionSuccessful();
+      return nextId;
+    } finally { db.endTransaction(); }
   }
 
   void state(String id, String state, String error) {

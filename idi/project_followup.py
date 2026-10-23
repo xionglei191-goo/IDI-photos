@@ -396,6 +396,7 @@ class ProjectFollowup:
             audit(con, 'followup_issue', issue_id, 'dismiss', dict(row), {'resolution': reason.strip()[:1000]})
 
     def summary(self):
+        from .identity import current
         cases = self.followup_cases()
         project_ids = {c['project_id'] for c in cases.values()}
         projects = [p for p in self.db.all('SELECT id,name FROM projects ORDER BY name') if p['id'] in project_ids]
@@ -418,6 +419,9 @@ class ProjectFollowup:
             latest['result'] = json.loads(latest['result'])
             photo_ids = {p['id'] for p in photos}
             latest['result']['failed'] = [f for f in latest['result']['failed'] if f['photo_id'] in photo_ids]
+        if current() and not current().admin:
+            # A global run may contain other projects in its error/results.
+            latest = None
         return {'scope': 'repair', 'case_count': len(cases), 'projects': projects, 'latest': latest,
                 'config': self.config(), 'unassigned_issues': 0,
                 'source': '查勘维修案件；办理阶段来自案件记录，资料检查仅包含相关本机归档原件',
@@ -570,7 +574,9 @@ class ProjectFollowup:
                     client.close()
 
     def feedback(self):
-        rows = self.db.all('SELECT f.*,p.name project_name FROM followup_feedback f JOIN projects p ON p.id=f.project_id ORDER BY f.created_at DESC LIMIT 100')
+        from .identity import project_filter
+        scope, args = project_filter('f.project_id')
+        rows = self.db.all('SELECT f.*,p.name project_name FROM followup_feedback f JOIN projects p ON p.id=f.project_id WHERE ' + scope + ' ORDER BY f.created_at DESC LIMIT 100', args)
         for row in rows:
             row['text'] = json.loads(row.pop('content'))['text']
         return rows

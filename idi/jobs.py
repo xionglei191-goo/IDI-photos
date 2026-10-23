@@ -47,13 +47,48 @@ class JobRunner:
             raise DomainError('没有此任务的访问权限', 403)
         row["payload"] = json.loads(row["payload"])
         row["result"] = json.loads(row["result"]) if row["result"] else None
+        self.check_scope(row)
         return row
+
+    def check_scope(self, row):
+        person = current()
+        if person is None or person.admin:
+            return
+        payload, projects = row['payload'], set()
+        if payload.get('project_id'):
+            projects.add(payload['project_id'])
+        if payload.get('batch_id'):
+            batch = self.db.one('SELECT project_id,case_id FROM import_batches WHERE id=?', (payload['batch_id'],))
+            if batch:
+                projects.add(batch['project_id'])
+                if batch['case_id']:
+                    case = self.db.one('SELECT project_id FROM cases WHERE id=?', (batch['case_id'],))
+                    projects.add(case['project_id'] if case else None)
+        case_ids = [g.get('case', {}).get('id') for g in payload.get('groups', [])]
+        if payload.get('case_id'):
+            case_ids.append(payload['case_id'])
+        for case_id in case_ids:
+            case = self.db.one('SELECT project_id FROM cases WHERE id=?', (case_id,))
+            projects.add(case['project_id'] if case else None)
+        for photo_id in payload.get('photo_ids', []):
+            photo = self.db.one('SELECT project_id FROM photos WHERE id=?', (photo_id,))
+            projects.add(photo['project_id'] if photo else None)
+        if not projects or any(not person.allows(p) for p in projects):
+            raise DomainError('任务涉及的项目权限已变化', 403)
 
     def list(self):
         person = current()
         own = person is not None and not person.admin
-        return [self.get(row["id"]) for row in self.db.all("SELECT id FROM jobs" +
-            (" WHERE user_id=?" if own else "") + " ORDER BY created_at DESC LIMIT 100", (person.id,) if own else ())]
+        rows = self.db.all("SELECT id FROM jobs" + (" WHERE user_id=?" if own else "") +
+                           " ORDER BY created_at DESC LIMIT 100", (person.id,) if own else ())
+        visible = []
+        for row in rows:
+            try:
+                visible.append(self.get(row['id']))
+            except DomainError as exc:
+                if not own:
+                    raise exc
+        return visible
 
     def retry(self, job_id):
         self.get(job_id)

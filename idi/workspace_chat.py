@@ -16,12 +16,15 @@ from .feishu_agent import FeishuAgent
 from .project_agent_tools import ProjectAgentTools, READ_ONLY, TOOLS, case_public
 from .context_memory import bounded_tool_result, history_notice
 from .agent_capabilities import GUIDANCE, MAINTENANCE_TOOLS
+from .identity import current, require_project, acting_as
+from .workspace_scope import check_thread_scope, user_principal
 
 log = logging.getLogger(__name__)
 MAX_ROUNDS, MAX_SECONDS, MAX_TOKENS = 12, 240, 50000
 TOOL_LABELS = {
     'list_projects': '读取项目清单', 'read_project_summary': '查看项目进展',
     'read_followup_summary': '汇总查勘维修进展', 'search_cases': '查询案件',
+    'read_case_progress': '核对案件进展事件',
     'read_case': '查看案件资料', 'read_case_records': '核对办理与进场记录',
     'read_requirements': '核对资料要求', 'read_images': '查看已归档原图',
     'finish_reply': '整理答复',
@@ -46,6 +49,11 @@ SYSTEM += '\n' + GUIDANCE
 def owner_hash(key):
     if not isinstance(key, str) or not re.fullmatch(r'[A-Za-z0-9-]{32,80}', key):
         raise DomainError('对话标识无效，请刷新页面后重试', 400)
+    person = current()
+    # Retain existing administrator browser history; project personnel receive
+    # separate ownership even when accounts share the same browser storage.
+    if person and not person.admin:
+        key = person.id + ':' + key
     return hashlib.sha256(key.encode('ascii')).hexdigest()
 
 
@@ -113,15 +121,25 @@ class WorkspaceChat:
     def status(self, key):
         owner = owner_hash(key)
         status = self.recognizer.status()
+        threads = self.db.all('SELECT * FROM workspace_chat_threads WHERE owner_hash=? ORDER BY updated_at DESC,id DESC LIMIT 100', (owner,))
+        visible = []
+        for row in threads:
+            try:
+                check_thread_scope(self.db, row)
+            except DomainError:
+                continue
+            visible.append({k: row[k] for k in ('id', 'title', 'project_id', 'case_id', 'context_label', 'created_at', 'updated_at')})
+        active = self.db.one("SELECT id,thread_id,state FROM workspace_chat_turns WHERE owner_hash=? AND state IN ('queued','running') ORDER BY created_at LIMIT 1", (owner,))
         return {'ready': bool(status['vision_ready']), 'model': self.db.setting('recognition', {}).get('model', ''),
-            'threads': self.db.all('SELECT id,title,project_id,case_id,context_label,created_at,updated_at FROM workspace_chat_threads WHERE owner_hash=? ORDER BY updated_at DESC,id DESC LIMIT 100', (owner,)),
-            'active': self.db.one("SELECT id,thread_id,state FROM workspace_chat_turns WHERE owner_hash=? AND state IN ('queued','running') ORDER BY created_at LIMIT 1", (owner,)),
+            'threads': visible,
+            'active': active if active and any(t['id'] == active['thread_id'] for t in visible) else None,
             'permissions': {'read_only': False, 'explicit_maintenance_only': True, 'submit': False}}
 
     def get(self, key, thread_id):
         row = self.db.one('SELECT * FROM workspace_chat_threads WHERE id=? AND owner_hash=?', (thread_id, owner_hash(key)))
         if not row:
             raise DomainError('对话不存在或不属于当前浏览器', 404)
+        check_thread_scope(self.db, row)
         row.pop('owner_hash')
         row.pop('project_ids')
         rows = self.db.all('SELECT id,question,answer,state,progress,steps,sources,usage,model,error,created_at,started_at,finished_at FROM workspace_chat_turns WHERE thread_id=? ORDER BY created_at,id', (thread_id,))
@@ -149,7 +167,8 @@ class WorkspaceChat:
             if previous:
                 if previous['question'] != question or (thread_id and thread_id != previous['thread_id']):
                     raise DomainError('此请求标识已用于另一个问题', 409)
-                original = con.execute('SELECT project_id,case_id FROM workspace_chat_threads WHERE id=?', (previous['thread_id'],)).fetchone()
+                original = con.execute('SELECT * FROM workspace_chat_threads WHERE id=?', (previous['thread_id'],)).fetchone()
+                check_thread_scope(self.db, dict(original))
                 if not thread_id:
                     expected_case, expected_project = data.get('case_id') or None, data.get('project_id') or None
                     if expected_case:
@@ -167,6 +186,7 @@ class WorkspaceChat:
                 thread = con.execute('SELECT * FROM workspace_chat_threads WHERE id=? AND owner_hash=?', (thread_id, owner)).fetchone()
                 if not thread:
                     raise DomainError('对话不存在或不属于当前浏览器', 404)
+                check_thread_scope(self.db, dict(thread))
                 if any(data.get(k) and data[k] != thread[k] for k in ('project_id', 'case_id')):
                     raise DomainError('请新建对话后切换项目范围', 409)
                 if con.execute('SELECT COUNT(*) FROM workspace_chat_turns WHERE thread_id=?', (thread_id,)).fetchone()[0] >= 60:
@@ -181,6 +201,7 @@ class WorkspaceChat:
                     project_id = case['project_id']
                     label = case.get('platform_report_code') or case.get('short_code') or case['title']
                 if project_id:
+                    require_project(project_id)
                     project = con.execute('SELECT id,name FROM projects WHERE id=?', (project_id,)).fetchone()
                     if not project:
                         raise DomainError('所选项目不存在', 404)
@@ -188,12 +209,14 @@ class WorkspaceChat:
                     if not case_id:
                         label = project['name']
                 else:
-                    project_ids = [r['id'] for r in con.execute('SELECT id FROM projects ORDER BY name,id')]
+                    project_ids = [p['id'] for p in self.domain.projects()]
+                    if current() and not current().admin:
+                        label = '我的全部项目'
                 if not project_ids or len(project_ids) > 200:
                     raise DomainError('请先建立项目，或选择一个项目进行对话')
                 thread_id = uid()
-                con.execute('INSERT INTO workspace_chat_threads VALUES(?,?,?,?,?,?,?,?,?)',
-                    (thread_id, owner, question[:40], project_id, dump(project_ids), case_id, label, now(), now()))
+                con.execute('INSERT INTO workspace_chat_threads(id,owner_hash,title,project_id,project_ids,case_id,context_label,created_at,updated_at,user_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                    (thread_id, owner, question[:40], project_id, dump(project_ids), case_id, label, now(), now(), current().id if current() else None))
             turn_id = uid()
             con.execute('INSERT INTO workspace_chat_turns(id,thread_id,owner_hash,request_id,question,created_at) VALUES(?,?,?,?,?,?)',
                 (turn_id, thread_id, owner, request_id, question, now()))
@@ -210,6 +233,11 @@ class WorkspaceChat:
         return {'thread_id': row['thread_id']}
 
     def check_task(self, task):
+        if task.get('user_id'):
+            person = user_principal(self.db, task['user_id'])
+            check_thread_scope(self.db, {**task, 'case_id': task.get('context_case_id')}, person)
+            if not person.admin and 'manager' not in person.projects.values():
+                raise DomainError('项目管理权限已变化，对话已停止', 403)
         self.memory.check_context(task)
         row = self.db.one('SELECT state FROM workspace_chat_turns WHERE id=?', (task['id'],))
         if self._stop.is_set() or not row or row['state'] != 'running':
@@ -229,12 +257,22 @@ class WorkspaceChat:
             task = dict(row)
             thread = con.execute('SELECT * FROM workspace_chat_threads WHERE id=?', (task['thread_id'],)).fetchone()
             task.update(project_ids=thread['project_ids'], context_case_id=thread['case_id'], project_id=thread['project_id'],
-                kind='chat', input={'text': task['question']}, source_message_id='', chat_id='')
+                user_id=thread['user_id'], kind='chat', input={'text': task['question']}, source_message_id='', chat_id='')
             con.execute("UPDATE workspace_chat_turns SET state='running',progress='正在理解问题',started_at=?,model=? WHERE id=?", (now(), self.db.setting('recognition', {}).get('model', ''), task['id']))
         self._execute(task)
         return True
 
     def _execute(self, task):
+        if task.get('user_id') and not task.get('_acting_as_user'):
+            try:
+                person = user_principal(self.db, task['user_id'])
+            except DomainError as exc:
+                with self.db.tx() as con:
+                    con.execute("UPDATE workspace_chat_turns SET state='failed',error=?,finished_at=? WHERE id=?", (str(exc), now(), task['id']))
+                return
+            task['_acting_as_user'] = True
+            with acting_as(person):
+                return self._execute(task)
         started, answer, error, steps = time.monotonic(), '', None, []
         usage = {'requests': 0, 'prompt_tokens': 0, 'completion_tokens': 0}
         context = None

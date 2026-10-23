@@ -217,4 +217,8 @@ def test_plan_exposes_suggestions_without_writing_draft_or_bypassing_stage_lock(
         con.execute("UPDATE cases SET workflow_stage='repair' WHERE id=?", (case['id'],))
     locked = platform.preview(case['id'], 'survey')
     assert not locked['access']['editable'] and locked['field_suggestions'] == {}
-    assert platform.preview(case['id'], 'repair')['field_suggestions'] == {}
+    repair = platform.preview(case['id'], 'repair')
+    assert set(repair['field_suggestions']) == {'approachStartWorkDate'}
+    assert '北京时间' in repair['field_suggestions']['approachStartWorkDate']['source']
+    assert 'approachStartWorkDate' not in repair['draft']['values']
+    assert db.all('SELECT * FROM platform_drafts') == before

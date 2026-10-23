@@ -225,10 +225,13 @@ class AgentMemory:
                 raise DomainError('参考记忆或来源资料已更改，请重新发送问题', 409)
 
     def view_scope(self, owner, thread_id=None, project_id=None, case_id=None):
+        from .identity import require_project
+        from .workspace_scope import check_thread_scope
         if thread_id:
             thread = self.db.one('SELECT * FROM workspace_chat_threads WHERE id=? AND owner_hash=?', (thread_id, owner))
             if not thread:
                 raise DomainError('对话不存在或不属于当前浏览器', 404)
+            check_thread_scope(self.db, thread)
             if (project_id and project_id != thread['project_id']) or (case_id and case_id != thread['case_id']):
                 raise DomainError('记忆范围与当前对话不一致', 409)
             return json.loads(thread['project_ids']), thread['case_id'], thread
@@ -237,7 +240,9 @@ class AgentMemory:
             if project_id and project_id != case['project_id']:
                 raise DomainError('案件不属于所选项目')
             project_id = case['project_id']
-        projects = [project_id] if project_id else [p['id'] for p in self.db.all('SELECT id FROM projects ORDER BY name,id')]
+        if project_id:
+            require_project(project_id)
+        projects = [project_id] if project_id else [p['id'] for p in self.domain.projects()]
         if any(not self.db.one('SELECT id FROM projects WHERE id=?', (p,)) for p in projects):
             raise DomainError('项目不存在', 404)
         return projects, case_id, None

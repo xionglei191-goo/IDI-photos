@@ -4,7 +4,9 @@ import ProjectWorkspace from './ProjectWorkspace';
 
 function Workspace() {
   const { person } = useAuth();
-  return person.system_role === 'admin' ? <DashboardApp /> : <ProjectWorkspace key={JSON.stringify(person.projects)} />;
+  const key = JSON.stringify([person.id, person.system_role, person.projects]);
+  return person.system_role === 'admin' || Object.values(person.projects).includes('manager')
+    ? <DashboardApp key={key} /> : <ProjectWorkspace key={key} />;
 }
 export default function App() {
   return <AuthGate><Workspace /></AuthGate>;

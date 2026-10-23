@@ -10,6 +10,7 @@ WORKFLOW_STEP = {'pending_intake': 0, 'insurer_review': 1, 'survey': 2, 'repair'
 
 
 def stage_access(case, stage):
+    from .identity import current as identity
     current = case['workflow_stage']
     editable = EDITABLE_FORM.get(current) == stage
     active_form = EDITABLE_FORM.get(current)
@@ -28,5 +29,8 @@ def stage_access(case, stage):
             mode, reason = 'completed', f'{FORM_LABELS[stage]}已完成，本环节仅供查看。'
         elif current in WORKFLOW_STEP and FORM_STEP[stage] > WORKFLOW_STEP[current]:
             mode, reason = 'future', '本案尚未进入此环节，完成前置流程后才能办理。'
+    person = identity()
+    if editable and person and not person.allows(case.get('project_id'), manage=True):
+        editable, mode, reason = False, 'read_only', '你在本项目为成员，可查看和上传资料；业务办理由项目管理员核对。'
     return {'editable': editable, 'mode': mode, 'reason': reason, 'active_stage': active_form,
             'active_label': FORM_LABELS.get(active_form, ''), 'workflow_stage': current}

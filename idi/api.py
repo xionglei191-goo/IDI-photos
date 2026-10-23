@@ -276,8 +276,11 @@ def create_app(settings: Settings | None = None):
     @app.get("/api/system")
     def system():
         if current() and not current().admin:
+            recognition = recognizer.status()
             return {"version": __version__, "stages": STAGES, "roles": ROLES, "photo_groups": PHOTO_GROUPS,
                     "case_statuses": STATUSES, "workflow_stages": WORKFLOW_STAGES,
+                    "recognition": {k: recognition[k] for k in ('vision_ready', 'local_ocr_available')},
+                    "worker_enabled": settings.worker_enabled,
                     "max_file_mb": settings.max_file_bytes // 1024 // 1024}
         return {"version": __version__, "data_dir": str(settings.data_dir), "local_only": settings.local_only, "deployment": settings.deployment,
                 "listen_host": settings.host, "lan_urls": settings.lan_urls, "lan_subnets": list(settings.lan_subnets) if not settings.local_only else [],

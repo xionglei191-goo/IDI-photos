@@ -52,21 +52,22 @@ export function chatIdentity() {
   return identity;
 }
 
-export function readChatSelection(): ChatSelection | null {
-  for (const source of [readStorage('sessionStorage', SELECTION), readStorage('localStorage', SELECTION), readCookie(SELECTION)]) {
+export function readChatSelection(owner = ''): ChatSelection | null {
+  const selection = SELECTION + (owner ? '-' + owner : ''), lastThread = LAST_THREAD + (owner ? '-' + owner : '');
+  for (const source of [readStorage('sessionStorage', selection), readStorage('localStorage', selection), readCookie(selection)]) {
     try {
       const value = JSON.parse(source || 'null');
       if (value && typeof value.threadId === 'string' && (!value.threadId || VALID_THREAD.test(value.threadId)) &&
         typeof value.scope === 'string' && /^(all|(?:project|case):[a-f0-9]{32})$/.test(value.scope)) return value;
     } catch { /* Try another backup, then the pre-upgrade thread pointer. */ }
   }
-  const threadId = stored(LAST_THREAD);
+  const threadId = stored(lastThread);
   return VALID_THREAD.test(threadId) ? { threadId, scope: 'all' } : null;
 }
-export function saveChatSelection(value: ChatSelection) {
-  save(SELECTION, JSON.stringify(value));
-  save(LAST_THREAD, value.threadId);
+export function saveChatSelection(value: ChatSelection, owner = '') {
+  save(SELECTION + (owner ? '-' + owner : ''), JSON.stringify(value));
+  save(LAST_THREAD + (owner ? '-' + owner : ''), value.threadId);
 }
 // This is tab state: opening a second tab should not force the dialog open.
-export function readChatOpen() { return readStorage('sessionStorage', OPEN) === '1'; }
-export function saveChatOpen(value: boolean) { writeStorage('sessionStorage', OPEN, value ? '1' : ''); }
+export function readChatOpen(owner = '') { return readStorage('sessionStorage', OPEN + (owner ? '-' + owner : '')) === '1'; }
+export function saveChatOpen(value: boolean, owner = '') { writeStorage('sessionStorage', OPEN + (owner ? '-' + owner : ''), value ? '1' : ''); }

@@ -1,3 +1,4 @@
+import usePermissions from './usePermissions';
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { ArrowUp, BookOpen, Check, ChevronRight, Clock3, FileText, LoaderCircle, MessageCircle, Plus, Square, X } from 'lucide-react';
 import { api, ApiError, message } from './api';
@@ -17,8 +18,10 @@ export default function WorkspaceChat({ projects, currentCase, projectId, openCa
   projects: Project[]; currentCase?: Case; projectId: string;
   openCase: (caseId: string) => Promise<void>; openSettings: () => void;
 }) {
-  const [identity] = useState(chatIdentity), [selection] = useState(readChatSelection);
-  const [open, setOpen] = useState(readChatOpen), [history, setHistory] = useState(false);
+  const { person, isAdmin } = usePermissions();
+  const storageOwner = isAdmin ? '' : person.id;
+  const [identity] = useState(chatIdentity), [selection] = useState(() => readChatSelection(storageOwner));
+  const [open, setOpen] = useState(() => readChatOpen(storageOwner)), [history, setHistory] = useState(false);
   const [memoryOpen, setMemoryOpen] = useState(false);
   const [threadId, setThreadId] = useState(selection?.threadId || ''), [thread, setThread] = useState<Thread | null>(null);
   const [restoring, setRestoring] = useState(!selection), [missingThread, setMissingThread] = useState('');
@@ -34,7 +37,7 @@ export default function WorkspaceChat({ projects, currentCase, projectId, openCa
   const refresh = useCallback(() => setRevision(v => v + 1), []);
   const selectThread = useCallback((id: string, nextScope = 'all') => {
     scopeChosen.current = true;
-    saveChatSelection({ threadId: id, scope: nextScope });
+    saveChatSelection({ threadId: id, scope: nextScope }, storageOwner);
     setRestoring(false); setMissingThread(''); setThreadError(''); setRecoveryNotice('');
     setThreadId(id); setThread(null); setScope(nextScope); nearEnd.current = true;
   }, []);
@@ -75,11 +78,11 @@ export default function WorkspaceChat({ projects, currentCase, projectId, openCa
       if (abort.signal.aborted) return;
       setThread(value); setScope(scopeOf(value)); setLoading(false); setThreadError('');
       unavailableThreads.current.delete(value.id);
-      saveChatSelection({ threadId: value.id, scope: scopeOf(value) });
+      saveChatSelection({ threadId: value.id, scope: scopeOf(value) }, storageOwner);
     }).catch(e => {
       if (!abort.signal.aborted) {
         setThreadError(message(e)); setLoading(false);
-        if (e instanceof ApiError && e.status === 404) { unavailableThreads.current.add(threadId); setMissingThread(threadId); }
+        if (e instanceof ApiError && [403, 404].includes(e.status)) { unavailableThreads.current.add(threadId); setMissingThread(threadId); }
       }
     });
     return () => abort.abort();
@@ -92,7 +95,7 @@ export default function WorkspaceChat({ projects, currentCase, projectId, openCa
   }, [active?.id, index?.active?.id, refresh]);
 
   useEffect(() => {
-    saveChatOpen(open);
+    saveChatOpen(open, storageOwner);
     const element = dialog.current;
     if (open) {
       if (element && !element.open) element.showModal();
@@ -144,7 +147,7 @@ export default function WorkspaceChat({ projects, currentCase, projectId, openCa
     setSending(true); setError(''); setHistory(false); nearEnd.current = true;
     try {
       const result = await request<{ thread_id: string }>('/turns', { method: 'POST', body: JSON.stringify({ ...payload, request_id: pendingRequest.current.id }) });
-      saveChatSelection({ threadId: result.thread_id, scope: selectedScope });
+      saveChatSelection({ threadId: result.thread_id, scope: selectedScope }, storageOwner);
       setThreadId(result.thread_id); setRestoring(false); setDraft(''); pendingRequest.current = null; refresh();
     } catch (e) { setError(message(e)); }
     finally { setSending(false); input.current?.focus(); }

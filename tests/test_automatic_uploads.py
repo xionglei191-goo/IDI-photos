@@ -9,7 +9,10 @@ from tests.test_platform_preparation import platform, enter_stage, draft_data, r
 from tests.test_feishu_agent import bot, capture, task_for
 
 
-def setup_flow(services, platform, case, photo, monkeypatch):
+def setup_flow(services, platform, case, photo, monkeypatch, *, quiet_seconds=0):
+    # Existing workflow tests isolate the downstream save/confirmation behavior.
+    # The dedicated quiet-window tests exercise the production 300-second wait.
+    monkeypatch.setattr('idi.automatic_uploads.PROPOSAL_QUIET_SECONDS', quiet_seconds)
     platform.test_survey.update(buildingFileInfoList=[], houseFileInfoList=[], fileInfoList=[], defectDesc='')
     enter_stage(platform, case['id'], 'survey')
     platform.client.write_enabled = True
