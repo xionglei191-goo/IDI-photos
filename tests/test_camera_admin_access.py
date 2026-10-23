@@ -92,10 +92,30 @@ def test_remote_camera_management_requires_system_admin(remote_camera_app, role)
             'name': '不应配对', 'user_id': worker['id'], 'project_ids': [project['id']],
         }).status_code == expected
         assert client.delete('/api/camera/admin/devices/missing').status_code == expected
+        assert client.delete('/api/camera/admin/devices/missing/record').status_code == expected
         assert client.put('/api/camera/admin/official/config', json={'enabled': False}).status_code == expected
         for action in ('retry', 'report'):
             assert client.post('/api/camera/admin/official/device/capture/' + action, json={}).status_code == expected
     assert not app.state.services['db'].all('SELECT * FROM camera_pairings')
+
+
+def test_delete_requires_revocation_and_preserves_disabled_credentials(client, services, project, admin_user):
+    camera = services['mobile_camera']
+    device = camera.pair(camera.create_pairing({
+        'name': '待删除手机', 'user_id': admin_user['id'], 'project_ids': [project['id']],
+    })['code'])
+    path = '/api/camera/admin/devices/' + device['device_id']
+    assert client.delete(path + '/record').status_code == 409
+    assert client.delete(path + '/record', headers={'X-IDI-Request': ''}).status_code == 403
+    assert client.delete(path).status_code == 200
+    assert device['device_id'] in [d['id'] for d in client.get('/api/camera/admin').json()['devices']]
+    assert client.delete(path + '/record').json() == {'deleted': True}
+    assert device['device_id'] not in [d['id'] for d in client.get('/api/camera/admin').json()['devices']]
+    assert client.get('/api/camera/cases', headers={'Authorization': 'Bearer ' + device['token']}).status_code == 401
+    assert client.delete(path + '/record').status_code == 404
+    row = services['db'].one('SELECT * FROM camera_devices WHERE id=?', (device['device_id'],))
+    assert row['deleted_at'] and row['revoked_at']
+    assert services['db'].one("SELECT * FROM audit WHERE entity_type='camera_device' AND entity_id=? AND action='delete'", (device['device_id'],))
 
 
 def test_remote_pairing_keeps_origin_and_project_checks(remote_camera_app):

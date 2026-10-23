@@ -25,14 +25,18 @@ class JobRunner:
     def register(self, kind: str, handler: Callable):
         self.handlers[kind] = handler
 
-    def enqueue(self, kind: str, payload: dict):
+    def enqueue(self, kind: str, payload: dict, *, result: dict | None = None):
         if kind not in self.handlers:
             raise DomainError("任务类型未注册")
         job_id = uid()
         person = current()
         with self.db.tx() as con:
-            con.execute("INSERT INTO jobs(id,kind,payload,created_at,user_id) VALUES(?,?,?,?,?)", (job_id, kind, dump(payload), now(), person.id if person else None))
-        self._wake.set()
+            con.execute("INSERT INTO jobs(id,kind,payload,created_at,user_id,state,result,finished_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (job_id, kind, dump(payload), now(), person.id if person else None,
+                         'completed' if result is not None else 'queued', dump(result) if result is not None else None,
+                         now() if result is not None else None))
+        if result is None:
+            self._wake.set()
         return self.get(job_id)
 
     def get(self, job_id):

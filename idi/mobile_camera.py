@@ -290,7 +290,7 @@ def camera_routes(service):
     @router.get('/api/camera/admin')
     def admin(request: Request):
         camera_admin()
-        devices = service.db.all('SELECT d.id,d.name,d.project_ids,d.created_at,d.last_seen_at,d.revoked_at,d.user_id,u.display_name AS user_name FROM camera_devices d LEFT JOIN idi_users u ON u.id=d.user_id ORDER BY d.created_at DESC')
+        devices = service.db.all('SELECT d.id,d.name,d.project_ids,d.created_at,d.last_seen_at,d.revoked_at,d.user_id,u.display_name AS user_name FROM camera_devices d LEFT JOIN idi_users u ON u.id=d.user_id WHERE d.deleted_at IS NULL ORDER BY d.created_at DESC')
         for device in devices:
             device['project_ids'] = json.loads(device['project_ids'])
         return {'projects': service.projects(), 'devices': devices, 'users': service.access.users() if service.access else [],
@@ -310,6 +310,21 @@ def camera_routes(service):
                 raise DomainError('设备不存在或已停用', 404)
             audit(con, 'camera_device', device_id, 'revoke')
         return {'revoked': True}
+
+    @router.delete('/api/camera/admin/devices/{device_id}/record')
+    def delete_device(device_id: str, request: Request):
+        camera_admin()
+        with service.db.tx() as con:
+            device = con.execute('SELECT * FROM camera_devices WHERE id=? AND deleted_at IS NULL', (device_id,)).fetchone()
+            if not device:
+                raise DomainError('设备不存在或已删除', 404)
+            if not device['revoked_at']:
+                raise DomainError('请先停用手机连接，再删除设备', 409)
+            stamp = now()
+            con.execute('UPDATE camera_devices SET deleted_at=? WHERE id=?', (stamp, device_id))
+            audit(con, 'camera_device', device_id, 'delete',
+                  before={'name': device['name'], 'revoked_at': device['revoked_at']}, after={'deleted_at': stamp})
+        return {'deleted': True}
 
     @router.post('/api/camera/pair')
     def pair(data: dict = Body(...)):

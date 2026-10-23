@@ -12,6 +12,7 @@ interface UploadItem {
   project_name: string; title: string; review_id: string | null; save_review_id: string | null;
   notification?: ReviewNotification | null;
   detail: { reason?: string; issues?: string[]; pending_count?: number; pending_reasons?: string[]; saved_count?: number; files?: { label: string; count: number }[];
+    pending_fields?: { field: string; label: string; message: string }[];
     filled_fields?: { field: string; label: string; value: string; source: string; needs_review: boolean }[];
     field_notes?: { label: string; reason: string }[]; other_stage_count?: number };
 }
@@ -64,7 +65,7 @@ export default function AutomaticUploads({ currentCase, cases = [], openCase, le
         setData(next); setError('');
         const fresh = view === 'proposals' ? next.items.filter(i => i.enabled && i.state === 'awaiting_confirmation' && i.review_id && !seen.current.has(i.review_id)) : [];
         fresh.forEach(i => seen.current.add(i.review_id!));
-        if (fresh.length) notify(`${fresh[0].short_code || fresh[0].platform_report_code} 的${fresh[0].stage === 'survey' ? '查勘' : '修复成果'}资料已备齐，请核对拟提交信息${fresh.length > 1 ? `，另有 ${fresh.length - 1} 案待确认` : ''}`);
+        if (fresh.length) notify(`${fresh[0].short_code || fresh[0].platform_report_code} 的${fresh[0].stage === 'survey' ? '查勘' : '修复成果'}照片已齐，请核对拟提交信息${fresh.length > 1 ? `，另有 ${fresh.length - 1} 案待确认` : ''}`);
       } catch (e) { if (alive) setError(message(e)); } finally { loading = false; }
     }
     void poll(); const timer = window.setInterval(() => void poll(), 3000);
@@ -94,7 +95,7 @@ export default function AutomaticUploads({ currentCase, cases = [], openCase, le
   if (suppressed || (view === 'proposals' && !ready.length)) return null;
   if (view === 'policy') return <section aria-label="自动保存设置" className="settings-card">
     <h3><CloudUpload size={17} aria-hidden="true" />照片上传与官网草稿</h3>
-    <p>按本环节逐步上传、保存。资料齐全后显示拟提交事项，由管理人员确认正式提交。</p>
+    <p>按本环节逐步上传、保存并自动填写。照片齐全后显示拟提交事项，由管理人员核对、补齐待确认字段后确认提交。</p>
     {data ? <label className="check"><input type="checkbox" aria-label="启用自动上传" disabled={busy} checked={data.policy.enabled} onChange={() => void toggle()} />自动上传并保存官网草稿</label> : <p>正在读取设置…</p>}
     {data && <><label className="check"><input type="checkbox" aria-label="飞书核对提醒" disabled={busy} checked={!!data.policy.notify_review_ready} onChange={() => void toggleNotifications()} />资料齐备待核对时，在飞书群 @ 项目负责人</label><p className="muted">使用“项目跟进”中已绑定的群和负责人，同一份拟提交资料只提醒一次。请先启用自动上传；未绑定负责人的项目会显示待绑定提示。</p></>}
     <ErrorBox error={error} />
@@ -105,7 +106,7 @@ export default function AutomaticUploads({ currentCase, cases = [], openCase, le
     {view === 'proposals' && <><div className="upload-summary"><FileCheck2 size={18} aria-hidden="true" /><strong>拟提交</strong><span className="upload-summary-copy">资料已保存，等待管理人员确认提交</span><span className="grow" /><strong className="upload-ready-count">{ready.length} 案待确认</strong></div>
     {ready.map(item => <article key={item.case_id} className="upload-case upload-case-ready">
       <div className="upload-case-main"><div className="row wrap"><button className="text-button upload-case-code" onClick={() => openCase(item.case_id)}>{item.short_code || item.platform_report_code}</button><span className="upload-stage">{(item.stage || item.workflow_stage) === 'survey' ? '查勘' : '修复成果'}</span><span className="upload-state">待管理人员确认</span></div>
-        <p>本环节资料已保存，核对后正式提交。</p>
+        <p>{item.detail.pending_fields?.length ? `照片已齐，待确认：${item.detail.pending_fields.map(f => f.label).join('、')}。` : '本环节资料已保存，核对后正式提交。'}</p>
         {!!item.detail.files?.length && <small>{item.detail.files.map(f => `${f.label} ${f.count}`).join(' · ')}</small>}
         {item.notification && <div className="upload-notification"><small role="status">{notificationText(item.notification)}</small>
           {item.notification.state === 'failed' && <button className="text-button" disabled={busy} onClick={() => void resolveNotification(item.notification!)}>重试飞书提醒</button>}

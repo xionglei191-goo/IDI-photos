@@ -18,7 +18,10 @@ def workflow_routes(workflow, reviews):
 
     @router.post('/sync')
     def sync(data: dict = Body(default={})):
-        return workflow.synchronizer.enqueue('full')
+        resume_id = data.get('resume_id')
+        if resume_id is not None and (not isinstance(resume_id, str) or not resume_id):
+            raise DomainError('请提供需要继续的同步批次编号')
+        return workflow.synchronizer.enqueue('full', resume_id=resume_id)
 
     @router.put('/sync/policy')
     def sync_policy(data: dict = Body(...)):
@@ -61,7 +64,11 @@ def workflow_routes(workflow, reviews):
     def confirm(review_id: str, data: dict = Body(...)):
         if data.get('acknowledged') is not True:
             raise DomainError('请先核对本次全部字段和所选文件')
-        return reviews.confirm(review_id, data.get('fingerprint'), data.get('local_only') is True, data.get('action', 'submit'))
+        return reviews.confirm(review_id, data.get('fingerprint'), data.get('local_only') is True, data.get('action', 'submit'), data.get('values'))
+
+    @router.post('/reviews/{review_id}/preview')
+    def preview_review(review_id: str, data: dict = Body(...)):
+        return reviews.preview_edits(review_id, data.get('fingerprint'), data.get('values', {}))
 
     @router.post('/reviews/{review_id}/readback')
     def readback(review_id: str):

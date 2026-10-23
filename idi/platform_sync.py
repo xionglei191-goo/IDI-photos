@@ -251,13 +251,46 @@ class PlatformSync:
     def _list_only(snapshot):
         return remote_stage(snapshot) in ('settlement', 'closed')
 
+    def require_snapshot_source(self, con, link, snapshot, session):
+        """Allow company reads of this project's readback, never arbitrary accounts.
+
+        Called under material_lock and the same transaction that saves the read,
+        so account edits and local case reassignment cannot bypass the check.
+        """
+        self._session(session)
+        previous = json.loads(link['snapshot']) if link else {}
+        if not previous.get('account') or previous['account'] == session.get('account'):
+            return
+        accounts = getattr(self.workflow.platform, 'project_accounts', None)
+        case = con.execute('''SELECT c.project_id,c.platform_report_code,p.name,p.aliases
+            FROM cases c JOIN projects p ON p.id=c.project_id WHERE c.id=?''', (link['case_id'],)).fetchone()
+        if (not accounts or self.client is not accounts.router or accounts.context.get()
+                or accounts.company.client.status() != session or not case
+                or accounts.company._config.get('username', session.get('account')) != session.get('account')
+                or accounts.binding(case['project_id'])['username'] != previous['account']):
+            raise DomainError('案件快照属于未绑定到本项目的官网账号，需人工核对后更新', 409)
+        names = {case['name'], *json.loads(case['aliases'])}
+        code, record_id = link['platform_report_code'], link['report_receiving_id']
+        if not code or case['platform_report_code'] != code:
+            raise DomainError('案件报修编号与官网关联不一致，需人工核对后更新', 409)
+        for source in (previous, snapshot):
+            row = {**source.get('claim', {}), **source.get('row', {})}
+            if (str(row.get('reportReceivingId') or '') != record_id
+                    or str(row.get('reportCode') or '').strip() != code
+                    or str(row.get('communityName') or row.get('engName') or '').strip() not in names):
+                raise DomainError('公司读取与项目办理的案件编号或项目归属不一致，需人工核对后更新', 409)
+            claim = source.get('claim', {})
+            project = claim.get('communityName') or claim.get('engName')
+            if ((claim.get('reportReceivingId') and str(claim['reportReceivingId']) != record_id)
+                    or (claim.get('reportCode') and str(claim['reportCode']).strip() != code)
+                    or (project and str(project).strip() not in names)):
+                raise DomainError('官网案件详情与清单的编号或项目归属不一致，需人工核对后更新', 409)
+
     def _item(self, item, session, run, checkpoint):
         self._session(session)
         record_id, scope, row = item['report_receiving_id'], item['scope'], json.loads(item['snapshot'])
         link = self.db.one('SELECT * FROM platform_links WHERE report_receiving_id=?', (record_id,))
         previous = json.loads(link['snapshot']) if link else {}
-        if previous.get('account') and previous['account'] != session.get('account'):
-            raise DomainError('案件快照属于另一个官网账号，需人工核对后更新', 409)
         remove_repair = False
         read_at = checkpoint.get('scans', {}).get(scope, {}).get('started_at') or now()
         if item['action'] == 'missing':
@@ -290,12 +323,15 @@ class PlatformSync:
                 list_only = run['mode'] == 'incremental' and self._list_only(list_snapshot)
             snapshot = list_snapshot if list_only else self.client.snapshot_from_row(row, scope)
             self._session(session)
-            result = self.workflow.apply_snapshot(snapshot, details_read=not list_only)
+            result = self.workflow.apply_snapshot(snapshot, details_read=not list_only, sync_session=session)
             checkpoint['created' if result['created'] else 'updated'] += 1
             case_id = result['case_id']
         else:
             case_id = link['case_id']
-        with self.db.tx() as con:
+        with self.workflow.platform.material_lock, self.db.tx() as con:
+            # Unchanged rows still need provenance validation before publication.
+            current_link = con.execute('SELECT * FROM platform_links WHERE report_receiving_id=?', (record_id,)).fetchone()
+            self.require_snapshot_source(con, current_link, list_snapshot, session)
             con.execute("UPDATE platform_sync_items SET state='done',scope=?,snapshot=?,case_id=?,error=NULL,action=? WHERE run_id=? AND report_receiving_id=?",
                 (scope, dump(row), case_id, 'missing_intake' if remove_repair else item['action'], run['id'], record_id))
             con.execute('UPDATE platform_sync_runs SET checkpoint=? WHERE id=?', (dump(checkpoint), run['id']))
@@ -376,15 +412,13 @@ class PlatformSync:
                 if row is None:
                     raise DomainError('此记录未在当前账号的对应列表中找到，请重新查询并选择案件', 404)
                 previous = json.loads(link['snapshot'])
-                if previous.get('account') and previous['account'] != session.get('account'):
-                    raise DomainError('案件快照属于另一个官网账号，需人工核对后更新', 409)
                 read_at = now()
                 snapshot = self._list_snapshot(row, 'repair', previous, session, read_at)
                 list_only = self._list_only(snapshot)
                 if not list_only:
                     snapshot = self.client.snapshot_from_row(row, 'repair')
                 self._session(session)
-                result = self.workflow.apply_snapshot(snapshot, details_read=not list_only)
+                result = self.workflow.apply_snapshot(snapshot, details_read=not list_only, sync_session=session)
                 with self.db.tx() as con:
                     self._upsert(con, 'repair', row, result['case_id'], run['id'], read_at)
                 if not list_only:

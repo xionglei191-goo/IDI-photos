@@ -23,9 +23,15 @@ export default function CaseBoard({ board, source, changeSource, projectId, buil
   const pages = Math.max(1, Math.ceil((data?.total || 0) / 30));
   useEffect(() => { if (page > pages && !result.loading) setPage(pages); }, [page, pages, result.loading]);
   return <section className="workspace board-workspace">
-    <div className="page-heading"><div><div className="eyebrow">案件工作台</div><h1>{board === 'intake' ? '理赔受理' : '查勘维修'}</h1><p>{source === 'platform' ? (board === 'intake' ? '理赔受理总清单，优先发现新案件和受理待办' : '收集、整理维修案件照片，核对官网资料并按需报送') : '本地新建及样例案件，关联官网后按官网清单展示'}</p></div><div className="row wrap"><button onClick={importFiles}><FolderInput size={16} aria-hidden="true" />导入照片</button><button onClick={create}><Plus size={16} aria-hidden="true" />新建案件</button><SyncControls value={data?.sync} fullSync={fullSync} sync={sync} refresh={refresh} notify={notify} /></div></div>
-    <div className={`board-stats ${board === 'intake' ? 'intake-stats' : ''}`}>
-      {stats.map(key => <button aria-pressed={status === key} className={`stat-card ${status === key ? 'selected' : ''}`} key={key} onClick={() => setStatus(status === key ? '' : key)}><span>{WORKFLOW_STAGES[key]}</span><strong>{data?.counts[key] || 0}</strong><small>{key === 'insurer_review' ? '直接赔付或非保险责任分支' : key === 'pending_intake' ? '等待施工 / 维保单位办理' : key === 'insurer_intake' ? '当前处理人为保险公司' : key === 'historical_unverified' ? '旧记录缺少受理结果，仅查看' : '点击查看案件'}</small></button>)}
+    <div className="page-heading board-heading">
+      <div className="board-intro"><div className="eyebrow">案件工作台</div><h1>{board === 'intake' ? '理赔受理' : '查勘维修'}</h1><p>{source === 'platform' ? (board === 'intake' ? '理赔受理总清单，优先发现新案件和受理待办' : '收集、整理维修案件照片，核对官网资料并按需报送') : '本地新建及样例案件，关联官网后按官网清单展示'}</p></div>
+      <div className={`board-stats ${board === 'intake' ? 'intake-stats' : ''}`} role="group" aria-label="案件进度筛选">
+        {stats.map(key => {
+          const hint = key === 'insurer_review' ? '直接赔付或非保险责任分支' : key === 'pending_intake' ? '等待施工 / 维保单位办理' : key === 'insurer_intake' ? '当前处理人为保险公司' : key === 'historical_unverified' ? '旧记录缺少受理结果，仅查看' : '点击查看案件';
+          return <button aria-pressed={status === key} title={`${hint}；再次点击取消筛选`} className={`stat-card ${status === key ? 'selected' : ''}`} key={key} onClick={() => setStatus(status === key ? '' : key)}><span>{WORKFLOW_STAGES[key]}</span><strong>{data?.counts[key] || 0}</strong><small className="visually-hidden">{hint}</small></button>;
+        })}
+      </div>
+      <div className="row board-actions"><button onClick={importFiles}><FolderInput size={16} aria-hidden="true" />导入照片</button><button onClick={create}><Plus size={16} aria-hidden="true" />新建案件</button><SyncControls value={data?.sync} fullSync={fullSync} sync={sync} refresh={refresh} notify={notify} /></div>
     </div>
     {!!summary?.exceptions && <div className="exception-banner"><span><b>{summary.exceptions} 项照片待确认</b> · 编号、位置或分类需要核对</span><button className="text-button" onClick={() => showPhotos('', '', 'exceptions')}>去确认 <ArrowRight size={14} /></button></div>}
     {data?.sync.latest && ['failed', 'partial'].includes(data.sync.latest.state) && <div className="notice">最近台账同步{data.sync.latest.state === 'partial' ? '部分完成' : '未完成'}：{data.sync.latest.error}。已保存的案件和照片仍可使用。</div>}

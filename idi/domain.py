@@ -130,10 +130,13 @@ class Domain:
         try:
             with self.db.tx() as con:
                 before = rowdict(con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone())
+                template_id = data.get('insurer_template_id', (before or {}).get('insurer_template_id', 'insurer-v2'))
+                if not isinstance(template_id, str) or not con.execute('SELECT id FROM templates WHERE id=?', (template_id,)).fetchone():
+                    raise DomainError('保司资料要求不存在')
                 prefix = normalize_code(data.get("short_prefix") or (before or {}).get("short_prefix") or unique_prefix(con, name, project_id))
                 if not re.fullmatch(r"[A-Z0-9]{1,16}", prefix):
                     raise DomainError("项目简称请使用1至16位英文字母或数字")
-                con.execute("INSERT INTO projects(id,name,aliases,insurer,created_at,updated_at,short_prefix) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,aliases=excluded.aliases,insurer=excluded.insurer,short_prefix=excluded.short_prefix,updated_at=excluded.updated_at", (project_id, name, dump(list(dict.fromkeys(a.strip() for a in aliases if a.strip()))), str(data.get("insurer", "")).strip(), now(), now(), prefix))
+                con.execute("INSERT INTO projects(id,name,aliases,insurer,created_at,updated_at,short_prefix,insurer_template_id) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,aliases=excluded.aliases,insurer=excluded.insurer,short_prefix=excluded.short_prefix,insurer_template_id=excluded.insurer_template_id,updated_at=excluded.updated_at", (project_id, name, dump(list(dict.fromkeys(a.strip() for a in aliases if a.strip()))), str(data.get("insurer", "")).strip(), now(), now(), prefix, template_id))
                 updated_codes = sync_project_codes(con, project_id, prefix)
                 after = rowdict(con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone())
                 audit(con, "project", project_id, "update" if before else "create", before, after)
@@ -214,6 +217,8 @@ class Domain:
                     if values.get("project_id"):
                         con.execute("UPDATE photos SET project_id=?,updated_at=?,revision=revision+1 WHERE case_id=?", (values["project_id"], now(), case_id))
                 else:
+                    if 'insurer_template_id' not in values:
+                        values['insurer_template_id'] = con.execute('SELECT insurer_template_id FROM projects WHERE id=?', (values['project_id'],)).fetchone()[0]
                     values.update(id=case_id, created_at=now(), updated_at=now())
                     con.execute("INSERT INTO cases(" + ",".join(values) + ") VALUES(" + ",".join("?" for _ in values) + ")", tuple(values.values()))
                 after = rowdict(con.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone())
@@ -423,7 +428,7 @@ class Domain:
             raise DomainError("资料要求模板不存在", 404)
         all_photos = self.db.all("SELECT p.*,b.media_type,v.visit_date,v.visit_key,v.basis FROM photos p JOIN blobs b ON b.hash=p.blob_hash LEFT JOIN visits v ON v.id=p.visit_id WHERE p.case_id=?", (case_id,))
         images = [p for p in all_photos if p["media_type"] == "image" and p['recognition_state'] != 'conflict' and (photo_ids is None or p["id"] in photo_ids)]
-        full_case = photo_ids is None or {p['id'] for p in all_photos}.issubset(set(photo_ids))
+        full_case = photo_ids is None or {p['id'] for p in all_photos if p['media_type'] == 'image'}.issubset(set(photo_ids))
         shared = {r['photo_id']: r for r in self.db.all('SELECT s.photo_id,s.visit_id,v.visit_date,v.visit_key,v.basis FROM visit_shared_checkins s JOIN visits v ON v.id=s.visit_id WHERE v.case_id=? '
                   'AND NOT EXISTS(SELECT 1 FROM photos copy WHERE copy.reuse_source_id=s.photo_id)', (case_id,))}
         # Count a shared original once in each intended use, never as two files.

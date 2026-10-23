@@ -1,6 +1,96 @@
 import { test, expect } from '@playwright/test';
 
-test.beforeEach(async ({ page }) => { await page.emulateMedia({ reducedMotion: 'reduce' }); });
+test.beforeEach(async ({ page, request }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  const auth = await (await request.get('/api/auth/status')).json();
+  expect((await request.post(auth.setup_required ? '/api/auth/setup' : '/api/auth/login', {
+    headers: { 'X-IDI-Request': '1' }, data: { username: 'upload-ui-admin', password: 'isolated-upload-ui-password', display_name: '隔离测试管理员' },
+  })).ok()).toBeTruthy();
+  await page.context().addCookies((await request.storageState()).cookies);
+});
+
+test('review edits missing and existing fields inline then submits once', async ({ page, request }, testInfo) => {
+  const headers = { 'X-IDI-Request': '1' }, confirmations: Record<string, unknown>[] = [], extraWrites: string[] = [];
+  const project = await (await request.post('/api/projects', { headers, data: { name: '照片齐全待核对项目' } })).json();
+  const item = await (await request.post('/api/cases', { headers, data: { project_id: project.id, title: '门套膨胀', building: '1', room: '203' } })).json();
+  await request.post(`/api/workflow/cases/${item.id}/result`, { headers, data: { action: 'accepted', revision: item.revision, event_at: '2026-10-23 09:47', note: '隔离测试' } });
+  const plan = await (await request.get(`/api/platform/cases/${item.id}/stages/survey`)).json();
+  const pending = [{ field: 'repairMethod', label: '维修方式', message: '缺少维修方式' }];
+  plan.review_only = true; plan.pending_fields = pending; plan.actions = [];
+  plan.values = { siteSurveyDate: '2026-10-23 09:47:00', defectDesc: '现场记录的原因', defectiveSite: '卫生间', divisionWorksCode: 'part_engineering_03', defectTypeCode: 'defect_type_other' };
+  plan.draft.values = { ...plan.values };
+  plan.business_fields = { ...plan.values, divisionWorks: '装饰装修工程', defectType: '其他' };
+  plan.write_binding = { username: 'wxdl123' };
+  plan.personnel = [{ userId: 'u1', name: '测试维修员', phone: '13800000000' }];
+  plan.issues = pending.map(p => ({ ...p, severity: 'error', code: 'required' })); plan.error_count = 1;
+  const contract = await (await request.get('/api/platform/contract')).json();
+  const costCode = contract.dictionaries.estimate_restoration_cost[0].code;
+  plan.file_fields.forEach((f: { existing: unknown[]; selected: unknown[]; label: string }, i: number) => { f.selected = []; f.existing = [{ id: `f${i}`, fileName: `${f.label}.png`, fileUrl: '/profile/example.png' }]; });
+  const review = { id: 'missing-field-review', case_id: item.id, stage: 'survey', state: 'prepared', fingerprint: 'partial-version', snapshot: plan, result: {}, write_enabled: true, connected: true, active: false, access: plan.access };
+  await page.route('**/api/workflow/uploads', route => route.fulfill({ json: { policy: { enabled: true }, connected: true, write_enabled: true, counts: { awaiting_confirmation: 1 }, items: [{
+    case_id: item.id, enabled: true, state: 'awaiting_confirmation', stage: 'survey', short_code: 'TEST-60172', review_id: review.id,
+    detail: { pending_fields: pending, files: [{ label: '楼栋打卡', count: 1 }, { label: '入户门打卡', count: 1 }, { label: '缺陷问题照片', count: 3 }] },
+  }] } }));
+  await page.route('**/api/workflow/reviews/missing-field-review', route => route.fulfill({ json: review }));
+  await page.route('**/api/workflow/reviews/missing-field-review/files/**', route => route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200"><rect width="320" height="200" fill="#e1edf0"/><text x="160" y="105" text-anchor="middle" fill="#4c6d79">测试附件</text></svg>' }));
+  let checkedPlan = plan;
+  await page.route('**/api/workflow/reviews/missing-field-review/preview', route => {
+    const values = { ...plan.values, ...route.request().postDataJSON().values };
+    const issues = plan.fields.filter((f: { key: string; kind: string; required: boolean; label: string; when?: Record<string, string[]> }) =>
+      !['files', 'readonly'].includes(f.kind) && f.required && Object.entries(f.when || {}).every(([k, allowed]) => allowed.includes(values[k])) && !values[f.key]
+    ).map((f: { key: string; label: string }) => ({ field: f.key, message: `缺少${f.label}`, severity: 'error', code: 'required' }));
+    checkedPlan = { ...plan, review_only: false, values: { ...values, repairPersonPhone: values.repairUserId ? '13800000000' : '' }, issues, error_count: issues.length,
+      actions: ['save', 'submit'], field_suggestions: { repairUserId: { value: 'u1' }, estimateRestorationCostCode: { value: costCode } } };
+    return route.fulfill({ json: checkedPlan });
+  });
+  await page.route('**/api/workflow/reviews/missing-field-review/confirm', route => {
+    confirmations.push(route.request().postDataJSON());
+    return route.fulfill({ json: { ...review, state: 'verified', snapshot: checkedPlan, result: { action: 'submit', phase: 'done' } } });
+  });
+  page.on('request', req => { if (req.method() === 'PUT' || /\/review\/survey$/.test(req.url())) extraWrites.push(req.url()); });
+  await page.goto('/');
+  const panel = page.getByRole('region', { name: '拟提交事项', exact: true });
+  await expect(panel.getByText('照片已齐，待确认：维修方式。')).toBeVisible();
+  await panel.getByRole('button', { name: '核对拟提交信息', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '现场查勘 · 预提交审核', exact: true });
+  await expect(dialog.getByText('照片已齐，以下字段仍需管理员确认')).toHaveCount(0);
+  await expect(dialog.getByText(/本次官网写入账号/)).toHaveCount(0);
+  await expect(dialog.getByRole('combobox', { name: '分部工程', exact: true })).toHaveValue('part_engineering_03');
+  const submit = dialog.getByRole('button', { name: '确认并提交', exact: true });
+  await expect(submit).toBeDisabled();
+  await expect(dialog.getByText('缺少维修方式', { exact: true })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('pending-field-review-initial.png'), fullPage: true });
+  await dialog.getByRole('combobox', { name: '维修方式', exact: true }).selectOption('3');
+  await expect(dialog.getByRole('textbox', { name: '零注拒原因', exact: true })).toBeVisible();
+  await expect(dialog.getByLabel('计划维修日期', { exact: true })).toHaveCount(0);
+  await expect(dialog.getByText('缺少零注拒原因', { exact: true })).toBeVisible();
+  await dialog.getByRole('combobox', { name: '维修方式', exact: true }).selectOption('2');
+  await expect(dialog.getByRole('listbox', { name: '维修人员', exact: true })).toHaveValues(['u1']);
+  await expect(dialog.getByRole('combobox', { name: '修复预估', exact: true })).toHaveValue(costCode);
+  await expect(dialog.getByText('缺少计划维修日期', { exact: true })).toBeVisible();
+  await dialog.getByLabel('计划维修日期', { exact: true }).fill('2026-10-24');
+  await dialog.getByRole('textbox', { name: '缺陷部位', exact: true }).fill('卫生间门套');
+  await dialog.getByRole('checkbox').check();
+  await dialog.getByRole('textbox', { name: '缺陷原因分析', exact: true }).fill('审核核实后的具体原因');
+  await expect(dialog.getByRole('checkbox')).not.toBeChecked();
+  await expect(submit).toBeDisabled();
+  await dialog.getByRole('checkbox').check();
+  await expect(submit).toBeEnabled();
+  for (const width of [1440, 390, 320]) {
+    await page.setViewportSize({ width, height: 1000 });
+    await dialog.locator('.review-identity').scrollIntoViewIfNeeded();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath(`pending-field-review-${width}.png`), fullPage: true });
+  }
+  await expect(dialog.getByRole('button', { name: '补齐待确认字段', exact: true })).toHaveCount(0);
+  expect(confirmations).toEqual([]);
+  await submit.click();
+  await expect(dialog.getByText('已正式提交 · 官网回读一致')).toBeVisible();
+  expect(confirmations).toEqual([{ acknowledged: true, fingerprint: 'partial-version', local_only: false, action: 'submit', values: {
+    repairMethod: '2', repairUserId: 'u1', estimateRestorationCostCode: costCode, planRepairDate: '2026-10-24', defectiveSite: '卫生间门套', defectDesc: '审核核实后的具体原因',
+  } }]);
+  expect(extraWrites).toEqual([]);
+});
 
 test('automatic upload control persists and proposal requires human confirmation', async ({ page, request }, testInfo) => {
   const headers = { 'X-IDI-Request': '1' }, errors: string[] = [];
@@ -36,9 +126,11 @@ test('automatic upload control persists and proposal requires human confirmation
       files: [{ label: '楼栋打卡', count: 1 }, { label: '入户门打卡', count: 1 }, { label: '缺陷问题照片', count: 1 }] } };
   const status = { policy: { enabled: true }, connected: true, write_enabled: true, counts: { awaiting_confirmation: 1 }, items: [item] };
   const review = { id: 'mock-review', case_id: c.id, stage: 'survey', state: 'prepared', fingerprint: 'checked-version', snapshot: plan, result: {}, write_enabled: true, connected: true, active: false, access: plan.access };
+  plan.issues = []; plan.error_count = 0;
   const confirmations: unknown[] = [];
   await page.route('**/api/workflow/uploads', route => route.fulfill({ json: status }));
   await page.route('**/api/workflow/reviews/mock-review', route => route.fulfill({ json: review }));
+  await page.route('**/api/workflow/reviews/mock-review/preview', route => route.fulfill({ json: plan }));
   await page.route('**/api/workflow/reviews/mock-review/confirm', route => {
     confirmations.push(route.request().postDataJSON());
     return route.fulfill({ json: { ...review, state: 'verified', result: { action: 'submit', phase: 'done' } } });
@@ -63,7 +155,7 @@ test('automatic upload control persists and proposal requires human confirmation
   await page.screenshot({ path: testInfo.outputPath('automatic-upload-review.png'), fullPage: true });
   await submit.click();
   await expect(dialog.getByText('已正式提交 · 官网回读一致')).toBeVisible();
-  expect(confirmations).toEqual([{ acknowledged: true, fingerprint: 'checked-version', local_only: false, action: 'submit' }]);
+  expect(confirmations).toEqual([{ acknowledged: true, fingerprint: 'checked-version', local_only: false, action: 'submit', values: {} }]);
   expect(errors).toEqual([]);
 });
 

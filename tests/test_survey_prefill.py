@@ -56,6 +56,19 @@ def test_multiple_visits_require_explicit_selection(evidence):
     assert '多个日期' in notes['siteSurveyDate']
 
 
+@pytest.mark.parametrize('title', ['门套膨胀', '卫生间门框发胀'])
+def test_swollen_door_trim_uses_official_categories_without_inventing_repair_arrangements(evidence, title):
+    evidence['case']['title'] = title
+    evidence['photos'] = [p for p in evidence['photos'] if p['photo_group'] in ('survey_checkin', 'survey_problem')]
+    for p in evidence['photos']:
+        p['process'] = title
+    suggested, notes = survey_suggestions(**evidence)
+    assert suggested['divisionWorksCode']['value'] == 'part_engineering_03'
+    assert suggested['defectTypeCode']['value'] == 'defect_type_other'
+    assert suggested['divisionWorksCode']['needs_review'] and suggested['defectTypeCode']['needs_review']
+    assert 'repairMethod' not in suggested and 'repairMethod' in notes
+
+
 @pytest.mark.parametrize('change', [{'recognition_state': 'conflict'}, {'recognition_state': 'failed'},
                                   {'case_id': 'another'}, {'media_type': 'video'}, {'media_type': 'document'}])
 def test_uncertain_foreign_and_non_image_files_are_not_time_evidence(evidence, change):

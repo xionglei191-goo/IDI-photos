@@ -73,7 +73,14 @@ def test_incremental_save_then_two_human_submissions_with_existing_next_stage_ph
     add('green', 'survey', 'problem')
     row = tick(auto, case['id'])
     assert len(uploads) == 3 and all(payload['state'] == 0 for _, payload in writes)
-    assert row['state'] == 'needs_fields'
+    assert row['state'] == 'awaiting_confirmation'
+    incomplete = services['reviews'].get(row['review_id'])
+    assert incomplete['snapshot']['review_only']
+    assert incomplete['snapshot']['pending_fields'] == [{'field': 'defectDesc', 'label': '缺陷原因分析', 'message': '缺少缺陷原因分析'}]
+    for action in ('save', 'submit'):
+        with pytest.raises(DomainError, match='待确认字段'):
+            services['reviews'].confirm(incomplete['id'], incomplete['fingerprint'], action=action)
+    assert all(payload['state'] == 0 for _, payload in writes)
     plan = platform.draft(case['id'], 'survey')
     platform.save_draft(case['id'], 'survey', draft_data(platform, case['id'], 'survey', {**plan['values'], 'defectDesc': '现场确认的缺陷原因'}))
     # Photos for the next phase are already in the archive before submitting survey.
@@ -85,6 +92,8 @@ def test_incremental_save_then_two_human_submissions_with_existing_next_stage_ph
     assert row['state'] == 'awaiting_confirmation', row
     assert len(uploads) == 3
     review = services['reviews'].get(row['review_id'])
+    assert not review['snapshot'].get('review_only')
+    assert services['reviews'].get(incomplete['id'])['state'] == 'stale'
     assert client.post(f"/api/workflow/reviews/{review['id']}/confirm", json={'fingerprint': review['fingerprint']}).status_code == 400
     result = client.post(f"/api/workflow/reviews/{review['id']}/confirm", json={'acknowledged': True, 'fingerprint': review['fingerprint']})
     assert result.status_code == 200 and result.json()['state'] == 'verified', result.text
@@ -99,6 +108,20 @@ def test_incremental_save_then_two_human_submissions_with_existing_next_stage_ph
     assert services['domain'].case(case['id'])['workflow_stage'] == 'acceptance'
     assert tick(auto, case['id'])['state'] == 'waiting_stage'
     assert len(uploads) == 6 and [p['state'] for _, p in writes].count(1) == 2
+
+
+def test_incomplete_review_requires_all_files_and_rejects_invalid_business_values(platform, services, case, photo, monkeypatch):
+    auto, add, _, _, _ = setup_flow(services, platform, case, photo, monkeypatch)
+    add('red', 'survey', 'building_checkin')
+    tick(auto, case['id'])
+    with pytest.raises(DomainError, match='资料待补或待核对'):
+        services['reviews'].snapshot(case['id'], 'survey', review_only=True)
+    add('blue', 'survey', 'door_checkin')
+    add('green', 'survey', 'problem')
+    data = draft_data(platform, case['id'], 'survey', {'siteSurveyDate': 'not-an-actual-date'})
+    platform.save_draft(case['id'], 'survey', data)
+    with pytest.raises(DomainError, match='资料待补或待核对'):
+        services['reviews'].snapshot(case['id'], 'survey', review_only=True)
 
 
 def test_new_photo_invalidates_proposal_before_rules_process_it(platform, services, case, photo, monkeypatch):

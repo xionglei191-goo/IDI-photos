@@ -109,7 +109,7 @@ class Workflow:
         con.execute("INSERT INTO settings VALUES('platform_lists',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (dump({'run_id': run_id, 'read_at': read_at, 'coverage': 'full', 'counts': {k: len(v) for k, v in lists.items()}}),))
 
-    def apply_snapshot(self, snapshot, case_id=None, *, details_read=True):
+    def apply_snapshot(self, snapshot, case_id=None, *, details_read=True, sync_session=None):
         row = {**snapshot.get('claim', {}), **snapshot.get('row', {})}
         record_id = str(row.get('reportReceivingId') or '')
         code = str(row.get('reportCode') or '').strip()
@@ -121,8 +121,10 @@ class Workflow:
             raise DomainError('官网流程状态尚未识别，保留原案件进度等待核对', 409)
         stamp = now()
         read_at = snapshot.get('fetched_at') or stamp
-        with self.db.tx() as con:
-            current_link = con.execute('SELECT case_id,verified_at,snapshot FROM platform_links WHERE report_receiving_id=?', (record_id,)).fetchone()
+        with self.platform.material_lock, self.db.tx() as con:
+            current_link = con.execute('SELECT * FROM platform_links WHERE report_receiving_id=?', (record_id,)).fetchone()
+            if sync_session is not None:
+                self.synchronizer.require_snapshot_source(con, current_link, snapshot, sync_session)
             current_snapshot = json.loads(current_link['snapshot']) if current_link else {}
             latest_read = max((current_link['verified_at'] or '') if current_link else '', current_snapshot.get('list_verified_at') or '')
             if latest_read > read_at:
@@ -140,7 +142,7 @@ class Workflow:
             title = str(row.get('accidentDesc') or row.get('issueDescription') or '报修内容待核对').strip()[:2000]
             insurer = str(row.get('insuraceCompany') or '')
             if not previous:
-                project = con.execute('SELECT id FROM projects WHERE name=?', (project_name,)).fetchone()
+                project = con.execute('SELECT id,insurer_template_id FROM projects WHERE name=?', (project_name,)).fetchone()
                 if project:
                     project_id = project['id']
                 else:
@@ -149,6 +151,7 @@ class Workflow:
                                 (project_id, project_name, '[]', insurer, stamp, stamp, unique_prefix(con, project_name, project_id)))
                 case_id = uid()
                 values = {'id': case_id, 'project_id': project_id, 'platform_report_code': code,
+                          'insurer_template_id': project['insurer_template_id'] if project else 'insurer-v2',
                           'policy_number': str(row.get('policyNum') or ''), 'report_number': str(row.get('reportNumber') or '') or None,
                           'title': title, 'insurer': insurer, 'contact_name': str(row.get('reportContact') or ''),
                           'contact_phone': str(row.get('reportContactPhone') or ''), **location,

@@ -5,7 +5,6 @@ import zipfile
 from copy import deepcopy
 
 import pytest
-from openpyxl import load_workbook
 
 from idi.db import Database, dump, uid
 from idi.domain import DomainError, GROUP_FIELDS
@@ -154,6 +153,7 @@ def test_original_date_change_does_not_rewrite_the_work_copy(services, case, pho
 
 def test_export_preserves_entry_records_gaps_and_one_copy_per_original(services, case, photo):
     domain = services['domain']
+    domain.save_case({'platform_report_code': 'ZLBH202610132005010577'}, case['id'])
     photos = materials(photo)
     first = record(domain, case, photos)
     second = domain.save_visit(case['id'], entry(visit_key='下午返场', started_at=None, finished_at=None, same_day_repair=False, notes='=HYPERLINK("unsafe")'))
@@ -165,11 +165,10 @@ def test_export_preserves_entry_records_gaps_and_one_copy_per_original(services,
     with zipfile.ZipFile(services['storage'].resolve(package['zip_path'])) as archive:
         for p in manifest['photos']:
             assert hashlib.sha256(archive.read(p['package_path'])).hexdigest() == p['blob_hash']
-        workbooks = [f for f in archive.namelist() if f.endswith('.xlsx')]
-        workbook = load_workbook(io.BytesIO(archive.read(workbooks[0])))
-        sheet = workbook['进场维修记录']
-        assert sheet.max_row == 3 and sheet['G3'].data_type == 's'
-        assert '楼栋.png' in sheet['I2'].value
+        assert len([f for f in archive.infolist() if not f.is_dir()]) == 6
+        assert not any(name.endswith(('.xlsx', '.json', '.docx', '.txt')) for name in archive.namelist())
+    assert next(v for v in manifest['visits'] if v['id'] == second['id'])['notes'] == '=HYPERLINK("unsafe")'
+    assert manifest['visits'][0]['shared_checkin_ids']
     frozen = deepcopy(manifest)
     domain.save_visit(case['id'], entry(visit_key='第一次进场', revision=first['revision'], notes='后改说明'), first['id'])
     assert services['reporter'].package(package['id'])['manifest'] == frozen

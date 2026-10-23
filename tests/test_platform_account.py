@@ -213,14 +213,63 @@ def test_login_single_flight_status_responsive_and_edits_rejected(account, monke
         release.set(); restored._attempt_thread.join(timeout=2)
 
 
-def test_temporary_login_does_not_get_replaced_by_saved_account(account, monkeypatch):
+@pytest.mark.parametrize('username,password', [('temporary-user', 'temporary-password'), (USER, 'new-temporary-password')])
+def test_temporary_login_does_not_get_replaced_but_saved_auto_connect_survives_restart(account, monkeypatch, username, password):
+    restored = configured(account)
+    saved = restored.store.path.read_bytes()
+    calls = fake_login(restored, monkeypatch)
+    restored.temporary_login(username, password)
+    assert restored.status()['auto_connect'] and restored.status()['automatic_paused']
+    assert restored.status()['state'] == 'temporary'
+    restored.client.logout(); restored.tick()
+    assert calls == [(username, password)]
+    restored.stop()
+    fresh_client = PlatformClient(httpx.MockTransport(lambda _: pytest.fail('no HTTP request expected')))
+    restarted = PlatformAccount(restored.platform, restored.store.path.parent.parent, client=fresh_client)
+    try:
+        restarted_calls = fake_login(restarted, monkeypatch)
+        restarted.tick()
+        assert restarted_calls == [(USER, PASSWORD)]
+        assert restarted.status()['state'] == 'connected' and restarted.status()['auto_connect']
+        assert not restarted.status()['automatic_paused']
+        assert restarted.store.path.read_bytes() == saved
+    finally:
+        restarted.stop(); fresh_client.close()
+
+
+def test_manual_login_with_saved_credentials_keeps_automatic_reconnect(account, monkeypatch):
+    restored = configured(account)
+    saved = restored.store.path.read_bytes()
+    calls = fake_login(restored, monkeypatch)
+    restored.temporary_login(' ' + USER + ' ', PASSWORD)
+    assert restored.status()['auto_connect'] and not restored.status()['automatic_paused']
+    restored.client.logout(); restored.tick()
+    assert calls == [(' ' + USER + ' ', PASSWORD), (USER, PASSWORD)]
+    assert restored.store.path.read_bytes() == saved
+
+
+def test_failed_temporary_login_preserves_saved_block_and_automatic_preference(account, monkeypatch):
+    restored = configured(account)
+    calls = fake_login(restored, monkeypatch, DomainError('rejected', 401))
+    restored.tick()
+    saved = restored.store.path.read_bytes()
+    state = dict(restored._state)
+    with pytest.raises(DomainError):
+        restored.temporary_login('temporary-user', 'temporary-password')
+    restored.tick()
+    assert len(calls) == 2
+    assert restored._state == state and restored.status()['state'] == 'needs_attention'
+    assert restored.status()['auto_connect'] and restored.store.path.read_bytes() == saved
+
+
+def test_explicit_saved_account_reconnect_ends_temporary_override(account, monkeypatch):
     restored = configured(account)
     calls = fake_login(restored, monkeypatch)
     restored.temporary_login('temporary-user', 'temporary-password')
-    assert not restored.status()['auto_connect']
-    restored.client.logout(); restored.tick()
-    assert calls == [('temporary-user', 'temporary-password')]
-    assert restored.store.load()['username'] == USER
+    restored.request_connect()
+    restored._attempt_thread.join(timeout=2)
+    assert calls == [('temporary-user', 'temporary-password'), (USER, PASSWORD)]
+    assert restored.status()['state'] == 'connected' and not restored.status()['automatic_paused']
 
 
 @pytest.mark.parametrize('status', [503, 504])

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -31,6 +32,7 @@ from .recognition import Recognizer
 from .project_followup import ProjectFollowup
 from .followup_routes import followup_routes
 from .reports import Reporter
+from .default_packages import DefaultPackages
 from .storage import Storage, safe_name
 from .workflow import Workflow
 from .workflow_routes import workflow_routes
@@ -110,6 +112,7 @@ def create_app(settings: Settings | None = None):
     jobs.register("backup", reporter.backup)
     jobs.register("archive_tree", archive_tree.process)
     jobs.register("platform_sync", workflow.sync)
+    default_packages = DefaultPackages(db, domain, reporter, jobs)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -119,6 +122,7 @@ def create_app(settings: Settings | None = None):
             official_camera.start()
             project_accounts.start()
             jobs.start()
+            default_packages.start()
             workflow.synchronizer.start()
             connectors.start()
             archive_tree.start()
@@ -145,6 +149,7 @@ def create_app(settings: Settings | None = None):
         case_agent.stop()
         followup.stop()
         connectors.stop()
+        default_packages.stop()
         jobs.stop()
         archive_tree.stop()
         platform.client.close()
@@ -159,6 +164,7 @@ def create_app(settings: Settings | None = None):
     app.state.services['model_runtime'] = recognizer.runtime
     app.state.services['photo_workflow'] = photo_workflow
     app.state.services['automatic_uploads'] = automatic_uploads
+    app.state.services['default_packages'] = default_packages
     app.state.services['review_notifications'] = review_notifications
     app.include_router(automatic_upload_routes(automatic_uploads))
     app.state.services['case_agent'] = case_agent
@@ -536,6 +542,22 @@ def create_app(settings: Settings | None = None):
     def templates():
         return domain.templates()
 
+    @app.get('/api/cases/{case_id}/picc-record')
+    def picc_record(case_id: str):
+        return reporter.picc.get(case_id)
+
+    @app.get('/api/cases/{case_id}/default-package')
+    def default_package(case_id: str):
+        return default_packages.get(case_id)
+
+    @app.post('/api/cases/{case_id}/default-package')
+    def retry_default_package(case_id: str):
+        return default_packages.retry(case_id)
+
+    @app.put('/api/cases/{case_id}/picc-record')
+    def save_picc_record(case_id: str, data: dict = Body(...)):
+        return reporter.picc.save(case_id, data)
+
     @app.post("/api/templates")
     def create_template(data: dict = Body(...)):
         return domain.save_template(data)
@@ -556,12 +578,7 @@ def create_app(settings: Settings | None = None):
 
     @app.post("/api/packages")
     def create_package(data: dict = Body(...)):
-        ids = photo_ids(data)
-        preview = reporter.preview(ids, data.get("template_id", "general"))
-        if data.get("parent_id") and len(preview["cases"]) != 1:
-            raise DomainError("补件请每次选择一个案件")
-        package_ids = {g["case"]["id"]: uid() for g in preview["cases"]}
-        return jobs.enqueue("export", {"photo_ids": ids, "template_id": data.get("template_id", "general"), "parent_id": data.get("parent_id"), "title": data.get("title", ""), "package_ids": package_ids, "groups": [{"case": {"id": g["case"]["id"]}, "photo_ids": g["photo_ids"]} for g in preview["cases"]]})
+        return reporter.enqueue_export(jobs, photo_ids(data), data.get('template_id', 'general'), data.get('parent_id'), data.get('title', ''))
 
     @app.get("/api/packages")
     def packages(case_id: str | None = None):
@@ -573,17 +590,38 @@ def create_app(settings: Settings | None = None):
         result.pop("zip_path", None)
         return result
 
+    @app.delete("/api/packages/{package_id}")
+    def delete_package(package_id: str, data: dict = Body(...)):
+        return reporter.delete(package_id, data.get('expected_token'))
+
     @app.get("/api/packages/{package_id}/download")
     def download_package(package_id: str):
         package = reporter.package(package_id)
+        if package['manifest'].get('format') == 'picc-record-v1':
+            return download_record(package_id)
         if package["state"] in ("building", "failed"):
             raise DomainError("资料包尚未生成完成", 409)
         path = storage.resolve(package["zip_path"])
         if not path.is_file():
             raise DomainError("报送文件缺失", 404)
         case = package["manifest"]["case"]
-        filename = safe_name(case["project_name"] + "-" + case["title"], 100) + f"-v{package['version']}.zip"
+        filename = (package['manifest'].get('root_directory') or safe_name(case["project_name"] + "-" + case["title"], 100)) + f"-v{package['version']}.zip"
         return FileResponse(path, media_type="application/zip", filename=filename)
+
+    @app.get('/api/packages/{package_id}/document')
+    def download_record(package_id: str):
+        package = reporter.package(package_id)
+        manifest = package['manifest']
+        if not package['document_url']:
+            raise DomainError('本版本没有可下载的记录表', 404)
+        path = storage.resolve('exports/' + package_id + '/' + manifest['document_path'])
+        if not path.is_file():
+            raise DomainError('记录表文件缺失，请重新生成', 404)
+        with path.open('rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != manifest.get('document_export', {}).get('sha256'):
+                raise DomainError('记录表文件校验失败，请重新生成', 409)
+        filename = manifest['root_directory'] + f"-v{package['version']}.docx"
+        return FileResponse(path, media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document', filename=filename)
 
     @app.post("/api/packages/{package_id}/events")
     def package_event(package_id: str, data: dict = Body(...)):

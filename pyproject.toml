@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "idi-case-archive"
-version = "0.2.41"
+version = "0.2.53"
 description = "IDI case photo archive and reporting workbench"
 requires-python = ">=3.11"
 dependencies = [
@@ -28,7 +28,7 @@ test = ["pytest>=8,<10"]
 include = ["idi*"]
 
 [tool.setuptools.package-data]
-idi = ["migrations/*.sql", "platform_dictionary.json", "camera_setup.html"]
+idi = ["migrations/*.sql", "templates/*.docx", "platform_dictionary.json", "camera_setup.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

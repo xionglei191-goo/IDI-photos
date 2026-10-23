@@ -5,7 +5,7 @@ import json
 import threading
 from contextlib import contextmanager
 
-from .db import dump, now, uid
+from .db import audit, dump, now, uid
 from .domain import DomainError
 from .platform_contract import VERSION
 from .platform_client import PlatformWriteError
@@ -33,15 +33,29 @@ class ReviewBatches:
             with self._active_lock:
                 self._active.discard(review_id)
 
+    @staticmethod
+    def review_blockers(plan):
+        """A proposal may await business fields, but never missing/invalid files."""
+        business_keys = {f['key'] for f in plan['fields'] if f['kind'] not in ('files', 'readonly')}
+        return [i for i in plan['issues'] if i['severity'] == 'error'
+                and not (i.get('code') == 'required' and i['field'] in business_keys)]
+
     @scoped_case()
-    def snapshot(self, case_id, stage, *, save_only=False):
+    def snapshot(self, case_id, stage, *, save_only=False, review_only=False):
         plan = self.platform.preview(case_id, stage)
+        return self._snapshot(plan, save_only=save_only, review_only=review_only)
+
+    def _snapshot(self, plan, *, save_only=False, review_only=False):
+        stage = plan['stage']
         case = plan['case']
         if not plan['access']['editable']:
             raise DomainError(plan['access']['reason'] + '请先刷新案件进度。', 409)
         if save_only and stage not in ('survey', 'repair'):
             raise DomainError('当前环节不支持逐步保存官网草稿', 409)
-        if self.platform.validation_errors(plan, allow_incomplete=save_only):
+        if review_only and (save_only or stage not in ('survey', 'repair')):
+            raise DomainError('当前环节不支持待补字段的拟提交审核', 409)
+        errors = self.review_blockers(plan) if review_only else self.platform.validation_errors(plan, allow_incomplete=save_only)
+        if errors:
             raise DomainError(f"当前环节还有 {plan['error_count']} 项资料待补或待核对", 409)
         selected = []
         for field in plan['file_fields']:
@@ -65,11 +79,17 @@ class ReviewBatches:
         if save_only:
             fingerprint_data['save_only'] = True
             plan = {**plan, 'actions': ['save'], 'save_only': True}
+        if review_only:
+            fingerprint_data['review_only'] = True
+            labels = {f['key']: f['label'] for f in plan['fields']}
+            pending = [{'field': i['field'], 'label': labels.get(i['field'], i['field']), 'message': i['message']}
+                       for i in plan['issues'] if i['severity'] == 'error']
+            plan = {**plan, 'actions': [], 'review_only': True, 'pending_fields': pending}
         fingerprint = hashlib.sha256(dump(fingerprint_data).encode()).hexdigest()
         return plan, fingerprint
 
-    def prepare(self, case_id, stage, expected_revision, *, save_only=False):
-        plan, fingerprint = self.snapshot(case_id, stage, save_only=save_only)
+    def prepare(self, case_id, stage, expected_revision, *, save_only=False, review_only=False):
+        plan, fingerprint = self.snapshot(case_id, stage, save_only=save_only, review_only=review_only)
         if expected_revision != plan['draft']['revision']:
             raise DomainError('草稿已经修改，请重新打开审核预览', 409)
         review_id = uid()
@@ -93,13 +113,87 @@ class ReviewBatches:
         return row
 
     @scoped_record('platform_review_batches', 'review_confirmation')
-    def confirm(self, review_id, fingerprint, local_only=False, action='submit'):
+    def confirm(self, review_id, fingerprint, local_only=False, action='submit', values=None):
         from .identity import current
         if getattr(self.platform, 'project_accounts', None) and not local_only and action != 'save' and current() is None:
             raise DomainError('正式提交须由登录的 IDI 系统管理员或本项目管理员核对确认', 403)
         with self._execution(review_id), self.platform.material_lock:
+            if values is not None:
+                fingerprint = self._apply_edits(review_id, fingerprint, values, local_only, action)
             self._confirm(review_id, fingerprint, local_only, action)
         return self.get(review_id)
+
+    def _edit_plan(self, review_id, fingerprint, values):
+        record = self.get(review_id)
+        if record['fingerprint'] != fingerprint or record['state'] not in ('prepared', 'reviewed', 'failed'):
+            raise DomainError('核对资料已变化或已执行，请重新打开审核', 409)
+        snapshot = record['snapshot']
+        _, current_fingerprint = self.snapshot(record['case_id'], record['stage'],
+            save_only=bool(record['save_only']), review_only=bool(snapshot.get('review_only')))
+        if fingerprint != current_fingerprint:
+            raise DomainError('核对后字段、选材或官网状态发生变化，请重新审核；本次未保存或提交', 409)
+        if self.automatic_uploads:
+            self.automatic_uploads.validate_submission(record)
+        patch, _ = self.platform._normalize(record['case_id'], record['stage'], {'values': values})
+        data = {'values': {**snapshot['draft']['values'], **patch}, 'files': snapshot['draft']['files']}
+        return record, patch, self.platform.preview(record['case_id'], record['stage'], data)
+
+    @scoped_record('platform_review_batches')
+    def preview_edits(self, review_id, fingerprint, values):
+        with self.platform.material_lock:
+            return self._edit_plan(review_id, fingerprint, values)[2]
+
+    def _apply_edits(self, review_id, fingerprint, values, local_only, action):
+        # Keep the human-approved values and original version together. Retrying
+        # the same request after a lost response must not submit a second time.
+        request = {'fingerprint': fingerprint, 'values': values, 'action': action, 'local_only': local_only}
+        with self.db.tx() as con:
+            record = self.get(review_id)
+            if record['snapshot'].get('inline_confirmation') == request:
+                return record['fingerprint']
+            record, patch, plan = self._edit_plan(review_id, fingerprint, values)
+            if action not in plan['actions'] or record['save_only'] and action != 'save':
+                raise DomainError('此核对记录不支持所选官网操作', 403)
+            errors = self.platform.validation_errors(plan, allow_incomplete=bool(record['save_only']))
+            if errors:
+                raise DomainError('；'.join(i['message'] for i in errors), 409)
+            from .platform_prefill import canonical_value
+            fields = {f['key']: f for f in plan['fields']}
+            patch = {k: v for k, v in patch.items() if canonical_value(fields[k], v) !=
+                     canonical_value(fields[k], record['snapshot']['values'].get(k))}
+            if not patch and not record['snapshot'].get('review_only'):
+                return fingerprint
+            draft = plan['draft']
+            stamp = now()
+            new_draft = {**draft, 'values': {**draft['values'], **patch}, 'revision': draft['revision'] + 1,
+                         'target_report_id': plan['link']['report_receiving_id'], 'updated_at': stamp}
+            # Compute the post-edit guard while all other material still matches
+            # the reviewed version. New photos and concurrent edits remain guarded.
+            guard = self.automatic_uploads.signature(record['case_id'], proposal=True,
+                draft_override={'stage': record['stage'], 'revision': new_draft['revision'],
+                                'target_report_id': new_draft['target_report_id']}) if self.automatic_uploads else ''
+            plan['draft'] = new_draft
+            for key in patch:
+                plan['field_sources'][key] = {'origin': 'manual', 'value': patch[key], 'source': '审核时人工修改',
+                    'photo_ids': [], 'needs_review': False, 'current': True, 'stale': False}
+            plan, updated_fingerprint = self._snapshot(plan, save_only=bool(record['save_only']))
+            plan['inline_confirmation'] = request
+            con.execute('INSERT INTO platform_drafts VALUES(?,?,?,?,?,?,?) ON CONFLICT(case_id,stage) DO UPDATE SET '
+                        'values_json=excluded.values_json,revision=excluded.revision,updated_at=excluded.updated_at',
+                (record['case_id'], record['stage'], dump(new_draft['values']), dump(draft['files']),
+                 new_draft['target_report_id'], new_draft['revision'], stamp))
+            for key in patch:
+                con.execute("INSERT INTO platform_draft_field_sources VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(case_id,stage,field) DO UPDATE SET origin='manual',value=excluded.value,source=excluded.source,photo_ids='[]',needs_review=0,input_signature='',updated_at=excluded.updated_at",
+                    (record['case_id'], record['stage'], key, 'manual', patch[key], '审核时人工修改', '[]', 0, '', stamp))
+            con.execute('UPDATE platform_review_batches SET fingerprint=?,snapshot=? WHERE id=?',
+                        (updated_fingerprint, dump(plan), review_id))
+            if self.automatic_uploads:
+                con.execute('UPDATE automatic_upload_cases SET review_guard=? WHERE case_id=? AND review_id=?',
+                            (guard, record['case_id'], review_id))
+            audit(con, 'platform_draft', record['case_id'], 'review_edit',
+                  before={'review_id': review_id, 'fingerprint': fingerprint, 'revision': draft['revision']},
+                  after={'values': patch, 'fingerprint': updated_fingerprint, 'revision': new_draft['revision'], 'remote_written': False})
+            return updated_fingerprint
 
     @scoped_record('platform_review_batches', 'automatic_save')
     def save_for_agent(self, review_id, fingerprint, check_permission=None):
@@ -128,6 +222,8 @@ class ReviewBatches:
         if check_permission:
             check_permission()
         record = self.get(review_id)
+        if record['snapshot'].get('review_only'):
+            raise DomainError('本次拟提交信息仍有待确认字段，请补齐后重新审核提交', 409)
         save_only = bool(record.get('save_only'))
         if save_only and action != 'save':
             raise DomainError('本记录仅用于逐步保存草稿，请重新核对完整资料后提交', 403)

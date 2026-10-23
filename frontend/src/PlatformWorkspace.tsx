@@ -26,7 +26,7 @@ export function LoginDialog({ close, connected, configure }: { close: () => void
     finally { setPassword(''); setBusy(false); }
   }
   return <Modal title="连接官网" close={() => { if (!busy) close(); }} footer={<><button disabled={busy} onClick={close}>关闭</button><button className="primary" type="submit" form="platform-login" disabled={busy || !username || !password}>{busy ? '正在通过官网正常登录…' : '连接官网'}</button></>}>
-    <p className="notice">这里用于临时登录。需要重启后自动连接时，请在“系统设置 → 连接与收图”保存系统账号。临时登录会暂停已设置的自动连接。</p>
+    <p className="notice">这里用于临时登录，不会改动已保存的账号和自动连接设置。使用不同账号或密码时，本次服务运行期间暂停自动重连；重启后按已保存的设置恢复。需要长期使用时，请在“系统设置 → 连接与收图”保存账号。</p>
     {configure && <button className="space-bottom" disabled={busy} onClick={configure}><LockKeyhole size={15} aria-hidden="true" />设置系统账号与自动连接</button>}
     <ErrorBox error={error} /><form id="platform-login" className="form-grid" onSubmit={submit} autoComplete="off">
       <label>官网账号<input value={username} onChange={e => setUsername(e.target.value)} disabled={busy} autoComplete="off" /></label>

@@ -98,16 +98,18 @@ class AutomaticUploads:
                 'company_connected': bool(company_connected), 'project_connections': project_connections,
                 'can_configure_project_accounts': person is None or person.admin}
 
-    def signature(self, case_id, *, proposal=False):
+    def signature(self, case_id, *, proposal=False, draft_override=None):
         from .project_accounts import case_context
         with case_context(self.platform, case_id):
-            return self._signature(case_id, proposal=proposal)
+            return self._signature(case_id, proposal=proposal, draft_override=draft_override)
 
-    def _signature(self, case_id, *, proposal=False):
+    def _signature(self, case_id, *, proposal=False, draft_override=None):
         case = self.domain.case(case_id)
         photos = self.db.all('SELECT p.id,p.revision,p.blob_hash,p.stage,p.role,p.photo_group,p.recognition_state,sc.visit_id AS shared_checkin_visit_id,r.dirty,r.identity,r.state,r.photo_revision FROM photos p LEFT JOIN photo_pipeline r ON r.photo_id=p.id LEFT JOIN visit_shared_checkins sc ON sc.photo_id=p.id WHERE p.case_id=? ORDER BY p.id', (case_id,))
-        data = [PREFILL_RULES_VERSION, self.rules.case_signature(case), photos, self.platform.prefill_defaults(),
-                self.db.all('SELECT stage,revision,target_report_id FROM platform_drafts WHERE case_id=? ORDER BY stage', (case_id,)),
+        drafts = self.db.all('SELECT stage,revision,target_report_id FROM platform_drafts WHERE case_id=? ORDER BY stage', (case_id,))
+        if draft_override:
+            drafts = sorted([d for d in drafts if d['stage'] != draft_override['stage']] + [draft_override], key=lambda d: d['stage'])
+        data = [PREFILL_RULES_VERSION, self.rules.case_signature(case), photos, self.platform.prefill_defaults(), drafts,
                 self.db.all('SELECT stage,field,photo_id,photo_revision,blob_hash,target_report_id FROM platform_manual_file_selections WHERE case_id=? ORDER BY stage,field,photo_id', (case_id,)),
                 self.platform.link(case_id)['revision']]
         if getattr(self.platform, 'project_accounts', None):
@@ -328,12 +330,14 @@ class AutomaticUploads:
             pending = self.db.all("SELECT p.id,r.reason FROM photos p JOIN blobs b ON b.hash=p.blob_hash LEFT JOIN photo_pipeline r ON r.photo_id=p.id WHERE p.case_id=? AND b.media_type='image' AND (p.stage=? OR p.stage='unknown' OR (?='repair' AND p.stage='acceptance')) AND (r.identity IS NULL OR r.identity='unverified' OR r.state IN ('needs_check','storage_error') OR r.dirty=1 OR r.photo_revision<>p.revision)", (case_id, 'survey' if stage == 'survey' else 'work', stage))
             issues = [i['message'] for i in plan['issues'] if i['severity'] == 'error']
             detail = {**self._detail(plan, prefill['plan'].get('field_suggestion_notes', {})), 'pending_count': len(pending)}
-            if issues or pending:
+            if self.reviews.review_blockers(plan) or pending:
                 reason = '已保存可用照片；补齐资料后生成拟提交信息' if detail['saved_count'] else '已自动填写可确定字段；等待补齐本环节资料' if detail['filled_fields'] else '等待本环节照片及必要资料'
                 return self._record(case_id, 'needs_fields', {**detail, 'reason': reason,
                     'pending_reasons': list(dict.fromkeys(p.get('reason') or '照片用途待核对' for p in pending))}, guard=guard)
-            proposal = self.reviews.prepare(case_id, stage, plan['draft']['revision'])
-            return self._record(case_id, 'awaiting_confirmation', {**detail, 'reason': '资料已齐，请核对拟提交信息；确认后正式提交'},
+            proposal = self.reviews.prepare(case_id, stage, plan['draft']['revision'], review_only=bool(issues))
+            return self._record(case_id, 'awaiting_confirmation', {**detail,
+                'pending_fields': proposal['snapshot'].get('pending_fields', []),
+                'reason': '照片已齐，请核对自动填写内容并补齐待确认字段' if issues else '资料已齐，请核对拟提交信息；确认后正式提交'},
                 review_id=proposal['id'], guard=guard)
 
     def start(self):

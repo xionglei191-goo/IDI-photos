@@ -7,9 +7,52 @@ import httpx
 import pytest
 
 from idi.domain import DomainError
+from idi.api import create_app
+from idi.config import Settings
 from idi.identity import acting_as
 from idi.platform_client import PlatformClient, PlatformWriteError
 from tests.test_project_access import make_person
+
+
+def test_service_restart_restores_company_and_all_registered_project_logins(services, project, monkeypatch):
+    accounts = services['project_accounts']
+    second = services['domain'].save_project({'name': '重启恢复项目'})
+    disabled = services['domain'].save_project({'name': '保留手动连接项目'})
+    accounts.company.configure({'username': 'restart-company', 'password': 'company-password', 'auto_connect': False})
+    for item in (project, second, disabled):
+        accounts.configure(item['id'], {'username': 'writer-' + item['id'], 'password': 'project-password',
+                                       'auto_connect': False, 'enabled': item != disabled})
+    # Simulate already saved automatic preferences without making any real website request.
+    for account in (accounts.company, accounts.account(project['id']), accounts.account(second['id'])):
+        account.store.save({**account.store.load(), 'auto_connect': True})
+    original = {a.store.path: a.store.path.read_bytes() for a in (accounts.company, *accounts.accounts.values())}
+    accounts.router.close()
+    fresh = create_app(Settings(services['settings'].data_dir, worker_enabled=False)).state.services['project_accounts']
+    logins, ready = [], threading.Event()
+
+    def login(client, username, password):
+        client._token, client._account = 'restart-test-token', username
+        logins.append((username, password))
+        if len(logins) == 3:
+            ready.set()
+        return client.status()
+
+    monkeypatch.setattr(PlatformClient, 'login', login)
+    try:
+        assert len(fresh.accounts) == 3 and fresh.company.client is not accounts.company.client
+        fresh.start()
+        assert ready.wait(3)
+        assert set(logins) == {('restart-company', 'company-password'),
+                              ('writer-' + project['id'], 'project-password'),
+                              ('writer-' + second['id'], 'project-password')}
+        assert fresh.company.status()['session']['connected']
+        assert fresh.account(project['id']).status()['session']['connected']
+        assert fresh.account(second['id']).status()['session']['connected']
+        assert not fresh.account(disabled['id']).status()['auto_connect']
+        assert not fresh.enabled(disabled['id'])
+    finally:
+        fresh.router.close()
+    assert all(path.read_bytes() == raw for path, raw in original.items())
 
 
 def configured(services, project_id, name, requests, *, fail=False):

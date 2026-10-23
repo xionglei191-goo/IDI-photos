@@ -14,7 +14,7 @@ export function dateTime(value: string | null | undefined) { if (!value) return 
 export function bytes(n: number) { return n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`; }
 export function place(value: { building?: string | null; unit?: string | null; room?: string | null; location_detail?: string | null }) { return [value.building ? `${value.building}栋` : '', value.unit ? `${value.unit}单元` : '', value.room || '', value.location_detail || ''].filter(Boolean).join(' ') || '位置待补充'; }
 export function inputDate(value: string | null | undefined) { return value ? value.replace(' ', 'T').slice(0, 16) : ''; }
-export function useData<T>(path: string | null, revision = 0) {
+export function useData<T>(path: string | null, revision: number | string = 0) {
   const [data, setData] = useState<T | null>(null), [loading, setLoading] = useState(true), [error, setError] = useState('');
   useEffect(() => { if (!path) { setLoading(false); return; } const abort = new AbortController(); setLoading(true); setError(''); api<T>(path, { signal: abort.signal }).then(value => { setData(value); setLoading(false); }).catch(e => { if (!abort.signal.aborted) { setError(message(e)); setLoading(false); } }); return () => abort.abort(); }, [path, revision]);
   return { data, loading, error };

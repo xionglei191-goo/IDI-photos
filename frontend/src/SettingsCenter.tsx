@@ -72,7 +72,7 @@ export default function SettingsCenter(props: Props) {
       <div className="settings-content">
         <div className="settings-section-heading"><h2>{section.label}</h2><p>{section.hint}</p></div>
         {target.section === 'access' && <AccessSettings projects={projects} notify={notify} initialProjectId={target.projectId} focusProjectAccount={!!target.projectId} />}
-        <div hidden={target.section !== 'connections'}><PlatformAccountSettings refresh={refresh} notify={notify} registerLeave={registerAccountLeave} /></div>
+        {target.section === 'connections' && <PlatformAccountSettings refresh={refresh} notify={notify} registerLeave={registerAccountLeave} />}
         {target.section === 'connections' && <><section className="settings-card" aria-label="IDI 水印相机"><h3>IDI 水印相机</h3><p>安卓相机通过今日官方 Android 原生 SDK 拍摄，原片上传到电脑归档，不自动提交保司。本地验真为可选项，默认关闭；拍摄前需联网并允许相机和精确定位。</p><div className="row wrap"><a className="button" href="/camera/download">下载安卓安装包</a><a className="button" href="/camera-setup" target="_blank" rel="noreferrer">管理手机连接</a></div><p className="muted">系统管理员登录后可在此管理手机连接，选择人员和项目并生成配对码。</p></section><Connections embedded projects={projects} cases={cases} revision={revision} refresh={refresh} notify={notify} /></>}
         {target.section === 'automation' && <AutomaticSettings {...props} />}
         {target.section === 'materials' && <div className="settings-subnav" role="group" aria-label="资料管理分类">{[['projects', '项目管理'], ['templates', '资料要求'], ['archive', '资料目录']].map(([tab, label]) => <button key={tab} aria-pressed={materialTab === tab} onClick={() => navigate({ section: 'materials', tab })}>{label}</button>)}</div>}
@@ -81,7 +81,7 @@ export default function SettingsCenter(props: Props) {
           {taskTab === 'runtime' && <RuntimeStatus login={login} settings={() => navigate({ section: 'recognition' })} channels={() => navigate({ section: 'connections' })} />}
           {taskTab === 'jobs' && <JobsWorkspace embedded jobs={jobs} refresh={refresh} notify={notify} />}
         </>}
-        <div hidden={!hasExistingPanel}><SettingsWorkspace embedded initialTab={existingTab} system={system} projects={projects} revision={revision} refresh={refresh} notify={notify} editProject={editProject} newProject={newProject} registerLeave={registerWorkspaceLeave} /></div>
+        {hasExistingPanel && <SettingsWorkspace embedded initialTab={existingTab} system={system} projects={projects} revision={revision} refresh={refresh} notify={notify} editProject={editProject} newProject={newProject} registerLeave={registerWorkspaceLeave} />}
         {target.section === 'backup' && <p className="settings-help"><Archive size={15} aria-hidden="true" />备份包含案件、照片原件和报送记录。</p>}
       </div>
     </div>

@@ -1,7 +1,12 @@
 import { test, expect } from '@playwright/test';
 
-test('proposal shows Feishu delivery and supports failure recovery without submitting', async ({ page }, testInfo) => {
+test('proposal shows Feishu delivery and supports failure recovery without submitting', async ({ page, request }, testInfo) => {
   await page.emulateMedia({ reducedMotion: 'reduce' });
+  const auth = await (await request.get('/api/auth/status')).json();
+  expect((await request.post(auth.setup_required ? '/api/auth/setup' : '/api/auth/login', {
+    headers: { 'X-IDI-Request': '1' }, data: { username: 'upload-ui-admin', password: 'isolated-upload-ui-password', display_name: '隔离测试管理员' },
+  })).ok()).toBeTruthy();
+  await page.context().addCookies((await request.storageState()).cookies);
   const notification = { id: 'notification-1', state: 'failed', name: '项目负责人', chat_name: '项目照片收集群', error: '负责人已不在群中，请重新绑定。' };
   const status = {
     policy: { enabled: true, notify_review_ready: true }, connected: true, write_enabled: true,

@@ -3,6 +3,10 @@ import { test, expect } from '@playwright/test';
 test('automatic fields explain their evidence and do not overwrite a dirty form', async ({ page, request }, testInfo) => {
   await page.emulateMedia({ reducedMotion: 'reduce' });
   const headers = { 'X-IDI-Request': '1' }, errors: string[] = [];
+  const auth = await (await request.get('/api/auth/status')).json();
+  expect((await request.post(auth.setup_required ? '/api/auth/setup' : '/api/auth/login', { headers,
+    data: { username: 'upload-ui-admin', password: 'isolated-upload-ui-password', display_name: '隔离测试管理员' } })).ok()).toBeTruthy();
+  await page.context().addCookies((await request.storageState()).cookies);
   page.on('pageerror', e => errors.push(e.message));
   const project = await (await request.post('/api/projects', { headers, data: { name: '自动填字段验收项目', short_prefix: 'FILL' } })).json();
   const item = await (await request.post('/api/cases', { headers, data: { project_id: project.id, title: '主卧卫生间瓷砖破裂，卫生间反臭', building: 'A3', room: '3001' } })).json();

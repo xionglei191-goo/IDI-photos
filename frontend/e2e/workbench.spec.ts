@@ -26,6 +26,12 @@ async function externalResult(page: Page, result: string) {
 }
 
 test('create case, upload, review, select, export, receive, and restore saved views', async ({ page, request }, testInfo) => {
+  const auth = await (await request.get('/api/auth/status')).json();
+  const login = await request.post(auth.setup_required ? '/api/auth/setup' : '/api/auth/login', {
+    headers, data: { username: 'upload-ui-admin', password: 'isolated-upload-ui-password', display_name: '隔离测试管理员' },
+  });
+  expect(login.ok()).toBeTruthy();
+  await page.context().addCookies((await request.storageState()).cookies);
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');
@@ -37,10 +43,12 @@ test('create case, upload, review, select, export, receive, and restore saved vi
   await expect(dialog).toHaveCount(0);
   await page.getByRole('button', { name: '新建案件', exact: true }).first().click();
   dialog = page.getByRole('dialog');
+  await dialog.getByRole('combobox', { name: '所属项目', exact: true }).selectOption({ label: '浏览器验收项目' });
   await dialog.getByLabel('案件内容', { exact: true }).fill('客厅油漆起皮');
   await dialog.getByLabel('栋号', { exact: true }).fill('1');
   await dialog.getByLabel('房号 / 区域').fill('201');
   await dialog.getByLabel('维修部位', { exact: true }).fill('客厅沙发旁');
+  await dialog.getByLabel('报修编号（平台）', { exact: true }).fill('ZLBH202610132005010577');
   await expect(dialog.getByText('资料编号', { exact: true })).toHaveCount(0);
   await dialog.getByRole('button', { name: '保存案件' }).click();
   await expect(dialog).toHaveCount(0);
@@ -81,7 +89,10 @@ test('create case, upload, review, select, export, receive, and restore saved vi
   await expect(dialog).toHaveCount(0);
   await page.getByRole('button', { name: '提取所选', exact: true }).click();
   dialog = page.getByRole('dialog');
-  await expect(dialog.getByText('所选1项资料，涉及1个案件。每案生成独立版本，保留本次内容快照。')).toBeVisible();
+  await expect(dialog.getByText(/^打包1张照片，涉及1个案件/)).toBeVisible();
+  await expect(dialog.getByText('父文件夹：浏览器验收项目-1-201-客厅油漆起皮-ZLBH202610132005010577')).toBeVisible();
+  await expect(dialog.getByText(/目录：查勘照片/)).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('photo-package-preview.png'), fullPage: true });
   await dialog.getByRole('button', { name: '生成ZIP资料包', exact: true }).click();
   await expect(page.getByRole('link', { name: '下载', exact: true })).toBeVisible();
   const downloaded = page.waitForEvent('download');
@@ -94,7 +105,7 @@ test('create case, upload, review, select, export, receive, and restore saved vi
   await dialog.getByLabel('说明', { exact: true }).fill('验收测试：资料收件');
   await dialog.getByLabel('回执附件', { exact: true }).setInputFiles({ name: '回执.txt', mimeType: 'text/plain', buffer: Buffer.from('received') });
   await dialog.getByRole('button', { name: '保存记录', exact: true }).click();
-  await expect(page.getByText('已接收', { exact: true })).toBeVisible();
+  await expect(page.locator('.reporting-table').getByText('已接收', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: '客厅油漆起皮', exact: true }).click();
   dialog = page.getByRole('dialog');
   await expect(dialog.getByRole('link', { name: '下载回执附件', exact: true })).toBeVisible();

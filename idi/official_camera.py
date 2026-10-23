@@ -437,10 +437,18 @@ def official_camera_routes(service):
     @router.get('/api/camera/admin/official')
     def admin(request: Request):
         camera_admin()
-        rows = service.db.all('SELECT * FROM camera_official_captures ORDER BY created_at DESC LIMIT 100')
-        return {'config': service.settings.status(), 'captures': [
-            {**service.receipt(row), 'device_id': row['device_id'], 'case_number': json.loads(row['metadata'])['case_number']}
-            for row in rows if not row['archived_at'] or row['photo_id']]}
+        rows = service.db.all('''SELECT c.*,d.name AS device_name FROM camera_official_captures c
+            LEFT JOIN camera_devices d ON d.id=c.device_id
+            WHERE c.archived_at IS NULL OR c.photo_id IS NOT NULL
+            ORDER BY c.created_at DESC,c.device_id,c.capture_id DESC LIMIT 100''')
+        captures = []
+        for row in rows:
+            meta = json.loads(row['metadata'])
+            captures.append({**service.receipt(row), 'device_id': row['device_id'],
+                             'device_name': row['device_name'] or '未知终端',
+                             'case_number': meta['case_number'], 'photo_group': meta.get('photo_group', ''),
+                             'stage_label': GROUP_LABELS.get(meta.get('photo_group'), '未知阶段')})
+        return {'config': service.settings.status(), 'captures': captures}
 
     @router.put('/api/camera/admin/official/config')
     def configure(request: Request, data: dict = Body(...)):

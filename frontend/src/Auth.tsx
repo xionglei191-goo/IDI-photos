@@ -90,7 +90,7 @@ export function PersonMenu() {
     catch (e) { setError(message(e)); }
     finally { setOldPassword(''); setPassword(''); setBusy(false); }
   }
-  return <><details className="action-menu"><summary aria-label="人员账号">{person.display_name}</summary>
+  return <><details className="action-menu person-menu"><summary aria-label="人员账号" title={person.display_name}>{person.display_name}</summary>
     <div><span className="muted">{person.system_role === 'admin' ? '系统管理员' : '项目人员'} · {person.username}</span>
       <button onClick={() => { setError(''); setEditing(true); }}>修改密码</button>
       <button onClick={() => void logout().catch(e => setError(message(e)))}>退出登录</button>

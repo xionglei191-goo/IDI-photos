@@ -62,7 +62,7 @@ class ReviewNotifications:
             raise DomainError('拟提交记录已变更或正在办理，提醒已取消。', 409)
         if row['review_guard'] != self.automatic.signature(case_id, proposal=True):
             raise DomainError('案件资料已变化，等待重新生成拟提交信息。', 409)
-        plan, fingerprint = self.reviews.snapshot(case_id, row['stage'])
+        plan, fingerprint = self.reviews.snapshot(case_id, row['stage'], review_only=bool(record['snapshot'].get('review_only')))
         if record['fingerprint'] != fingerprint or plan['case']['workflow_stage'] != row['stage']:
             raise DomainError('当前环节或拟提交内容已变化，提醒已取消。', 409)
         return row, plan
@@ -85,7 +85,11 @@ class ReviewNotifications:
         files = [f'{plain(f["label"])} {len(f["existing"])} 项' for f in plan['file_fields'] if f['existing']]
         if files:
             lines.append('已保存：' + '；'.join(files))
-        lines.append('本环节资料已收集并保存，请在 IDI 工作台的“拟提交”中点击“核对拟提交信息”，核对字段和照片后确认提交。')
+        if plan.get('pending_fields'):
+            lines.append('待管理员确认：' + '、'.join(plain(f['label']) for f in plan['pending_fields']) + '。')
+            lines.append('本环节照片已齐，已自动填写可确定内容。请在 IDI 工作台的“拟提交”中点击“核对拟提交信息”，补齐待确认字段并审核；确认后系统自动正式提交。')
+        else:
+            lines.append('本环节资料已收集并保存，请在 IDI 工作台的“拟提交”中点击“核对拟提交信息”，核对字段和照片后确认提交。')
         settings = self.followup.settings
         urls = list(settings.public_origins) or settings.lan_urls
         if urls:

@@ -3,6 +3,7 @@
 <title>连接 IDI 水印相机</title>
 <style>
 *{box-sizing:border-box}body{margin:0;background:#f7f8fa;color:#17212b;font:16px/1.6 system-ui,sans-serif}main{max-width:780px;margin:48px auto;padding:24px}h1{font-size:28px}section{background:white;border:1px solid #e2e5e9;border-radius:16px;padding:24px;margin:20px 0}input,button{font:inherit}input[type=text],input[type=password]{display:block;width:100%;padding:12px;border:1px solid #bcc4ce;border-radius:8px;margin:8px 0 16px}button{cursor:pointer;background:#c94016;color:white;border:0;border-radius:8px;padding:12px 20px}button.secondary{background:#eef0f4;color:#17212b}label.project{display:block;padding:8px}input[type=checkbox]{width:20px;height:20px;vertical-align:middle;margin-right:8px}.muted{color:#596575}#code{font:700 32px monospace;letter-spacing:4px;overflow-wrap:anywhere}.device{display:flex;justify-content:space-between;align-items:center;gap:16px;border-top:1px solid #e2e5e9;padding:16px 0}#error{color:#b21b17}a{color:#a83512}
+button:disabled{opacity:.5;cursor:not-allowed}.device>div{min-width:0;overflow-wrap:anywhere}.device>button{flex-shrink:0}.capture-status{font-size:14px;margin-top:4px}.pagination{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:16px}.pagination[hidden]{display:none}@media(max-width:520px){main{margin:16px auto;padding:12px}section{padding:16px}.device{flex-wrap:wrap}}
 </style><main><a href="/">← 返回 IDI 工作台</a><h1>连接 IDI 水印相机</h1><p class="muted">在安卓 APP 输入服务器地址和配对码。这台手机只能读取所选项目的案件并上传照片、视频。</p><p id="error" role="alert"></p>
 <section><p><a href="/camera/download">下载安卓安装包（0.5.2，人员绑定与官方拍摄）</a></p><p class="muted">手机需联网并允许相机和精确定位；录像首次使用需允许麦克风。预览顶部可切换拍照与录像，视频为 720p、每段最长 60 秒。原片保留在手机并上传到 IDI，自动进入本项目官网草稿保存队列；正式提交由项目管理员确认。照片本地验真默认关闭，视频暂不支持本地验真。</p><strong>服务器地址</strong><p id="server"></p><label>设备名称<input id="name" type="text" maxlength="80" placeholder="例如：张师傅的手机"></label><label>绑定人员<select id="owner" aria-label="绑定人员" style="display:block;width:100%;padding:12px;margin:8px 0 16px"></select></label><strong>允许访问的项目</strong><div id="projects"></div><p><button id="generate">生成配对码</button></p><div id="pairing" hidden><div id="code"></div><p>15 分钟内有效，仅能使用一次。输入 APP 后点击「连接并同步」。</p><button class="secondary" id="copy">复制配对码</button></div></section>
 <section id="official-section" hidden><h2>今日水印相机 · 官方接入</h2>
@@ -19,15 +20,31 @@
 <label class="project"><input id="auto-verify" type="checkbox">开启照片本地自动验真（可选，默认关闭）</label>
 <p class="muted">关闭时，照片原片直接归档并标记“未做本地验真”。开启后，新上传照片会发送到今日官方验真接口，消耗验真额度，通过后归档；不会补验已归档照片。关闭也会暂停此前待验真任务。视频原样归档并标为未验真，不调用照片验真接口。</p>
 <p><button type="submit">保存配置</button> <button type="button" class="secondary" id="refresh-official">刷新拍摄记录</button></p>
-</form><h3>最近 100 条官方拍摄记录</h3><div id="official-captures"></div></section>
+</form><h3>最近 100 条官方拍摄记录</h3><div id="official-captures"></div>
+<nav id="capture-pagination" class="pagination" aria-label="拍摄记录分页" hidden><button id="capture-prev" type="button" class="secondary">上一页</button><span id="capture-page-info" class="muted" role="status"></span><button id="capture-next" type="button" class="secondary">下一页</button></nav></section>
 <section><h2>已连接的手机</h2><div id="devices"></div></section></main>
 <script>
 const $=id=>document.getElementById(id);let code='';async function api(path,options={}){const r=await fetch(path,{...options,headers:{'X-IDI-Request':'1','Content-Type':'application/json',...options.headers}});const d=await r.json();if(!r.ok)throw Error(d.detail||'请求失败');return d}
-async function refresh(){try{const d=await api('/api/camera/admin');$('server').textContent=d.server_urls.join(' 或 ')||'请先为 IDI 配置手机可访问的 HTTPS 或局域网地址';$('owner').replaceChildren();(d.users||[]).filter(u=>u.enabled).forEach(u=>{const o=document.createElement('option');o.value=u.id;o.textContent=u.display_name+' ('+u.username+')';$('owner').append(o)});$('projects').replaceChildren();d.projects.forEach(p=>{const l=document.createElement('label');l.className='project';const i=document.createElement('input');i.type='checkbox';i.value=p.id;l.append(i,document.createTextNode(p.name));$('projects').append(l)});$('devices').replaceChildren();d.devices.forEach(v=>{const row=document.createElement('div');row.className='device';const name=document.createElement('div');name.textContent=v.name+' · '+(v.user_name||'历史设备：需重新绑定人员')+(v.revoked_at?' · 已停用':'');row.append(name);if(!v.revoked_at){const b=document.createElement('button');b.className='secondary';b.textContent='停用连接';b.onclick=async()=>{try{await api('/api/camera/admin/devices/'+encodeURIComponent(v.id),{method:'DELETE'});await refresh()}catch(e){$('error').textContent=e.message}};row.append(b)}$('devices').append(row)});if(!d.devices.length)$('devices').textContent='还没有已连接的手机'}catch(e){$('error').textContent=e.message}}
+async function refresh(){try{
+ const d=await api('/api/camera/admin');$('server').textContent=d.server_urls.join(' 或 ')||'请先为 IDI 配置手机可访问的 HTTPS 或局域网地址';
+ $('owner').replaceChildren();(d.users||[]).filter(u=>u.enabled).forEach(u=>{const o=document.createElement('option');o.value=u.id;o.textContent=u.display_name+' ('+u.username+')';$('owner').append(o)});
+ $('projects').replaceChildren();d.projects.forEach(p=>{const l=document.createElement('label');l.className='project';const i=document.createElement('input');i.type='checkbox';i.value=p.id;l.append(i,document.createTextNode(p.name));$('projects').append(l)});
+ $('devices').replaceChildren();d.devices.forEach(v=>{
+  const row=document.createElement('div');row.className='device';const name=document.createElement('div');name.textContent=v.name+' · '+(v.user_name||'历史设备：需重新绑定人员')+(v.revoked_at?' · 已停用':'');row.append(name);
+  const b=document.createElement('button');b.className=v.revoked_at?'':'secondary';b.textContent=v.revoked_at?'删除':'停用连接';
+  b.onclick=async()=>{
+   if(v.revoked_at&&!confirm('确定删除已停用手机“'+v.name+'”？历史拍摄记录和已归档照片会保留。'))return;
+   b.disabled=true;$('error').textContent='';
+   try{await api('/api/camera/admin/devices/'+encodeURIComponent(v.id)+(v.revoked_at?'/record':''),{method:'DELETE'});await refresh()}
+   catch(e){$('error').textContent=e.message}finally{b.disabled=false}
+  };row.append(b);$('devices').append(row)
+ });if(!d.devices.length)$('devices').textContent='还没有已连接的手机';
+}catch(e){$('error').textContent=e.message}}
 $('generate').onclick=async()=>{try{$('error').textContent='';$('generate').disabled=true;const ids=[...document.querySelectorAll('#projects input:checked')].map(i=>i.value);const d=await api('/api/camera/admin/pairings',{method:'POST',body:JSON.stringify({name:$('name').value,project_ids:ids,user_id:$('owner').value})});code=d.code;$('code').textContent=code;$('pairing').hidden=false}catch(e){$('error').textContent=e.message}finally{$('generate').disabled=false}};$('copy').onclick=async()=>{try{await navigator.clipboard.writeText(code);$('copy').textContent='已复制'}catch(e){$('error').textContent='请选中配对码手动复制'}};refresh();
 </script><script>
 const officialFields=['sdk_app_id','sdk_secret_key','group_key','group_secret','group_watermark_id'];
 const officialLabels={not_requested:'已归档 · 未做本地验真',unconfigured:'等待验真配置',queued:'等待验真',submitting:'正在提交验真',processing:'官方处理中',verified:'验真通过 · 已归档',rejected:'验真未通过',error:'验真异常',cancelled:'官方任务已取消'};
+const capturePageSize=10;let officialCaptures=[],capturePage=1;
 async function refreshOfficial(){try{
  const response=await fetch('/api/camera/admin/official');if(response.status===404)return;
  if(!response.ok)throw Error('官方接入状态读取失败');const d=await response.json();const c=d.config;$('official-section').hidden=false;
@@ -36,15 +53,24 @@ async function refreshOfficial(){try{
  $('official-status').textContent=c.ready?('官方拍摄已启用；照片本地自动验真'+(c.auto_verify?'已开启':'已关闭')+'。录像请安装 0.5.0 或更高版本。'):'尚未启用官方拍摄；请填写或检查 SDK App ID 与 Secret Key。';
  officialFields.forEach(k=>{$(k).value='';$(k).placeholder=c['has_'+k]?'已保存，留空保留':'尚未填写'});
  $('group_watermark_id').value=c.group_watermark_id||'';
- $('official-captures').replaceChildren();
- for(const item of d.captures){const box=document.createElement('div');box.className='device';const detail=document.createElement('div');
- detail.textContent=item.case_number+' · '+(item.media_type==='video'?'视频 · 已归档 · 未验真':officialLabels[item.verification_state]||'待核对')+(item.error?'；'+item.error:'');box.append(detail);
+ officialCaptures=d.captures;renderCaptures();
+}catch(e){$('error').textContent=e.message}}
+function renderCaptures(){
+ const pages=Math.max(1,Math.ceil(officialCaptures.length/capturePageSize));capturePage=Math.min(Math.max(1,capturePage),pages);
+ const start=(capturePage-1)*capturePageSize;$('official-captures').replaceChildren();
+ for(const item of officialCaptures.slice(start,start+capturePageSize)){const box=document.createElement('div');box.className='device';const detail=document.createElement('div');
+ const title=document.createElement('div');title.className='capture-title';title.textContent=item.case_number+' · '+(item.stage_label||'未知阶段')+' · '+(item.device_name||'未知终端');detail.append(title);
+ const status=document.createElement('div');status.className='muted capture-status';status.textContent=(item.media_type==='video'?'视频 · 已归档 · 未验真':officialLabels[item.verification_state]||'待核对')+(item.error?'；'+item.error:'');detail.append(status);box.append(detail);
  const prefix='/api/camera/admin/official/'+encodeURIComponent(item.device_id)+'/'+encodeURIComponent(item.capture_id);
  if(['error','unconfigured'].includes(item.verification_state)){const b=document.createElement('button');b.textContent='重试验真';b.onclick=async()=>{b.disabled=true;try{await api(prefix+'/retry',{method:'POST',body:'{}'});await refreshOfficial()}catch(e){$('error').textContent=e.message;b.disabled=false}};box.append(b)}
  if(item.verification_state==='verified'){if(item.report.url){const link=document.createElement('a');link.href=item.report.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent='官方验真报告';box.append(link)}else{const b=document.createElement('button');b.textContent='生成官方报告';b.onclick=async()=>{b.disabled=true;try{await api(prefix+'/report',{method:'POST',body:'{}'});await refreshOfficial()}catch(e){$('error').textContent=e.message;b.disabled=false}};box.append(b)}}
  $('official-captures').append(box)}
- if(!d.captures.length)$('official-captures').textContent='还没有官方 SDK 拍摄记录。关闭照片本地验真时，上传后直接归档。';
-}catch(e){$('error').textContent=e.message}}
+ if(!officialCaptures.length)$('official-captures').textContent='还没有官方 SDK 拍摄记录。关闭照片本地验真时，上传后直接归档。';
+ $('capture-pagination').hidden=!officialCaptures.length;
+ $('capture-prev').disabled=capturePage===1;$('capture-next').disabled=capturePage===pages;
+ $('capture-page-info').textContent='第 '+capturePage+' / '+pages+' 页 · 共 '+officialCaptures.length+' 条';
+}
+$('capture-prev').onclick=()=>{capturePage--;renderCaptures()};$('capture-next').onclick=()=>{capturePage++;renderCaptures()};
 $('official-form').onsubmit=async event=>{event.preventDefault();try{const data={enabled:$('official-enabled').checked,auto_verify:$('auto-verify').checked};officialFields.forEach(k=>data[k]=$(k).value);await api('/api/camera/admin/official/config',{method:'PUT',body:JSON.stringify(data)});await refreshOfficial()}catch(e){$('error').textContent=e.message}};
-$('refresh-official').onclick=refreshOfficial;refreshOfficial();
+$('refresh-official').onclick=()=>{capturePage=1;return refreshOfficial()};refreshOfficial();
 </script></html>

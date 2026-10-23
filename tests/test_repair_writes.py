@@ -62,6 +62,8 @@ def test_new_repair_save_then_submit_reuses_files_and_created_record(
     assert 'acceptanceDate' not in writes[0] and 'acceptanceCheckFileInfo' not in writes[0]
     assert ('supplementaryMaterialsFileInfo' in writes[0]) == (method == '2')
     assert services['domain'].case(case['id'])['workflow_stage'] == 'repair'
+    services['default_packages'].run_once()
+    assert services['default_packages'].get(case['id'])['state'] == 'waiting'
     saved = platform.draft(case['id'], 'repair')
     assert saved['values'] == values and all(not ids for ids in saved['files'].values())
     next_batch = services['reviews'].prepare(case['id'], 'repair', saved['revision'])
@@ -70,6 +72,11 @@ def test_new_repair_save_then_submit_reuses_files_and_created_record(
     assert writes[1]['state'] == 1 and writes[1]['repairAcceptanceId'] == REPAIR_ID
     assert len(uploaded) == 4 and len(writes) == 2
     assert services['domain'].case(case['id'])['workflow_stage'] == 'acceptance'
+    services['default_packages'].run_once()
+    while services['jobs'].run_one():
+        pass
+    services['default_packages'].run_once()
+    assert services['default_packages'].get(case['id'])['state'] == 'ready'
     for picture in pictures:
         current = services['domain'].photo(picture['id'])
         assert (current['stage'], current['role'], current['blob_hash']) == (picture['stage'], picture['role'], picture['blob_hash'])

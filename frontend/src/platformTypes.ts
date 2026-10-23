@@ -18,7 +18,7 @@ export interface PlatformContract {
 }
 export interface PlatformSession { connected: boolean; account: string; mode: string; connected_at: string | null; write_enabled: boolean }
 export interface PlatformAccountStatus {
-  project_id?: string; enabled?: boolean; write_enabled?: boolean;
+  project_id?: string; enabled?: boolean; write_enabled?: boolean; automatic_paused?: boolean;
   configured: boolean; username: string; password_stored: boolean; auto_connect: boolean; state: string;
   last_attempt_at: string | null; last_success_at: string | null; next_retry_at: string | null; error: string;
   session: PlatformSession;
@@ -45,13 +45,14 @@ export interface PlatformFileField extends PlatformField {
 export interface PlatformFieldSuggestion { value: string; source: string; photo_ids: string[]; needs_review: boolean }
 export interface PlatformFieldSource extends PlatformFieldSuggestion { origin: 'automatic' | 'manual'; current: boolean; stale: boolean }
 export interface PlatformPlan {
+  review_only?: boolean; pending_fields?: { field: string; label: string; message: string }[];
   write_binding?: { project_id: string; username: string; revision: string; enabled: boolean };
   case: Case; stage: PlatformStage; label: string; guide_page: number; contract_version: string;
   link: PlatformLink; draft: PlatformDraft; values: Record<string, string | number>;
   remote_values: Record<string, string>;
   fields: PlatformField[]; file_fields: PlatformFileField[]; photos: Photo[];
   photo_total: number; unassigned_count: number; error_count: number; warning_count: number;
-  issues: { field: string; message: string; severity: 'error' | 'warning' }[];
+  issues: { field: string; message: string; severity: 'error' | 'warning'; code?: string }[];
   personnel: { userId: string; name: string; phone: string }[];
   business_fields: Record<string, unknown>; endpoint: string; actions: string[];
   write_enabled: boolean; remote_written: false; prepared_for_review: boolean;

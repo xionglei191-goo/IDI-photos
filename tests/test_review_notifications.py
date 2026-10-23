@@ -62,6 +62,35 @@ def test_incomplete_materials_never_send_notification(services, platform, case, 
     assert all(payload['state'] == 0 for _, payload in writes)
 
 
+def test_complete_photos_notify_pending_fields_once_then_require_fresh_review(services, platform, case, photo, monkeypatch, followup, channel, project):
+    auto, add, _, writes, _ = setup_flow(services, platform, case, photo, monkeypatch)
+    bind(followup, channel, project)
+    auto.configure({'notify_review_ready': True})
+    platform.test_survey['repairMethod'] = ''
+    row = ready(services, platform, case, add, auto)
+    assert row['state'] == 'awaiting_confirmation'
+    review = services['reviews'].get(row['review_id'])
+    assert review['snapshot']['review_only'] and review['snapshot']['actions'] == []
+    assert [f['field'] for f in row['detail']['pending_fields']] == ['repairMethod']
+    notifier, feedback = services['review_notifications'], channel[1]
+    assert notifier.run_once() == 1
+    assert '待管理员确认：维修方式' in feedback.sent[0][1]['text']
+    assert '照片已齐' in feedback.sent[0][1]['text']
+    tick(auto, case['id'])
+    notifier.recover()
+    assert notifier.run_once() == 0 and len(feedback.sent) == 1
+    assert all(payload['state'] == 0 for _, payload in writes)
+    plan = platform.draft(case['id'], 'survey')
+    platform.save_draft(case['id'], 'survey', draft_data(platform, case['id'], 'survey', {**plan['values'], 'repairMethod': '2'}))
+    row = tick(auto, case['id'])
+    complete = services['reviews'].get(row['review_id'])
+    assert not complete['snapshot'].get('review_only')
+    assert notifier.run_once() == 1 and len(feedback.sent) == 2
+    assert '待管理员确认：' not in feedback.sent[-1][1]['text']
+    assert services['reviews'].confirm(complete['id'], complete['fingerprint'])['state'] == 'verified'
+    assert [payload['state'] for _, payload in writes].count(1) == 1
+
+
 def test_missing_owner_stays_visible_and_sends_after_binding(notification_flow, case, project, followup, channel):
     notifier, auto, client, _ = notification_flow
     with notifier.db.tx() as con:

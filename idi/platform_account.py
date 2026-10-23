@@ -65,6 +65,7 @@ class PlatformAccount:
         previous = self.db.setting(self.state_key, {})
         self._state = previous if previous.get('revision') == self._config.get('revision') else {}
         self._connecting = False
+        self._temporary_override = False
 
     @property
     def client(self):
@@ -82,6 +83,8 @@ class PlatformAccount:
                 state = 'needs_attention'
             elif self._connecting:
                 state = 'connecting'
+            elif self._temporary_override and enabled:
+                state = 'temporary'
             elif session['connected'] and session['account'] == self._config.get('username'):
                 state = 'connected'
             elif not configured:
@@ -96,9 +99,10 @@ class PlatformAccount:
                 state = 'pending'
             return {'configured': configured, 'username': self._config.get('username', ''),
                     'password_stored': configured, 'auto_connect': enabled, 'state': state,
+                    'automatic_paused': self._temporary_override and enabled,
                     'last_attempt_at': self._state.get('last_attempt_at'),
                     'last_success_at': self._state.get('last_success_at'),
-                    'next_retry_at': self._state.get('next_retry_at') if enabled else None,
+                    'next_retry_at': self._state.get('next_retry_at') if enabled and not self._temporary_override else None,
                     'error': self._load_error or self._state.get('error', ''), 'session': session}
 
     @contextmanager
@@ -129,6 +133,7 @@ class PlatformAccount:
             value = dict(username=username, password=password, auto_connect=enabled, revision=uid())
             self.store.save(value)
             self._config, self._load_error, self._state = value, '', {}
+            self._temporary_override = False
             self._persist()
             if changed or self.client.status()['account'] not in ('', username):
                 self.client.logout()
@@ -140,6 +145,7 @@ class PlatformAccount:
         with self._editing(), self._meta:
             self.store.delete()
             self._config, self._state, self._load_error = {}, {}, ''
+            self._temporary_override = False
             self._persist()
             self.client.logout()
         return self.status()
@@ -151,6 +157,7 @@ class PlatformAccount:
                 self.store.save(value)
                 self._config = value
             self._state = {}
+            self._temporary_override = False
             self._persist()
             self.client.logout()
         return self.client.status()
@@ -158,19 +165,21 @@ class PlatformAccount:
     def temporary_login(self, username, password):
         if self.validate:
             self.validate(username)
-        # An explicit temporary account takes priority over the saved account until re-enabled.
+        # Temporary credentials take priority only in this process; saved preferences survive restart.
         with self._editing():
             with self._meta:
-                if self._config and self._config['auto_connect']:
-                    value = {**self._config, 'auto_connect': False}
-                    self.store.save(value)
-                    self._config = value
-                self._state = {}
-                self._persist()
                 self._connecting = True
             try:
                 with self._login_slot():
-                    return self.client.login(username, password)
+                    session = self.client.login(username, password)
+                with self._meta:
+                    self._temporary_override = bool(self._config) and (username.strip(), password) != (
+                        self._config['username'], self._config['password'])
+                    if self._config and not self._temporary_override:
+                        self._state.update(last_success_at=self.clock().isoformat(), failures=0,
+                                           blocked=False, error='', next_retry_at=None)
+                        self._persist()
+                return session
             finally:
                 with self._meta:
                     self._connecting = False
@@ -189,13 +198,14 @@ class PlatformAccount:
                     return False
                 session = self.client.status()
                 if not force:
-                    if not self._config['auto_connect'] or self._state.get('blocked'):
+                    if self._temporary_override or not self._config['auto_connect'] or self._state.get('blocked'):
                         return False
                     if session['connected']:
                         return False
                     retry = self._state.get('next_retry_at')
                     if retry and datetime.fromisoformat(retry) > self.clock():
                         return False
+                self._temporary_override = False
                 self._connecting = True
                 self._state.update(last_attempt_at=self.clock().isoformat(), next_retry_at=None, error='')
                 self._persist()

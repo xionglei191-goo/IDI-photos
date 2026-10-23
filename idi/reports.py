@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import sqlite3
+import threading
 import zipfile
 from collections import defaultdict
 from contextlib import closing
@@ -22,6 +23,9 @@ from PIL import Image, ImageOps
 from .db import Database, audit, dump, now, uid
 from .domain import Domain, DomainError, PHOTO_GROUPS, ROLES, STAGES, STATUSES, WORKFLOW_STAGES
 from .storage import Storage, safe_name
+from .package_content import content_fingerprint
+from .photo_package import PHOTO_PACKAGE_FORMAT, PHOTO_DIRECTORIES, case_folder, photo_directory, photo_paths, write_media
+from .picc_records import PICC_FORMAT, PiccRecords, write_record
 
 
 def location(case):
@@ -174,27 +178,62 @@ def html_report(path, manifest):
 class Reporter:
     def __init__(self, db: Database, storage: Storage, domain: Domain):
         self.db, self.storage, self.domain = db, storage, domain
+        self.picc = PiccRecords(db, domain)
+        self._package_lock = threading.RLock()
 
     def packages(self, case_id=None):
-        rows = self.db.all("SELECT pk.*,c.title AS case_title,pr.name AS project_name FROM packages pk JOIN cases c ON c.id=pk.case_id JOIN projects pr ON pr.id=c.project_id" + (" WHERE pk.case_id=?" if case_id else "") + " ORDER BY pk.created_at DESC", (case_id,) if case_id else ())
+        rows = self.db.all("SELECT pk.*,c.project_id,c.title AS case_title,pr.name AS project_name FROM packages pk JOIN cases c ON c.id=pk.case_id JOIN projects pr ON pr.id=c.project_id WHERE pk.state<>'deleted'" + (" AND pk.case_id=?" if case_id else "") + " ORDER BY pk.created_at DESC,pk.version DESC", (case_id,) if case_id else ())
         for row in rows:
             manifest = json.loads(row.pop("manifest"))
             row["case_title"] = manifest["case"]["title"]
             row["project_name"] = manifest["case"]["project_name"]
+            for field in ("short_code", "platform_report_code", "report_number", "building", "unit", "room", "location_detail"):
+                row[field] = manifest["case"].get(field) or ""
             row.pop("zip_path", None)
             row["photo_count"] = len(manifest["photos"])
             row["missing_count"] = manifest["completeness"]["missing_count"]
-            row["download_url"] = f"/api/packages/{row['id']}/download" if row["state"] != "building" else None
+            row["download_url"] = f"/api/packages/{row['id']}/download" if row["state"] in ("ready", "submitted", "accepted", "returned") else None
+            row['document_url'] = f"/api/packages/{row['id']}/document" if row['download_url'] and manifest.get('document_path') else None
+            row['format'] = manifest.get('format')
         return rows
 
     def package(self, package_id):
         row = self.db.one("SELECT * FROM packages WHERE id=?", (package_id,))
-        if not row:
+        if not row or row['state'] == 'deleted':
             raise DomainError("报送记录不存在", 404)
         row["manifest"] = json.loads(row["manifest"])
         row["events"] = self.db.all("SELECT * FROM package_events WHERE package_id=? ORDER BY created_at", (package_id,))
-        row["download_url"] = f"/api/packages/{package_id}/download"
+        row["download_url"] = f"/api/packages/{package_id}/download" if row['state'] in ('ready', 'submitted', 'accepted', 'returned') else None
+        row['document_url'] = f"/api/packages/{package_id}/document" if row['download_url'] and row['manifest'].get('document_path') else None
+        row['deletion_token'] = self._deletion_token(row, len(row['events']))
         return row
+
+    @staticmethod
+    def _deletion_token(row, receipt_count):
+        return hashlib.sha256(dump([row['id'], row['state'], row['zip_hash'], receipt_count]).encode()).hexdigest()
+
+    def delete(self, package_id, expected_token):
+        with self._package_lock, self.db.tx() as con:
+            row = con.execute('SELECT * FROM packages WHERE id=?', (package_id,)).fetchone()
+            if not row:
+                raise DomainError('报送记录不存在', 404)
+            if row['state'] == 'deleted':
+                return {'deleted': package_id, 'originals_retained': True}
+            receipts = con.execute('SELECT COUNT(*) FROM package_events WHERE package_id=?', (package_id,)).fetchone()[0]
+            if not expected_token or expected_token != self._deletion_token(row, receipts):
+                raise DomainError('资料包状态或回执已变化，请重新打开删除确认框核对', 409)
+            for job in con.execute("SELECT payload FROM jobs WHERE kind='export' AND state IN ('queued','running')"):
+                payload = json.loads(job['payload'])
+                groups = payload.get('groups', [])
+                if (row['case_id'] in payload.get('package_ids', {}) or payload.get('parent_id') == package_id
+                        or any(group.get('case', {}).get('id') == row['case_id'] for group in groups)
+                        or not groups and not payload.get('package_ids')):
+                    raise DomainError('本案资料包正在生成，请等待完成后再删除', 409)
+            # Keep the immutable snapshot, receipt references and version reservation for audit/backup.
+            con.execute("UPDATE packages SET state='deleted' WHERE id=?", (package_id,))
+            audit(con, 'package', package_id, 'delete', {'state': row['state'], 'version': row['version'], 'case_id': row['case_id']},
+                  {'state': 'deleted', 'originals_retained': True, 'receipts_retained': receipts})
+        return {'deleted': package_id, 'originals_retained': True}
 
     def preview(self, photo_ids, template_id="general"):
         ids = list(dict.fromkeys(photo_ids))
@@ -203,17 +242,34 @@ class Reporter:
         rows = self.domain.photos(ids=ids, page_size=500)["items"]
         if len(rows) != len(ids):
             raise DomainError("部分照片不存在，请刷新列表")
+        if template_id == PICC_FORMAT:
+            case_ids = {row['case_id'] for row in rows}
+            if len(case_ids) != 1 or None in case_ids:
+                raise DomainError('人保记录表每次处理一个案件，请选择同一案件的资料')
+            rows = self.picc.all_photos(next(iter(case_ids)))
+            included = {p['id'] for p in self.picc.get(next(iter(case_ids)), rows)['photos']}
+            rows = [p for p in rows if p['media_type'] != 'image' or p['id'] in included]
+        excluded = [row for row in rows if row['media_type'] not in ('image', 'video')]
+        rows = [row for row in rows if row['media_type'] in ('image', 'video')]
+        if not rows:
+            raise DomainError('所选资料没有照片或视频；压缩包不包含 PDF 或其他资料')
         if any(not p["case_id"] for p in rows):
             raise DomainError("所选照片含未归属案件的资料，请先确认案件")
         grouped = defaultdict(list)
         for row in rows:
+            if template_id != PICC_FORMAT:
+                photo_directory(row)
             grouped[row["case_id"]].append(row["id"])
-        return {"photo_count": len(ids), "cases": [{"case": self.domain.case(case_id), "photo_ids": values, "completeness": self.domain.completeness(case_id, template_id, values)} for case_id, values in grouped.items()]}
+        cases = []
+        for case_id, values in grouped.items():
+            case = self.domain.case(case_id)
+            cases.append({'case': case, 'photo_ids': values, 'root_directory': case_folder(case),
+                          'completeness': self.domain.completeness(case_id, template_id, values)})
+        return {"photo_count": sum(row['media_type'] == 'image' for row in rows),
+                "video_count": sum(row['media_type'] == 'video' for row in rows),
+                "excluded_file_count": len(excluded), "cases": cases}
 
-    def _snapshot(self, package_id, case_id, photo_ids, template_id, parent_id, title):
-        existing = self.db.one("SELECT * FROM packages WHERE id=?", (package_id,))
-        if existing:
-            return json.loads(existing["manifest"])
+    def _content(self, case_id, photo_ids, template_id, parent_id):
         case = self.domain.case(case_id)
         template = next((t for t in self.domain.templates() if t["id"] == template_id), None)
         if not template:
@@ -222,14 +278,31 @@ class Reporter:
             parent = self.package(parent_id)
             if parent["case_id"] != case_id:
                 raise DomainError("补件记录必须属于同一案件")
-        photo_rows = self.domain.photos(ids=photo_ids, case_id=case_id, page_size=500)["items"]
-        if len(photo_rows) != len(photo_ids):
+        is_picc = template_id == PICC_FORMAT
+        photo_rows = self.picc.all_photos(case_id) if is_picc else [row for start in range(0, len(photo_ids), 500)
+            for row in self.domain.photos(ids=photo_ids[start:start + 500], case_id=case_id, page_size=500)['items']]
+        if not is_picc and len(photo_rows) != len(photo_ids):
             raise DomainError("照片所属案件已发生变化，请重新选材")
+        photo_rows = [row for row in photo_rows if row['media_type'] == 'image' or not is_picc and row['media_type'] == 'video']
+        if not photo_rows:
+            raise DomainError('本案尚无照片，视频请使用原照片打包方案' if is_picc else '所选资料没有照片或视频；压缩包不包含 PDF 或其他资料')
+        photo_ids = [row['id'] for row in photo_rows]
+        record = self.picc.snapshot(case_id, photo_rows) if is_picc else None
+        if is_picc:
+            included = {p['id'] for p in record['photos']}
+            photo_rows = [p for p in photo_rows if p['id'] in included]
+            photo_ids = [p['id'] for p in photo_rows]
+            root_directory = case_folder(case)
+            paths = {row['id']: '_document_media/' + row['id'] + '.jpg' for row in photo_rows if row['media_type'] == 'image'}
+            order = {photo['id']: index for index, photo in enumerate(record['photos'])}
+            photo_rows.sort(key=lambda row: (order.get(row['id'], len(order)), row['id']))
+        else:
+            root_directory, paths = photo_paths(case, photo_rows)
         snapshots = []
-        for index, row in enumerate(photo_rows, 1):
+        for row in photo_rows:
             source_rows = self.db.all("SELECT source_type,original_name,group_name,sender,message_time,received_at FROM photo_sources WHERE photo_id=? ORDER BY received_at", (row["id"],))
             original = row["original_name"] or (row["id"] + row["extension"])
-            path = "资料/" + safe_name(STAGES[row["stage"]]) + "/" + f"{index:03d}-" + safe_name(original, 100)
+            path = paths[row['id']]
             allowed = ("id", "blob_hash", "stage", "role", "photo_group", "part", "process", "watermark_time", "exif_time", "recognition_state", "confirmed_fields", "media_type", "mime_type", "size_bytes", "width", "height", "revision", "visit_id", "visit_date", "visit_key", "shared_checkin_visit_id", "shared_checkin_date", "shared_checkin_key")
             snapshots.append({**{k: row[k] for k in allowed}, "original_name": original, "package_path": path, "sources": source_rows})
         quality = self.domain.completeness(case_id, template_id, photo_ids)
@@ -242,48 +315,158 @@ class Reporter:
                 # Counts in a selected package must not imply excluded originals are included.
                 selected.pop('counts', None)
                 visits.append(selected)
+        return {"case": case, "template": template, "photos": snapshots, "completeness": quality,
+                "visits": visits, "parent_id": parent_id, "format": PICC_FORMAT if is_picc else PHOTO_PACKAGE_FORMAT,
+                "root_directory": root_directory,
+                **({'record': record, 'document_path': root_directory + '/查勘及施工记录表.docx'} if is_picc else {})}
+
+    def _equivalent(self, content, con, *, include_building=False):
+        fingerprint = content_fingerprint(content)
+        rows = con.execute("SELECT * FROM packages WHERE case_id=? AND state IN ('ready','submitted','accepted','returned'" +
+                           (",'building'" if include_building else "") + ") ORDER BY version DESC", (content['case']['id'],))
+        for row in rows:
+            manifest = json.loads(row['manifest'])
+            if content_fingerprint(manifest) != fingerprint:
+                continue
+            if row['state'] != 'building':
+                path = self.storage.resolve(row['zip_path'])
+                if not path.is_file():
+                    continue
+                with path.open('rb') as stream:
+                    if hashlib.file_digest(stream, 'sha256').hexdigest() != row['zip_hash']:
+                        continue
+                if manifest.get('document_path'):
+                    document = self.storage.resolve('exports/' + row['id'] + '/' + manifest['document_path'])
+                    if not document.is_file():
+                        continue
+                    with document.open('rb') as stream:
+                        if hashlib.file_digest(stream, 'sha256').hexdigest() != manifest.get('document_export', {}).get('sha256'):
+                            continue
+            return dict(row)
+        return None
+
+    @staticmethod
+    def _export_result(package, reused=False):
+        return {"id": package['id'], "case_id": package['case_id'], "version": package['version'],
+                "download_url": package['download_url'], "document_url": package.get('document_url'), "reused": reused}
+
+    def enqueue_export(self, jobs, photo_ids, template_id='general', parent_id=None, title=''):
+        preview = self.preview(photo_ids, template_id)
+        return self._enqueue_groups(jobs, preview['cases'], template_id, parent_id, title)
+
+    def enqueue_case_export(self, jobs, case_id, template_id, title=''):
+        # Internal all-case preparation is not limited to one UI selection page.
+        ids = [p['id'] for p in self.picc.all_photos(case_id) if p['media_type'] in ('image', 'video')]
+        return self._enqueue_groups(jobs, [{'case': {'id': case_id}, 'photo_ids': ids}], template_id, None, title)
+
+    def _enqueue_groups(self, jobs, groups, template_id, parent_id, title):
+        with self._package_lock:
+            with self.db.read_snapshot() as con:
+                if parent_id and len(groups) != 1:
+                    raise DomainError('补件请每次选择一个案件')
+                contents = [self._content(group['case']['id'], group['photo_ids'], template_id, parent_id) for group in groups]
+                fingerprint = hashlib.sha256(dump(sorted((item['case']['id'], content_fingerprint(item)) for item in contents)).encode()).hexdigest()
+                for job in con.execute("SELECT id,payload FROM jobs WHERE kind='export' AND state IN ('queued','running') ORDER BY created_at DESC"):
+                    if json.loads(job['payload']).get('request_fingerprint') == fingerprint:
+                        return jobs.get(job['id'])
+                matches = [self._equivalent(content, con) for content in contents]
+                results = [self._export_result(self.package(row['id']), True) for row in matches if row]
+            payload = {"photo_ids": [pid for g in groups for pid in g['photo_ids']], "template_id": template_id, "parent_id": parent_id, "title": title,
+                       "package_ids": {g['case']['id']: uid() for g in groups}, "request_fingerprint": fingerprint,
+                       "groups": [{"case": {"id": g['case']['id']}, "photo_ids": g['photo_ids']} for g in groups]}
+            if len(results) == len(contents):
+                return jobs.enqueue('export', payload, result={"state": "completed", "packages": results, "reused_count": len(results)})
+            return jobs.enqueue('export', payload)
+
+    def _snapshot(self, package_id, case_id, photo_ids, template_id, parent_id, title):
+        existing = self.db.one("SELECT * FROM packages WHERE id=?", (package_id,))
+        if existing:
+            if existing['state'] == 'deleted':
+                raise DomainError('资料包已删除，请重新选材生成', 409)
+            return json.loads(existing["manifest"])
+        with self.db.read_snapshot():
+            content = self._content(case_id, photo_ids, template_id, parent_id)
         with self.db.tx() as con:
+            if parent_id:
+                parent = con.execute("SELECT state FROM packages WHERE id=?", (parent_id,)).fetchone()
+                if not parent or parent['state'] == 'deleted':
+                    raise DomainError('原报送记录已删除，请重新选材生成', 409)
+            equivalent = self._equivalent(content, con, include_building=True)
+            if equivalent:
+                return json.loads(equivalent['manifest'])
             version = con.execute("SELECT COALESCE(MAX(version),0)+1 FROM packages WHERE case_id=?", (case_id,)).fetchone()[0]
-            manifest = {"schema": 1, "package_id": package_id, "version": version, "created_at": now(), "case": case, "template": template, "photos": snapshots, "completeness": quality, "visits": visits, "parent_id": parent_id,
+            manifest = {**content, "schema": 1, "package_id": package_id, "version": version, "created_at": now(),
                         "evidence_note": "按本次选材形成的不可变快照；完工照片不等同于验收通过；生成报送包不等同于提交。"}
             zip_path = f"exports/{package_id}/资料报送包.zip"
-            con.execute("INSERT INTO packages VALUES(?,?,?,?,?,?,?,?,?,?,?)", (package_id, case_id, template_id, parent_id, version, title or case["title"], "building", dump(manifest), zip_path, "", now()))
+            con.execute("INSERT INTO packages VALUES(?,?,?,?,?,?,?,?,?,?,?)", (package_id, case_id, template_id, parent_id, version, title or content['case']["title"], "building", dump(manifest), zip_path, "", now()))
             audit(con, "package", package_id, "snapshot", after={"case_id": case_id, "version": version, "photo_ids": photo_ids})
         return manifest
 
     def build(self, package_id, case_id, photo_ids, template_id="general", parent_id=None, title=""):
+        with self._package_lock:
+            return self._build(package_id, case_id, photo_ids, template_id, parent_id, title)
+
+    def _build(self, package_id, case_id, photo_ids, template_id, parent_id, title):
         old = self.db.one("SELECT state FROM packages WHERE id=?", (package_id,))
         if old and old["state"] in ("ready", "submitted", "accepted", "returned"):
             return self.package(package_id)
         manifest = self._snapshot(package_id, case_id, photo_ids, template_id, parent_id, title)
+        reused = manifest['package_id'] != package_id
+        if reused:
+            package = self.package(manifest['package_id'])
+            if package['state'] != 'building':
+                return {**package, 'reused': True}
+            # Finish an interrupted, identical snapshot instead of completing a job with no ZIP.
+            package_id = manifest['package_id']
         folder = self.storage.resolve("exports/" + package_id)
         folder.mkdir(parents=True, exist_ok=True)
         try:
+            media_only = manifest.get('format') == PHOTO_PACKAGE_FORMAT
+            is_picc = manifest.get('format') == PICC_FORMAT
             for photo in manifest["photos"]:
                 blob = self.db.one("SELECT * FROM blobs WHERE hash=?", (photo["blob_hash"],))
                 if not blob or not self.storage.verify(blob):
                     raise DomainError("原文件缺失或哈希不一致：" + photo["original_name"])
                 destination = folder / photo["package_path"]
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                if not destination.is_file() or hashlib.sha256(destination.read_bytes()).hexdigest() != photo["blob_hash"]:
+                if media_only or is_picc:
+                    photo['export'] = write_media(self.storage.resolve(blob['stored_path']), destination, photo, force_jpeg=is_picc)
+                elif not destination.is_file() or hashlib.sha256(destination.read_bytes()).hexdigest() != photo["blob_hash"]:
                     shutil.copyfile(self.storage.resolve(blob["stored_path"]), destination)
+            if is_picc:
+                manifest['document_export'] = write_record(folder / manifest['document_path'], manifest['record'], manifest['photos'], folder)
             (folder / "snapshot.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-            spreadsheet(folder / "照片资料索引.xlsx", manifest)
-            word_report(folder / "案件照片资料报告.docx", manifest, folder)
-            html_report(folder / "照片浏览.html", manifest)
-            missing = [f"{STAGES[r['stage']]} / {ROLES[r['role']]} / {r['scope']}：要求{r['minimum']}，本次{r['count']}" for r in manifest["completeness"]["items"] if r["missing"]]
-            (folder / "缺项说明.txt").write_text("本次选材核对\n" + ("\n".join(missing) if missing else "本次选材满足当前模板数量要求") + "\n\n" + manifest["evidence_note"], encoding="utf-8")
+            if is_picc:
+                # A PICC delivery is the Word document itself. Videos use the ordinary media export.
+                document_path = 'exports/' + package_id + '/' + manifest['document_path']
+                with self.db.tx() as con:
+                    con.execute("UPDATE packages SET state='ready',zip_path=?,zip_hash=?,manifest=? WHERE id=? AND state<>'deleted'",
+                                (document_path, manifest['document_export']['sha256'], dump(manifest), package_id))
+                return {**self.package(package_id), 'reused': reused}
+            if not media_only and not is_picc:
+                # An interrupted historical job must keep its original immutable export format.
+                spreadsheet(folder / "照片资料索引.xlsx", manifest)
+                word_report(folder / "案件照片资料报告.docx", manifest, folder)
+                html_report(folder / "照片浏览.html", manifest)
+                missing = [f"{STAGES[r['stage']]} / {ROLES[r['role']]} / {r['scope']}：要求{r['minimum']}，本次{r['count']}" for r in manifest["completeness"]["items"] if r["missing"]]
+                (folder / "缺项说明.txt").write_text("本次选材核对\n" + ("\n".join(missing) if missing else "本次选材满足当前模板数量要求") + "\n\n" + manifest["evidence_note"], encoding="utf-8")
             target = folder / "资料报送包.zip"
             temp = folder / "资料报送包.zip.tmp"
-            file_paths = [folder / p["package_path"] for p in manifest["photos"]] + [folder / name for name in ("snapshot.json", "照片资料索引.xlsx", "案件照片资料报告.docx", "照片浏览.html", "缺项说明.txt")]
+            file_paths = [folder / p["package_path"] for p in manifest["photos"]]
+            if not media_only:
+                file_paths += [folder / name for name in ("snapshot.json", "照片资料索引.xlsx", "案件照片资料报告.docx", "照片浏览.html", "缺项说明.txt")]
             with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                if media_only:
+                    root = manifest['root_directory']
+                    for directory in ('', *PHOTO_DIRECTORIES):
+                        archive.writestr(root + ('/' + directory if directory else '') + '/', b'')
                 for path in file_paths:
                     archive.write(path, path.relative_to(folder).as_posix())
             os.replace(temp, target)
             digest = hashlib.sha256(target.read_bytes()).hexdigest()
             with self.db.tx() as con:
-                con.execute("UPDATE packages SET state='ready',zip_hash=? WHERE id=?", (digest, package_id))
-            return self.package(package_id)
+                con.execute("UPDATE packages SET state='ready',zip_hash=?,manifest=? WHERE id=? AND state<>'deleted'", (digest, dump(manifest), package_id))
+            return {**self.package(package_id), 'reused': reused}
         except Exception:
             with self.db.tx() as con:
                 con.execute("UPDATE packages SET state='failed' WHERE id=? AND state='building'", (package_id,))
@@ -299,9 +482,9 @@ class Reporter:
             case_id = group["case"]["id"]
             package_id = mapping.get(case_id) or uid()
             result = self.build(package_id, case_id, group["photo_ids"], payload.get("template_id", "general"), payload.get("parent_id"), payload.get("title", ""))
-            results.append({"id": result["id"], "case_id": case_id, "version": result["version"], "download_url": result["download_url"]})
+            results.append(self._export_result(result, result.get('reused', False)))
             progress(index + 1, len(groups))
-        return {"state": "completed", "packages": results}
+        return {"state": "completed", "packages": results, "reused_count": sum(result['reused'] for result in results)}
 
     def add_event(self, package_id, data, attachment_hash=None):
         package = self.package(package_id)
@@ -314,6 +497,9 @@ class Reporter:
         from .domain import clean_date
         event_at = clean_date(event_at, "记录")
         with self.db.tx() as con:
+            current = con.execute('SELECT state FROM packages WHERE id=?', (package_id,)).fetchone()
+            if not current or current['state'] == 'deleted':
+                raise DomainError('报送记录已删除', 404)
             con.execute("INSERT INTO package_events VALUES(?,?,?,?,?,?,?)", (uid(), package_id, state, event_at, str(data.get("note", ""))[:10000], attachment_hash, now()))
             con.execute("UPDATE packages SET state=? WHERE id=?", (state, package_id))
             audit(con, "package", package_id, "receipt", after={"state": state, "event_at": event_at, "note": data.get("note", ""), "attachment_hash": attachment_hash})

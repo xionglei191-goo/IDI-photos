@@ -6,8 +6,7 @@ import time
 import zipfile
 
 import pytest
-from docx import Document
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 
 from idi.api import create_app
 from idi.cli import restore
@@ -160,6 +159,7 @@ def test_cross_case_visit_assignment_and_stale_photo_edits_are_rejected(services
 
 
 def test_selected_export_snapshot_receipt_and_supplement(services, case, photo, client):
+    services['domain'].save_case({'platform_report_code': 'ZLBH202610132005010577'}, case['id'])
     p = photo(stage="survey", role="problem", part="客厅", process="=HYPERLINK(\"bad\")")
     excluded = photo("red", stage="acceptance", role="finished")
     request = client.post("/api/packages", json={"photo_ids": [p["id"]]})
@@ -168,15 +168,12 @@ def test_selected_export_snapshot_receipt_and_supplement(services, case, photo, 
     package_id = client.get(f"/api/jobs/{request.json()['id']}").json()["result"]["packages"][0]["id"]
     data = client.get(f"/api/packages/{package_id}/download").content
     original_digest = hashlib.sha256(data).hexdigest()
+    manifest = client.get(f"/api/packages/{package_id}").json()['manifest']
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        manifest = json.loads(archive.read("snapshot.json"))
         assert [x["id"] for x in manifest["photos"]] == [p["id"]]
         assert excluded["id"] not in json.dumps(manifest)
         assert hashlib.sha256(archive.read(manifest["photos"][0]["package_path"])).hexdigest() == p["blob_hash"]
-        book = load_workbook(io.BytesIO(archive.read("照片资料索引.xlsx")), data_only=False)
-        assert book["照片索引"]["I2"].data_type == "s"
-        assert book["照片索引"]["I2"].value.startswith("=HYPERLINK")
-        assert len(Document(io.BytesIO(archive.read("案件照片资料报告.docx"))).inline_shapes) == 1
+        assert [entry.filename for entry in archive.infolist() if not entry.is_dir()] == [manifest['photos'][0]['package_path']]
     services["domain"].save_case({"title": "后续更名"}, case["id"])
     services["domain"].update_photo(p["id"], {"process": "修改施工内容"})
     receipt = client.post(f"/api/packages/{package_id}/receipt", data={"state": "accepted", "note": "资料已收件", "event_at": "2026-10-15 09:00"}, files={"file": ("回执.txt", b"received", "text/plain")}).json()
@@ -188,13 +185,31 @@ def test_selected_export_snapshot_receipt_and_supplement(services, case, photo, 
     assert second["version"] == 2 and second["manifest"]["parent_id"] == package_id
     old_listed = next(x for x in client.get("/api/packages").json() if x["id"] == package_id)
     assert old_listed["case_title"] == case["title"]
+    assert old_listed["project_id"] == case["project_id"]
+    for field in ("short_code", "building", "room"):
+        assert old_listed[field] == manifest["case"][field]
+    assert old_listed["download_url"] == f"/api/packages/{package_id}/download"
+
+
+def test_incomplete_package_has_no_download_link(services, case, photo, client):
+    services['domain'].save_case({'platform_report_code': 'ZLBH202610132005010577'}, case['id'])
+    p = photo(stage='survey')
+    package_id = uid()
+    services["reporter"]._snapshot(package_id, case["id"], [p["id"]], "general", None, "")
+    for state in ("building", "failed"):
+        with services["db"].tx() as con:
+            con.execute("UPDATE packages SET state=? WHERE id=?", (state, package_id))
+        listed = client.get("/api/packages", params={"case_id": case["id"]}).json()
+        assert len(listed) == 1 and listed[0]["download_url"] is None
+        assert client.get(f"/api/packages/{package_id}/download").status_code == 409
 
 
 def test_unassigned_export_and_cross_case_supplement_are_rejected(services, case, photo):
+    services['domain'].save_case({'platform_report_code': 'ZLBH202610132005010577'}, case['id'])
     free = services["importer"].add_file(image_bytes(), "自由.png")
     with pytest.raises(DomainError, match="先确认案件"):
         services["reporter"].preview([free["photo_id"]])
-    p = photo("red")
+    p = photo("red", stage='survey')
     first = services["reporter"].build(uid(), case["id"], [p["id"]])
     other = services["domain"].save_case({"project_id": case["project_id"], "title": "另案"})
     assigned = services["domain"].update_photo(free["photo_id"], {"case_id": other["id"]})
@@ -203,7 +218,8 @@ def test_unassigned_export_and_cross_case_supplement_are_rejected(services, case
 
 
 def test_corrupt_archive_is_not_silently_reused(services, case, photo):
-    p = photo()
+    services['domain'].save_case({'platform_report_code': 'ZLBH202610132005010577'}, case['id'])
+    p = photo(stage='survey')
     blob = services["db"].one("SELECT * FROM blobs WHERE hash=?", (p["blob_hash"],))
     services["storage"].resolve(blob["stored_path"]).write_bytes(b"damaged")
     with pytest.raises(ValueError, match="哈希"):
@@ -301,6 +317,7 @@ def test_interrupted_job_recovers_and_attempt_count_is_preserved(services):
 
 
 def test_backup_restore_verifies_originals_packages_and_disables_receivers(services, case, photo, tmp_path):
+    services['domain'].save_case({'platform_report_code': 'ZLBH202610132005010577'}, case['id'])
     p = photo(stage="acceptance", role="finished")
     package = services["reporter"].build(uid(), case["id"], [p["id"]])
     feed = services["connectors"].save({"name": "资料入口", "kind": "feed", "enabled": True, "config": {}})
@@ -309,7 +326,7 @@ def test_backup_restore_verifies_originals_packages_and_disables_receivers(servi
     archive = services["settings"].data_dir / "backups" / backup["filename"]
     destination = tmp_path / "restored"
     result = restore(archive, destination)
-    assert result["verified_files"] >= 9
+    assert result["verified_files"] >= 6
     recovered = create_app(Settings(destination, worker_enabled=False)).state.services
     assert recovered["domain"].case(case["id"])["title"] == case["title"]
     assert recovered["domain"].summary()["total"] == 1

@@ -218,6 +218,7 @@ def test_directory_links_cannot_escape_archive(services, photo, tmp_path):
 
 
 def test_report_versions_receipts_and_backup_restore_rebuild_tree(services, case, photo, tmp_path):
+    services['domain'].save_case({'platform_report_code': 'ZLBH202610132005010577'}, case['id'])
     p = photo(stage="survey")
     reporter, tree = services["reporter"], services["archive_tree"]
     package = reporter.build(uid(), case["id"], [p["id"]])

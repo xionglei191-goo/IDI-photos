@@ -138,6 +138,40 @@ def upload(client, fixture, **changes):
                        files={'image': ('official.jpg', fixture['image'], 'image/jpeg')})
 
 
+def test_admin_capture_details_survive_device_deletion(client, official, services):
+    official['service'].settings.save({'auto_verify': False})
+    receipt = upload(client, official).json()
+    path = '/api/camera/admin/devices/' + official['device']['device_id']
+    assert client.delete(path).status_code == 200
+    assert client.delete(path + '/record').status_code == 200
+    capture = client.get('/api/camera/admin/official').json()['captures'][0]
+    assert capture['case_number'] == official['meta']['case_number']
+    assert capture['photo_group'] == 'construction'
+    assert capture['stage_label'] == '施工过程'
+    assert capture['device_name'] == '官方测试手机'
+    assert capture['photo_id'] == receipt['photo_id']
+    assert client.get('/api/photos/' + receipt['photo_id'] + '/original').content == official['image']
+    assert client.get('/api/camera/official-captures/' + capture['capture_id'], headers=official['headers']).status_code == 401
+
+
+def test_admin_capture_limit_excludes_deleted_photos_before_limiting(client, official, services):
+    official['service'].settings.save({'auto_verify': False})
+    receipt = upload(client, official).json()
+    with services['db'].tx() as con:
+        source = dict(con.execute('SELECT * FROM camera_official_captures').fetchone())
+        for index in range(105):
+            row = {**source, 'capture_id': f'capture-{index:03d}',
+                   'created_at': f'2026-10-23T10:{index // 60:02d}:{index % 60:02d}+00:00',
+                   'photo_id': None if index >= 100 else receipt['photo_id']}
+            con.execute('INSERT INTO camera_official_captures (' + ','.join(row) + ') VALUES ('
+                        + ','.join('?' for _ in row) + ')', tuple(row.values()))
+        con.execute('UPDATE camera_official_captures SET created_at=? WHERE capture_id=?',
+                    ('2026-10-22T00:00:00+00:00', source['capture_id']))
+    captures = client.get('/api/camera/admin/official').json()['captures']
+    assert len(captures) == 100
+    assert [c['capture_id'] for c in captures] == [f'capture-{i:03d}' for i in reversed(range(100))]
+
+
 def test_sdk_only_settings_default_to_no_local_verification(tmp_path):
     settings = XheySettings(tmp_path)
     status = settings.save({'enabled': True, 'sdk_app_id': 'test-app', 'sdk_secret_key': 'test-secret'})
