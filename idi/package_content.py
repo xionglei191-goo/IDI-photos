@@ -33,4 +33,6 @@ def content_fingerprint(manifest):
                'template': pick(manifest['template'], ('id', 'name', 'insurer', 'requirements')),
                'parent_id': manifest.get('parent_id'), 'format': manifest.get('format', 'report-bundle-v1'),
                'root_directory': manifest.get('root_directory'), 'record': manifest.get('record')}
+    if manifest.get('official_inventory'):
+        content['official_inventory'] = manifest['official_inventory']
     return hashlib.sha256(json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()

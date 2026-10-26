@@ -1,0 +1,18 @@
+.record-pagination { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; padding-top: 14px; }
+.record-pagination .inline-field { flex-shrink: 0; white-space: nowrap; }
+.record-pagination.pagination select, .record-pagination.pagination button { min-height: 44px; }
+.record-pagination.pagination button { min-width: 44px; padding: 8px; }
+.record-pagination .record-page-summary { display: block; flex: 1; min-width: 150px; font-size: 12px; }
+.record-page-buttons { flex-wrap: wrap; gap: 6px; }
+.record-page-number { min-width: 80px; text-align: center; font-size: 12px; white-space: nowrap; }
+.record-table[aria-busy="true"] { opacity: .55; }
+.record-table table { min-width: 820px; }
+.record-section-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.record-section-heading h3 { margin-bottom: 0; }
+.record-section-heading button { min-height: 44px; }
+.record-retry { margin: 10px 0; min-height: 44px; }
+@media (max-width: 640px) {
+  .record-pagination { gap: 10px; }
+  .record-pagination .record-page-summary { flex-basis: 100%; min-width: 0; text-align: left; }
+  .record-page-buttons { width: 100%; justify-content: center; }
+}

@@ -109,6 +109,11 @@ def test_incremental_save_then_two_human_submissions_with_existing_next_stage_ph
     repair = services['reviews'].get(row['review_id'])
     assert services['reviews'].confirm(repair['id'], repair['fingerprint'])['state'] == 'verified'
     assert services['domain'].case(case['id'])['workflow_stage'] == 'acceptance'
+    services['default_packages'].run_once()
+    request = services['db'].one("SELECT * FROM default_package_requests WHERE source_id=?", (repair['id'],))
+    assert request and request['source'] == 'submission' and request['state'] == 'pending'
+    assert services['default_packages'].get(case['id'])['state'] == 'preparing'
+    assert len(services['jobs'].list()) == 1
     assert tick(auto, case['id'])['state'] == 'waiting_stage'
     assert len(uploads) == 6 and [p['state'] for _, p in writes].count(1) == 2
 
@@ -238,6 +243,52 @@ def test_unchanged_case_does_not_poll_official_or_recreate_proposal(platform, se
     monkeypatch.setattr(services['workflow'], 'refresh_case', lambda *args: pytest.fail('No new evidence'))
     assert auto.run_once() == 0
     assert auto.get(case['id'])['review_id'] == original
+
+
+def test_idle_upload_scan_connections_are_bounded(platform, services, case, photo, monkeypatch):
+    auto, add, _, _, _ = setup_flow(services, platform, case, photo, monkeypatch)
+    ready(services, platform, case, add, auto)
+    connections, connect = [], services['db'].connect
+    def counted():
+        connections.append(1)
+        return connect()
+    monkeypatch.setattr(services['db'], 'connect', counted)
+    monkeypatch.setattr(auto, 'process', lambda *args: pytest.fail('Unchanged case was processed'))
+    assert auto.run_once() == 0
+    assert len(connections) <= 4  # Policy, discovery policy/query, one shared scan.
+
+
+def test_retry_deadline_and_new_photo_still_run_immediately(platform, services, case, photo, monkeypatch):
+    auto, add, _, _, _ = setup_flow(services, platform, case, photo, monkeypatch)
+    ready(services, platform, case, add, auto)
+    seen = []
+    def process(row):
+        # An actual write verifies that the scan's read snapshot has closed.
+        auto._record(row['case_id'], 'awaiting_confirmation', {'reason': 'checked'})
+        seen.append(row['case_id'])
+    monkeypatch.setattr(auto, 'process', process)
+    assert auto.run_once() == 0
+    with services['db'].tx() as con:
+        con.execute('UPDATE automatic_upload_cases SET retry_at=1 WHERE case_id=?', (case['id'],))
+    assert auto.run_once() == 1
+    assert auto.run_once() == 0
+    add('purple', 'survey', 'problem')
+    assert auto.run_once() == 1
+    assert seen == [case['id'], case['id']]
+
+
+def test_pause_after_candidate_scan_prevents_processing(platform, services, case, photo, monkeypatch):
+    from contextlib import contextmanager
+    auto, _, _, _, _ = setup_flow(services, platform, case, photo, monkeypatch)
+    snapshot = services['db'].read_snapshot
+    @contextmanager
+    def pause_after_scan():
+        with snapshot() as con:
+            yield con
+        auto.enroll(case['id'], enabled=False)
+    monkeypatch.setattr(services['db'], 'read_snapshot', pause_after_scan)
+    monkeypatch.setattr(auto, 'process', lambda *args: pytest.fail('Paused case was processed'))
+    assert auto.run_once() == 0
 
 
 def test_revoked_group_permission_stops_auto_save(platform, services, case, photo, monkeypatch, bot):

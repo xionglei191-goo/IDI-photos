@@ -7,7 +7,7 @@ import logging
 import threading
 from datetime import datetime, timedelta, timezone
 
-from .db import dump, now, uid
+from .db import dump, is_database_busy, now, uid
 from .domain import DomainError
 from .platform_client import PlatformBudgetReached, PlatformReadPaused
 from .workflow import remote_stage
@@ -503,17 +503,23 @@ class PlatformSync:
                     self._plan(run, checkpoint)
                 if checkpoint['phase'] == 'details':
                     items = self.db.all('SELECT * FROM platform_sync_items WHERE run_id=? ORDER BY rowid', (run_id,))
-                    progress(sum(v['state'] == 'done' for v in items), len(items))
+                    completed = sum(v['state'] == 'done' for v in items)
+                    progress(completed, len(items))
                     consecutive = 0
-                    for index, item in enumerate(items, 1):
+                    for item in items:
                         if item['state'] == 'done':
                             continue
                         try:
                             self._item(item, session, run, checkpoint)
+                            completed += 1
                             consecutive = 0
                         except (PlatformReadPaused, PlatformBudgetReached):
                             raise
                         except Exception as exc:
+                            if is_database_busy(exc):
+                                # Leave this item pending and resume the durable
+                                # checkpoint; do not classify contention as bad data.
+                                raise
                             if isinstance(exc, DomainError) and exc.status in (401, 403):
                                 raise
                             with self.db.tx() as con:
@@ -521,7 +527,7 @@ class PlatformSync:
                             consecutive += 1
                             if consecutive >= 3:
                                 raise DomainError('连续三个案件核验失败，已停止后续请求，请核对错误', 409)
-                        progress(index, len(items))
+                        progress(completed, len(items))
                     self._session(session)
                     self._publish(run, checkpoint)
                 if checkpoint['phase'] == 'photos':
@@ -537,8 +543,16 @@ class PlatformSync:
             state, error, retry_at = 'partial', str(exc), (self.clock() + timedelta(seconds=exc.retry_after)).isoformat()
         except Exception as exc:
             state, error = 'partial', str(exc)[:1000]
-            if isinstance(exc, DomainError) and exc.status in (401, 403):
+            if is_database_busy(exc):
+                failures = checkpoint.get('database_retries', 0) + 1
+                checkpoint['database_retries'] = failures
+                delay = min(300, 30 * 2 ** min(failures - 1, 4))
+                error = '本地数据库繁忙，已保留同步进度，将自动重试'
+                retry_at = (self.clock() + timedelta(seconds=delay)).isoformat()
+            elif isinstance(exc, DomainError) and exc.status in (401, 403):
                 retry_at = (self.clock() + timedelta(seconds=60)).isoformat()
+        if state == 'completed':
+            checkpoint.pop('database_retries', None)
         errors = self.db.all("SELECT report_receiving_id AS record_id,error FROM platform_sync_items WHERE run_id=? AND state='error'", (run_id,))
         counts = {scope: info.get('total', 0) for scope, info in checkpoint['scans'].items()}
         total = self.db.one('SELECT total,request_count FROM platform_sync_runs WHERE id=?', (run_id,))

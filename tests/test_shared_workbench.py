@@ -108,11 +108,12 @@ def test_chat_binds_person_and_model_only_receives_authorized_projects(app, scop
 
 
 @pytest.mark.parametrize('when', ['queued', 'during_model'])
-def test_chat_rechecks_revoked_scope_before_and_after_model(scoped, services, project, chat, monkeypatch, when):
+@pytest.mark.parametrize('selection', ['project', 'all'])
+def test_chat_rechecks_revoked_scope_before_and_after_model(scoped, services, project, chat, monkeypatch, when, selection):
     manager, user, private_project, _ = scoped
     # Retain a second management assignment so access to the shared UI stays on.
     services['access'].save_members(private_project['id'], {'members': [{'user_id': user['id'], 'role': 'manager'}]})
-    first = send(manager, project_id=project['id']).json()
+    first = send(manager, **({'project_id': project['id']} if selection == 'project' else {})).json()
     calls = []
     def revoke():
         services['access'].save_members(project['id'], {'members': []})
@@ -141,6 +142,29 @@ def test_manager_cannot_recover_a_previous_admin_browser_thread(scoped, chat, cl
     chat.run_one()
     assert manager.get('/api/workspace-chat/threads/' + first['thread_id'], headers=HEADERS).status_code == 404
     assert manager.get('/api/workspace-chat', headers=HEADERS).json()['threads'] == []
+
+
+def test_all_projects_chat_adds_only_newly_authorized_projects(scoped, chat, services, project, monkeypatch):
+    manager, user, private_project, private_case = scoped
+    first = send(manager).json()
+    monkeypatch.setattr(chat, 'request_model', lambda *_: response(text='原有授权范围。'))
+    assert chat.run_one()
+    added = services['domain'].save_project({'name': '新授权项目'})
+    services['access'].save_members(added['id'], {'members': [{'user_id': user['id'], 'role': 'manager'}]})
+    sent = send(manager, thread_id=first['thread_id'])
+    assert sent.status_code == 200, sent.text
+    replies = iter([response(('read_followup_summary', {})), response(text='已按当前授权核对。')])
+    calls = []
+    monkeypatch.setattr(chat, 'request_model', lambda messages, *_: calls.append(dump(messages)) or next(replies))
+    assert chat.run_one()
+    row = services['db'].one('SELECT project_ids FROM workspace_chat_threads WHERE id=?', (first['thread_id'],))
+    assert set(json.loads(row['project_ids'])) == {project['id'], added['id']}
+    assert '新授权项目' in calls[-1]
+    assert all(private_project['name'] not in value and private_case['title'] not in value for value in calls)
+    services['access'].save_members(project['id'], {'members': []})
+    # Do not drop a revoked project and then expose its old conversation history.
+    assert send(manager, thread_id=first['thread_id']).status_code == 403
+    assert manager.get('/api/workspace-chat/threads/' + first['thread_id'], headers=HEADERS).status_code == 403
 
 
 def test_feishu_records_require_the_entire_frozen_project_scope(scoped, services, project, bot):

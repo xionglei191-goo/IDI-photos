@@ -20,6 +20,9 @@ QUESTION = '今天有哪些案件有进展？'
 @pytest.fixture(autouse=True)
 def server_clock(monkeypatch):
     monkeypatch.setattr('idi.agent_dates.now', lambda: STAMP)
+    # A workspace question is anchored to its stored creation time, so freeze
+    # that clock together with the evidence clock rather than using today's date.
+    monkeypatch.setattr('idi.workspace_chat.now', lambda: STAMP)
 
 
 def dated(text=QUESTION):

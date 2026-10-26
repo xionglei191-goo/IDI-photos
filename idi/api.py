@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from fastapi import Body, FastAPI, File, Form, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from openpyxl import Workbook
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -50,6 +50,7 @@ from .review_notifications import ReviewNotifications
 from .operations import Operations, operations_routes
 from .mobile_camera import MobileCamera, camera_routes
 from .official_camera import OfficialCamera, official_camera_routes
+from .camera_timing import CameraTimingMiddleware
 from .photo_dedup import PhotoDedup
 from .access import Access, access_routes
 from .identity import acting_as, current
@@ -81,6 +82,9 @@ def create_app(settings: Settings | None = None):
     workflow = Workflow(db, domain, platform, jobs)
     reviews = ReviewBatches(workflow)
     platform.workflow = workflow
+    from .package_media import PackageMedia
+    reporter.official = PackageMedia(platform, access)
+    reporter.picc.official = reporter.official
     connectors = ConnectorService(settings, db, importer, jobs)
     followup = ProjectFollowup(settings, db, domain, storage, connectors, recognizer)
     photo_ai = PhotoAI(db, domain, storage, recognizer, followup)
@@ -515,8 +519,9 @@ def create_app(settings: Settings | None = None):
         return importer.batch(batch_id)
 
     @app.get("/api/jobs")
-    def list_jobs():
-        return jobs.list()
+    def list_jobs(page: int | None = Query(None, ge=1), page_size: int = Query(20, ge=1, le=100)):
+        # The dashboard's live task feed keeps its existing array response.
+        return jobs.list() if page is None else jobs.list_page(page, page_size)
 
     @app.get("/api/jobs/{job_id}")
     def get_job(job_id: str):
@@ -581,6 +586,9 @@ def create_app(settings: Settings | None = None):
 
     @app.post("/api/packages")
     def create_package(data: dict = Body(...)):
+        if data.get('case_id'):
+            return reporter.enqueue_case_export(jobs, data['case_id'], data.get('template_id', 'general'),
+                                                data.get('title', ''), data.get('parent_id'))
         return reporter.enqueue_export(jobs, photo_ids(data), data.get('template_id', 'general'), data.get('parent_id'), data.get('title', ''))
 
     @app.get("/api/packages")
@@ -749,4 +757,5 @@ def create_app(settings: Settings | None = None):
             return FileResponse(index, headers={"Cache-Control": "no-cache"})
         return JSONResponse({"detail": "前端尚未构建，请运行 scripts/setup.ps1"}, status_code=503)
 
+    app.add_middleware(CameraTimingMiddleware)
     return app

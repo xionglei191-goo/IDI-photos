@@ -102,6 +102,33 @@ class JobRunner:
         self._wake.set()
         return self.get(job_id)
 
+    def list_page(self, page=1, page_size=20):
+        if type(page) is not int or page < 1 or type(page_size) is not int or not 1 <= page_size <= 100:
+            raise DomainError('任务分页参数无效')
+        person = current()
+        own = person is not None and not person.admin
+        with self.db.read_snapshot() as con:
+            if own:
+                # Count only accessible tasks. Scan their scopes without loading
+                # historical result bodies or opening a connection per task.
+                visible = []
+                for row in con.execute('SELECT id,payload FROM jobs WHERE user_id=? ORDER BY created_at DESC,id DESC', (person.id,)):
+                    try:
+                        self.check_scope({'payload': json.loads(row['payload'])})
+                        visible.append(row['id'])
+                    except DomainError:
+                        continue
+                total = len(visible)
+            else:
+                total = con.execute('SELECT COUNT(*) FROM jobs').fetchone()[0]
+            pages = max(1, (total + page_size - 1) // page_size)
+            page = min(page, pages)
+            offset = (page - 1) * page_size
+            ids = visible[offset:offset + page_size] if own else [row['id'] for row in con.execute(
+                'SELECT id FROM jobs ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?', (page_size, offset))]
+            items = [self.get(job_id) for job_id in ids]
+        return {'items': items, 'total': total, 'page': page, 'page_size': page_size, 'pages': pages}
+
     def start(self):
         if self._thread and self._thread.is_alive():
             return
@@ -123,7 +150,8 @@ class JobRunner:
 
     def run_one(self, lane=None):
         with self.db.tx() as con:
-            restriction = " AND kind='platform_sync'" if lane == 'network' else " AND kind<>'platform_sync'" if lane == 'local' else ''
+            network = "(kind='platform_sync' OR (kind='export' AND COALESCE(json_extract(payload,'$.check_official_media'),0)=1))"
+            restriction = ' AND ' + network if lane == 'network' else ' AND NOT ' + network if lane == 'local' else ''
             row = con.execute("SELECT * FROM jobs WHERE state='queued'" + restriction + " ORDER BY created_at LIMIT 1").fetchone()
             if not row:
                 return False

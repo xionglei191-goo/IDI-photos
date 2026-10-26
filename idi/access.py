@@ -6,13 +6,16 @@ import hmac
 import json
 import re
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Body, Request, Response
+from fastapi import APIRouter, Body, Query, Request, Response
+from starlette.concurrency import run_in_threadpool
 
 from .db import audit, dump, now, uid
 from .domain import DomainError
 from .identity import Principal, current, require_admin, require_project
+from .camera_timing import CameraTiming, SCOPE_KEY
 
 COOKIE = 'idi_session'
 SESSION_HOURS = 12
@@ -212,9 +215,16 @@ class Access:
                                '/api/camera/sdk-config', '/api/camera/native-config', '/api/camera/native-session',
                                '/api/camera/h5-config', '/api/camera/h5-session')
         if any(path == prefix or path.startswith(prefix + '/') for prefix in camera_device_paths):
-            device = request.app.state.services['mobile_camera'].authenticate(request)
+            timing = request.scope.get(SCOPE_KEY) or CameraTiming()
+            submitted = time.perf_counter()
+            def authenticate():
+                timing.queued(submitted)
+                with timing.measure('auth'):
+                    device = request.app.state.services['mobile_camera'].authenticate(request)
+                    return device, self.principal(device['user_id'])
+            device, person = await run_in_threadpool(authenticate)
             request.state.camera_device = device
-            return self.principal(device['user_id'])
+            return person
         if not path.startswith('/api/'):
             if path == '/camera-setup':
                 person = self.session(request)
@@ -264,7 +274,7 @@ class Access:
             return
         if path in ('/api/packages', '/api/packages/preview') and method == 'POST':
             data = await request.json()
-            if not data.get('photo_ids'):
+            if not data.get('photo_ids') and not (path == '/api/packages' and data.get('case_id')):
                 raise DomainError('请选择本项目照片', 403)
             self._body_scope(data, True)
             if data.get('parent_id'):
@@ -433,19 +443,29 @@ def access_routes(service):
         return service.save_members(project_id, data)
 
     @router.get('/api/access/website-operations')
-    def operations(project_id: str | None = None):
+    def operations(project_id: str | None = None, page: int | None = Query(None, ge=1),
+                   page_size: int = Query(20, ge=1, le=100)):
         from .identity import project_filter
         scope, args = project_filter('w.project_id')
         if project_id:
             require_project(project_id)
             scope += ' AND w.project_id=?'
             args.append(project_id)
-        rows = service.db.all('SELECT w.*,pr.name AS project_name,c.title AS case_title FROM website_operations w '
-                              'JOIN projects pr ON pr.id=w.project_id JOIN cases c ON c.id=w.case_id WHERE ' +
-                              scope + ' ORDER BY w.created_at DESC LIMIT 200', args)
+        source = (' FROM website_operations w JOIN projects pr ON pr.id=w.project_id '
+                  'JOIN cases c ON c.id=w.case_id WHERE ' + scope)
+        with service.db.read_snapshot():
+            if page is not None:
+                total = service.db.one('SELECT COUNT(*) AS n' + source, args)['n']
+                pages = max(1, (total + page_size - 1) // page_size)
+                page = min(page, pages)
+            rows = service.db.all('SELECT w.*,pr.name AS project_name,c.title AS case_title' + source +
+                                  ' ORDER BY w.created_at DESC,w.id DESC LIMIT ? OFFSET ?',
+                                  [*args, page_size if page is not None else 200,
+                                   (page - 1) * page_size if page is not None else 0])
         for row in rows:
             for key in ('photo_ids', 'source_users'):
                 row[key] = json.loads(row[key])
-        return rows
+        return rows if page is None else {'items': rows, 'total': total, 'page': page,
+                                         'page_size': page_size, 'pages': pages}
 
     return router

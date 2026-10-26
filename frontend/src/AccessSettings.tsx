@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { RefreshCw } from 'lucide-react';
 import { api, message, patch, post, put } from './api';
-import { dateTime, Empty, ErrorBox, Modal, useData } from './common';
+import { dateTime, Empty, ErrorBox, Loading, Modal, useData } from './common';
 import type { Person } from './Auth';
 import type { Notify, Project } from './types';
 import PlatformAccountSettings from './PlatformAccountSettings';
+import RecordPagination, { useRecordPage } from './RecordPagination';
 
 interface User extends Person { enabled: boolean }
 interface Operation {
@@ -15,12 +17,13 @@ const stateLabels: Record<string, string> = { running: '执行中', failed: '失
 const operationLabels: Record<string, string> = { automatic_save: '自动保存照片', review_confirmation: '管理员确认', formal_submit: '正式提交', confirmed_save: '管理员保存', readback: '回读核实', withdraw_attachment: '撤回附件', withdraw_readback: '回读撤回结果' };
 
 export function WebsiteOperations({ projectId = '', revision = 0 }: { projectId?: string; revision?: number }) {
-  const records = useData<Operation[]>('/api/access/website-operations' + (projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''), revision);
-  return <section className="settings-card"><h3>官网操作记录</h3><p className="muted">记录实际上传人员、执行或确认人员、项目官网账号和操作结果。</p><ErrorBox error={records.error} />
-    {!records.data?.length ? <Empty>暂无官网操作记录</Empty> : <div className="table-wrap"><table><thead><tr><th>时间 / 项目</th><th>案件</th><th>实际上传人员</th><th>执行 / 确认人员</th><th>官网账号</th><th>操作 / 结果</th></tr></thead><tbody>{records.data.map(row => <tr key={row.id}>
+  const records = useRecordPage<Operation>('/api/access/website-operations' + (projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''), 'idi.website-operations.page-size', revision);
+  return <section className="settings-card" aria-label="官网操作记录"><div className="record-section-heading"><h3>官网操作记录</h3><button disabled={records.loading} onClick={records.refresh}><RefreshCw size={15} aria-hidden="true" />刷新记录</button></div><p className="muted">记录实际上传人员、执行或确认人员、项目官网账号和操作结果。</p><ErrorBox error={records.error} />
+    {records.error ? <button className="record-retry" onClick={records.refresh}>重试读取记录</button> : !records.items.length ? records.loading ? <Loading /> : <Empty>暂无官网操作记录</Empty> : <div className="table-wrap record-table" aria-busy={records.loading}><table><thead><tr><th>时间 / 项目</th><th>案件</th><th>实际上传人员</th><th>执行 / 确认人员</th><th>官网账号</th><th>操作 / 结果</th></tr></thead><tbody>{records.items.map(row => <tr key={row.id}>
       <td>{dateTime(row.created_at)}<small>{row.project_name}</small></td><td>{row.case_title}</td><td>{row.source_users.map(user => user.display_name).join('、') || '—'}</td>
       <td>{row.actor_name}</td><td>{row.website_account || '尚未配置'}</td><td>{operationLabels[row.operation] || row.operation}<small>{stateLabels[row.state] || row.state}</small>{row.error && <small className="danger-text">{row.error}</small>}</td>
     </tr>)}</tbody></table></div>}
+    <RecordPagination label="官网操作记录" {...records} />
   </section>;
 }
 
@@ -31,7 +34,7 @@ export default function AccessSettings({ projects, notify, initialProjectId, foc
   const [roles, setRoles] = useState<Record<string, string>>({}), [saving, setSaving] = useState(false), [error, setError] = useState('');
   const [editing, setEditing] = useState<User | 'new' | null>(null);
   useEffect(() => { setRoles(Object.fromEntries((users.data || []).map(user => [user.id, user.projects[projectId] || '']))); }, [projectId, users.data]);
-  useEffect(() => { if (!projectId && projects.length) setProjectId(projects[0].id); }, [projects, projectId]);
+  useEffect(() => { if (projects.length) setProjectId(current => current || projects[0].id); }, [projects]);
   useEffect(() => { if (initialProjectId && projects.some(p => p.id === initialProjectId)) setProjectId(initialProjectId); }, [initialProjectId]);
   useEffect(() => {
     if (focusProjectAccount && projectId === initialProjectId) {

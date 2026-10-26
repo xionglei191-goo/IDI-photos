@@ -211,10 +211,15 @@ class CaseAgent:
         return {**self.get(run_id), 'cached': cached}
 
     def cancel(self, run_id):
+        from .identity import require_project
         with self.db.tx() as con:
-            row = con.execute('SELECT state FROM case_agent_runs WHERE id=?', (run_id,)).fetchone()
+            row = con.execute('SELECT state,case_id FROM case_agent_runs WHERE id=?', (run_id,)).fetchone()
             if not row:
                 raise DomainError('审阅记录不存在', 404)
+            case = con.execute('SELECT project_id FROM cases WHERE id=?', (row['case_id'],)).fetchone()
+            if not case:
+                raise DomainError('案件不存在', 404)
+            require_project(case['project_id'], manage=True)
             if row['state'] in ACTIVE:
                 con.execute("UPDATE case_agent_runs SET state='cancelled',error='用户停止审阅；已发生的接口调用可能仍在结束中',finished_at=? WHERE id=?", (now(), run_id))
                 audit(con, 'case_agent', run_id, 'cancel')

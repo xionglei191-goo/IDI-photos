@@ -17,7 +17,7 @@ export default function CaseBoard({ board, source, changeSource, projectId, buil
   useEffect(() => setPage(1), [projectId, building, delayed, status, archived]);
   const result = useData<BoardData>('/api/workflow/board?' + queryString({ board, source, project_id: projectId, building, query: delayed, status, page, archived }), revision);
   const data = result.data;
-  const fullSync = jobs.find(j => j.kind === 'platform_sync' && (j.payload.mode || 'full') === 'full' && ['queued', 'running'].includes(j.state));
+  const activeSync = jobs.find(j => j.kind === 'platform_sync' && j.payload.mode === 'incremental' && ['queued', 'running'].includes(j.state));
   const stats = board === 'intake' ? ['pending_intake', 'insurer_review', 'insurer_intake', 'historical_unverified'] : ['survey', 'repair', 'acceptance', 'settlement'];
   const availableStages = source === 'platform' ? Object.keys(WORKFLOW_STAGES) : [...stats, ...(archived ? ['closed', 'direct_payment', 'noncoverage'] : [])];
   const pages = Math.max(1, Math.ceil((data?.total || 0) / 30));
@@ -31,7 +31,7 @@ export default function CaseBoard({ board, source, changeSource, projectId, buil
           return <button aria-pressed={status === key} title={`${hint}；再次点击取消筛选`} className={`stat-card ${status === key ? 'selected' : ''}`} key={key} onClick={() => setStatus(status === key ? '' : key)}><span>{WORKFLOW_STAGES[key]}</span><strong>{data?.counts[key] || 0}</strong><small className="visually-hidden">{hint}</small></button>;
         })}
       </div>
-      <div className="row board-actions"><button onClick={importFiles}><FolderInput size={16} aria-hidden="true" />导入照片</button><button onClick={create}><Plus size={16} aria-hidden="true" />新建案件</button><SyncControls value={data?.sync} fullSync={fullSync} sync={sync} refresh={refresh} notify={notify} /></div>
+      <div className="row board-actions"><button onClick={importFiles}><FolderInput size={16} aria-hidden="true" />导入照片</button><button onClick={create}><Plus size={16} aria-hidden="true" />新建案件</button><SyncControls value={data?.sync} activeSync={activeSync} sync={sync} refresh={refresh} notify={notify} /></div>
     </div>
     {!!summary?.exceptions && <div className="exception-banner"><span><b>{summary.exceptions} 项照片待确认</b> · 编号、位置或分类需要核对</span><button className="text-button" onClick={() => showPhotos('', '', 'exceptions')}>去确认 <ArrowRight size={14} /></button></div>}
     {data?.sync.latest && ['failed', 'partial'].includes(data.sync.latest.state) && <div className="notice">最近台账同步{data.sync.latest.state === 'partial' ? '部分完成' : '未完成'}：{data.sync.latest.error}。已保存的案件和照片仍可使用。</div>}

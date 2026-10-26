@@ -58,6 +58,7 @@ def normalize_date(value):
 class PiccRecords:
     def __init__(self, db, domain):
         self.db, self.domain = db, domain
+        self.official = None
 
     def all_photos(self, case_id):
         self.domain.case(case_id)
@@ -68,6 +69,10 @@ class PiccRecords:
             if len(items) >= result['total']:
                 return items
             page += 1
+
+    def package_photos(self, case_id):
+        from .package_media import supplement
+        return supplement(self.all_photos(case_id), self.official.cached_photos(case_id) if self.official else [])
 
     def survey_date(self, case_id, rows, photos):
         link = self.db.one('SELECT snapshot FROM platform_links WHERE case_id=?', (case_id,))
@@ -108,7 +113,7 @@ class PiccRecords:
         if draft:
             saved = json.loads(draft['fields'])
             fields.update({key: saved[key] for key in EDITABLE_FIELDS if key in saved})
-        rows = self.all_photos(case_id) if rows is None else rows
+        rows = self.package_photos(case_id) if rows is None else rows
         excluded_hashes = set(json.loads(draft['photo_overrides']).get('excluded_blob_hashes', [])) if draft else set()
         groups = {}
         for row in rows:
@@ -127,6 +132,7 @@ class PiccRecords:
                     sort_time, source = parsed, kind
                     break
             photos.append({'id': row['id'], 'original_name': row['original_name'],
+                           'original_url': row.get('original_url') or '/api/photos/' + row['id'] + '/original',
                            'thumbnail_url': row['thumbnail_url'], 'sort_time': sort_time,
                            'time_source': source, 'time_label': TIME_LABELS[source],
                            'remarks': '', 'excluded': row['blob_hash'] in excluded_hashes,
@@ -147,6 +153,7 @@ class PiccRecords:
         if missing:
             blockers.append(f'{missing}张照片的上传时间异常，请刷新资料后重试')
         return {'case_id': case_id, 'revision': draft['revision'] if draft else 0,
+                'official_sync_available': bool(self.official and self.official.linked(case_id)),
                 'fields': fields, 'survey_date_source': date_source, 'photos': photos, 'photo_overrides': {},
                 'excluded_photos': excluded_photos, 'duplicate_count': sum(len(v) - 1 for v in groups.values()),
                 'video_count': sum(p['media_type'] == 'video' for p in rows),
@@ -175,6 +182,9 @@ class PiccRecords:
             if action is not None:
                 photo = con.execute("SELECT p.blob_hash FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE p.id=? AND p.case_id=? AND b.media_type='image'",
                                     (action['id'], case_id)).fetchone()
+                if not photo and self.official:
+                    photo = next((p for p in self.official.cached_photos(case_id)
+                                  if p['id'] == action['id'] and p['media_type'] == 'image'), None)
                 if not photo:
                     raise DomainError('照片已变化或不属于本案，请刷新照片后重试', 409)
                 if action['excluded']:

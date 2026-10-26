@@ -426,12 +426,13 @@ class Domain:
             audit(con, "template", template_id, "update" if before else "create", before, data)
         return next(t for t in self.templates() if t["id"] == template_id)
 
-    def completeness(self, case_id, template_id="general", photo_ids=None):
+    def completeness(self, case_id, template_id="general", photo_ids=None, *, additional_photos=()):
         case = self.case(case_id)
         template = next((t for t in self.templates() if t["id"] == template_id), None)
         if not template:
             raise DomainError("资料要求模板不存在", 404)
         all_photos = self.db.all("SELECT p.*,b.media_type,v.visit_date,v.visit_key,v.basis FROM photos p JOIN blobs b ON b.hash=p.blob_hash LEFT JOIN visits v ON v.id=p.visit_id WHERE p.case_id=?", (case_id,))
+        all_photos.extend(additional_photos)
         images = [p for p in all_photos if p["media_type"] == "image" and p['recognition_state'] != 'conflict' and (photo_ids is None or p["id"] in photo_ids)]
         full_case = photo_ids is None or {p['id'] for p in all_photos if p['media_type'] == 'image'}.issubset(set(photo_ids))
         shared = {r['photo_id']: r for r in self.db.all('SELECT s.photo_id,s.visit_id,v.visit_date,v.visit_key,v.basis FROM visit_shared_checkins s JOIN visits v ON v.id=s.visit_id WHERE v.case_id=? '

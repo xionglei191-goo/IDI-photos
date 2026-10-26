@@ -264,12 +264,23 @@ class AutomaticUploads:
         processed = 0
         try:
             self._discover()
-            for small in self.db.all("SELECT u.case_id FROM automatic_upload_cases u WHERE u.enabled=1 ORDER BY EXISTS(SELECT 1 FROM photos p WHERE p.case_id=u.case_id AND p.photo_group IN ('survey_checkin','work_checkin') AND p.updated_at>=u.updated_at) DESC,u.updated_at"):
+            # Signature checks are read-only. Reuse one consistent connection
+            # per scan without holding a transaction over uploads or writes.
+            candidates = []
+            with self.db.read_snapshot():
+                for row in self.db.all("SELECT u.* FROM automatic_upload_cases u WHERE u.enabled=1 ORDER BY EXISTS(SELECT 1 FROM photos p WHERE p.case_id=u.case_id AND p.photo_group IN ('survey_checkin','work_checkin') AND p.updated_at>=u.updated_at) DESC,u.updated_at"):
+                    if self._stop.is_set():
+                        break
+                    changed = row['signature'] != self.signature(row['case_id'])
+                    if changed or row['retry_at'] and row['retry_at'] <= time.time():
+                        candidates.append(row['case_id'])
+                    if len(candidates) >= 10:
+                        break
+            for case_id in candidates:
                 if self._stop.is_set() or not self.policy().get('enabled'):
                     break
-                row = self.get(small['case_id'])
-                changed = row['signature'] != self.signature(row['case_id'])
-                if not changed and (not row['retry_at'] or row['retry_at'] > time.time()):
+                row = self.get(case_id)
+                if not row or not row['enabled']:
                     continue
                 try:
                     self.process(row)

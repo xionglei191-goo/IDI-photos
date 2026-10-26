@@ -33,7 +33,7 @@ const SECTIONS = [
 interface Props {
   target: SettingsTarget; navigate: (target: SettingsTarget) => void; back: () => void; backLabel: string;
   system: System | null; session: PlatformSession | null; projects: Project[]; cases: Case[]; currentCase?: Case; jobs: Job[];
-  revision: number; refresh: () => void; notify: Notify; login: () => void; sync: () => Promise<void>;
+  revision: number; refresh: () => void; notify: Notify; login: () => void; sync: () => Promise<void>; syncFull: () => Promise<void>;
   editProject: (project: Project) => void; newProject: () => void; openCase: (id: string) => void;
   leave: () => Promise<boolean>; registerLeave: (callback: (() => Promise<boolean>) | null) => void;
 }
@@ -69,6 +69,7 @@ export default function SettingsCenter(props: Props) {
   const taskTab = ['uploads', 'runtime', 'jobs'].includes(target.tab || '') ? target.tab! : 'uploads';
   const existingTab = target.section === 'recognition' || target.section === 'backup' ? target.section : materialTab;
   const hasExistingPanel = ['recognition', 'materials', 'backup'].includes(target.section);
+  const fullSync = jobs.find(job => job.kind === 'platform_sync' && (job.payload.mode || 'full') === 'full' && ['queued', 'running'].includes(job.state));
   return <section className="workspace settings-center" aria-label="系统设置">
     <div className="page-heading"><div><h1>系统设置</h1><p>连接、自动处理和运行记录集中管理</p></div><button onClick={props.back}><ArrowLeft size={15} aria-hidden="true" />{props.backLabel}</button></div>
     <div className="settings-layout">
@@ -80,11 +81,12 @@ export default function SettingsCenter(props: Props) {
         {isAdmin && target.section === 'connections' && <PlatformAccountSettings refresh={refresh} notify={notify} registerLeave={registerAccountLeave} />}
         {isAdmin && target.section === 'connections' && <><section className="settings-card" aria-label="IDI 水印相机"><h3>IDI 水印相机</h3><p>安卓相机通过今日官方 Android 原生 SDK 拍摄，原片上传到电脑归档，不自动提交保司。本地验真为可选项，默认关闭；拍摄前需联网并允许相机和精确定位。</p><div className="row wrap"><a className="button" href="/camera/download">下载安卓安装包</a><a className="button" href="/camera-setup" target="_blank" rel="noreferrer">管理手机连接</a></div><p className="muted">系统管理员登录后可在此管理手机连接，选择人员和项目并生成配对码。</p></section><Connections embedded projects={projects} cases={cases} revision={revision} refresh={refresh} notify={notify} /></>}
         {target.section === 'automation' && <AutomaticSettings {...props} />}
+        {isAdmin && target.section === 'materials' && <section className="settings-card" aria-label="官网完整同步"><h3>官网完整同步</h3><p>完整核对理赔受理、查勘维修两张清单，以及全部案件详情和官网附件。日常更新可使用案件看板的手动同步。</p><SyncControls mode="full" activeSync={fullSync} sync={props.syncFull} refresh={refresh} notify={notify} /></section>}
         {target.section === 'materials' && <div className="settings-subnav" role="group" aria-label="资料管理分类">{[['projects', '项目管理'], ['templates', '资料要求'], ['archive', '资料目录']].map(([tab, label]) => <button key={tab} aria-pressed={materialTab === tab} onClick={() => navigate({ section: 'materials', tab })}>{label}</button>)}</div>}
         {target.section === 'tasks' && <><div className="settings-subnav" role="group" aria-label="后台任务分类">{[['uploads', '保存进度'], ['runtime', '运行详情'], ['jobs', '任务记录']].map(([tab, label]) => <button key={tab} aria-pressed={taskTab === tab} onClick={() => navigate({ section: 'tasks', tab })}>{label}</button>)}</div>
           {taskTab === 'uploads' && <AutomaticUploads view="progress" currentCase={props.currentCase} openCase={props.openCase} leave={props.leave} refresh={refresh} notify={notify} login={login} openProjectAccount={projectId => navigate({ section: 'access', projectId })} />}
           {taskTab === 'runtime' && <RuntimeStatus login={login} settings={() => navigate({ section: 'recognition' })} channels={() => navigate({ section: 'connections' })} />}
-          {taskTab === 'jobs' && <JobsWorkspace embedded jobs={jobs} refresh={refresh} notify={notify} />}
+          {taskTab === 'jobs' && <JobsWorkspace embedded revision={revision} refresh={refresh} notify={notify} />}
         </>}
         {isAdmin && hasExistingPanel && <SettingsWorkspace embedded initialTab={existingTab} system={system} projects={projects} revision={revision} refresh={refresh} notify={notify} editProject={editProject} newProject={newProject} registerLeave={registerWorkspaceLeave} />}
         {isAdmin && target.section === 'backup' && <p className="settings-help"><Archive size={15} aria-hidden="true" />备份包含案件、照片原件和报送记录。</p>}

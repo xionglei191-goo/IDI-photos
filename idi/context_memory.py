@@ -79,31 +79,63 @@ def history_notice(task):
         f'对话范围：最近24小时内还有 {member_count} 条您的群消息未带入本次上下文，涉及这些内容时请引用原消息。' if member_count else '')))
 
 
-def bounded_tool_result(value, budget=7000):
-    """Keep valid JSON and explicitly label omissions, never slice serialized JSON."""
+def tool_result_times(value, field=''):
+    """Show timestamp fields in Beijing time; retain quotes and naive labels."""
+    if isinstance(value, dict):
+        return {key: tool_result_times(item, key) for key, item in value.items()}
+    if isinstance(value, list):
+        return [tool_result_times(item, field) for item in value]
+    if isinstance(value, str) and (field.endswith('_at') or field in ('at', 'watermark_time', 'oldest', 'newest')):
+        try:
+            stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if stamp.tzinfo is not None:
+                return stamp.astimezone(timezone(timedelta(hours=8))).isoformat()
+        except ValueError:
+            pass
+    return value
+
+
+def bounded_tool_result(value, budget=7000, *, tool_name=None, arguments=None):
+    """Deliver a complete result or an explicit error; never falsify pagination."""
+    value = tool_result_times(value)
     if token_estimate(value) <= budget:
         return dump(value)
-    clean = json.loads(dump(value))
-    omitted = 0
-    def shrink(node):
-        nonlocal omitted
-        if isinstance(node, dict):
-            return {key: shrink(part) for key, part in node.items()}
-        if isinstance(node, list):
-            keep = max(1, len(node) // 2)
-            omitted += len(node) - keep
-            return [shrink(part) for part in node[:keep]]
-        if isinstance(node, str) and len(node) > 500:
-            omitted += 1
-            return node[:500] + '（内容节选，请缩小查询范围）'
-        return node
-    for _ in range(8):
-        clean = shrink(clean)
-        result = {'data': clean, 'context_limit': {'truncated': True, 'omitted_items': omitted,
-            'instruction': '结果有省略，不能据此断言已覆盖全部资料；请缩小范围重新查询。'}}
-        if token_estimate(result) <= budget:
-            return dump(result)
-    return dump({'context_limit': {'truncated': True, 'instruction': '结果超过上下文预算，请按具体项目或案件重新查询。'}})
+    result = {'error': '工具结果超过上下文预算，本次结果未送达；不能作为已读取或完整查询的依据。',
+              'context_limit': {'truncated': True, 'delivered': False,
+                  'instruction': '请缩小项目、案件、日期或照片范围；支持分页的工具请减小 page_size 后重新读取。'}}
+    if isinstance(value, dict) and tool_name and isinstance(arguments, dict):
+        page = value
+        if 'selected_files' in value:
+            page = value['selected_files']
+        elif 'pagination' in value:
+            page = value['pagination'].get('events', {})
+        size = page.get('page_size', 0)
+        if type(size) is int and size > 1:
+            # Choose a divisor so the retry starts at the exact same offset.
+            smaller = next(n for n in range(size // 2, 0, -1) if size % n == 0)
+            retry = {**arguments, 'page': (page.get('page', 1) - 1) * size // smaller + 1, 'page_size': smaller}
+            result['retry'] = {'tool': tool_name, 'arguments': retry}
+    return dump(result)
+
+
+def tool_batch_error(calls):
+    """Reject malformed IDs; let the model split a valid but oversized batch."""
+    if not isinstance(calls, list) or not 1 <= len(calls) <= 16:
+        raise DomainError('模型工具调用格式或数量无效')
+    ids = set()
+    for call in calls:
+        if (not isinstance(call, dict) or not isinstance(call.get('id'), str)
+                or not 1 <= len(call['id']) <= 200 or call['id'] in ids
+                or not isinstance(call.get('function'), dict)
+                or not isinstance(call['function'].get('name'), str)
+                or not 1 <= len(call['function']['name']) <= 80):
+            raise DomainError('模型工具调用编号或格式无效，本轮未执行工具')
+        ids.add(call['id'])
+    if len(calls) > 4:
+        return '每轮最多调用4个工具，本轮全部未执行。请拆成多轮查询，读取结果后再继续。'
+    if len(calls) > 1 and any(c['function']['name'] == 'finish_reply' for c in calls):
+        return 'finish_reply 必须单独调用，本轮全部未执行。请先查询并接收结果，再完成答复。'
+    return None
 
 
 class ConversationContext:

@@ -5,10 +5,10 @@ import type { Job } from './types';
 import type { SyncStatus } from './workflowTypes';
 import usePermissions from './usePermissions';
 
-export default function SyncControls({ value, fullSync, sync, refresh, notify, mode = 'manual' }: {
-  value?: SyncStatus; fullSync?: Job; sync: () => Promise<void>; refresh: () => void;
+export default function SyncControls({ value, activeSync, sync, refresh, notify, mode = 'manual' }: {
+  value?: SyncStatus; activeSync?: Job; sync: () => Promise<void>; refresh: () => void;
   notify: (text: string, error?: boolean) => void;
-  mode?: 'manual' | 'policy';
+  mode?: 'manual' | 'full' | 'policy';
 }) {
   const { isAdmin } = usePermissions();
   const [schedule, setSchedule] = useState(value?.schedule);
@@ -30,7 +30,7 @@ export default function SyncControls({ value, fullSync, sync, refresh, notify, m
   }
 
   async function manual() {
-    if (dispatching.current || fullSync) return;
+    if (dispatching.current || activeSync) return;
     dispatching.current = true; setStarting(true);
     try { await sync(); }
     catch (e) { notify(message(e), true); }
@@ -42,9 +42,9 @@ export default function SyncControls({ value, fullSync, sync, refresh, notify, m
       {saving ? <LoaderCircle size={16} className="spin" aria-hidden="true" /> : <Clock3 size={16} aria-hidden="true" />}
       自动同步 <small>{saving ? '保存中' : !schedule ? '读取中' : schedule.enabled ? '已开启' : '已暂停'}</small>
     </button>}
-    {mode === 'manual' && <button className="primary" disabled={starting || !!fullSync} aria-busy={starting || !!fullSync} title="立即完整同步官网台账；自动同步进行中时会排队执行" onClick={() => void manual()}>
-      <RefreshCw size={16} className={starting || fullSync ? 'spin' : ''} aria-hidden="true" />
-      {starting ? '正在启动' : fullSync ? fullSync.state === 'queued' ? '等待同步' : '同步中' : isAdmin ? '手动同步' : '刷新清单'}
+    {mode !== 'policy' && <button className="primary" disabled={starting || !!activeSync} aria-busy={starting || !!activeSync} title={mode === 'full' ? '完整核对理赔受理、查勘维修两张清单和全部案件详情' : '增量同步昨天、今天的受理记录及全部在办维修案件；漏跑日期自动补查'} onClick={() => void manual()}>
+      <RefreshCw size={16} className={starting || activeSync ? 'spin' : ''} aria-hidden="true" />
+      {starting ? '正在启动' : activeSync ? activeSync.state === 'queued' ? '等待同步' : '同步中' : !isAdmin ? '刷新清单' : mode === 'full' ? '手动完整同步' : '手动同步'}
     </button>}
   </div>;
 }

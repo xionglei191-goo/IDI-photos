@@ -1,5 +1,5 @@
 import usePermissions from './usePermissions';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowLeft, Check, Clipboard, Download, FileImage, Pencil, RefreshCw } from 'lucide-react';
 import { api, message, patch, post } from './api';
 import { dateTime, Empty, ErrorBox, Loading, Modal, PHOTO_GROUPS, place, ROLES, STAGES, useData, WORKFLOW_STAGES } from './common';
@@ -9,7 +9,7 @@ import ReviewBatchDialog from './ReviewBatchDialog';
 import CaseAgentPanel from './CaseAgentPanel';
 import CasePackages, { exportJobsForCase, reusedPackageMessage } from './CasePackages';
 import PiccRecordForm from './PiccRecordForm';
-import type { Case, Job, Notify, PhotoPage, Template } from './types';
+import type { Case, Job, Notify, Template } from './types';
 import type { PlatformStage } from './platformTypes';
 import type { CaseDetailData, ReviewBatch } from './workflowTypes';
 
@@ -42,39 +42,52 @@ export default function CaseDetail({ board, value, cases, jobs, revision, notify
   useEffect(() => { if (queuedExport && jobs.some(job => job.id === queuedExport.id)) setQueuedExport(null); }, [jobs, queuedExport]);
   const exportJobs = exportJobsForCase(queuedExport && !jobs.some(job => job.id === queuedExport.id) ? [queuedExport, ...jobs] : jobs, value.id);
   const exporting = exportJobs.some(job => ['queued', 'running'].includes(job.state));
-  const [data, setData] = useState<CaseDetailData | null>(null), [opening, setOpening] = useState(true), [readbackError, setReadbackError] = useState('');
-  const openingTask = useRef<{ id: string; task: Promise<{ data: CaseDetailData; readbackError: string }> } | null>(null);
+  const [data, setData] = useState<CaseDetailData | null>(null), [opening, setOpening] = useState(true), [reading, setReading] = useState(true), [readbackError, setReadbackError] = useState('');
+  const editingRef = useRef(false);
+  const [editingForm, setEditingForm] = useState(false);
+  const editingChanged = useCallback((editing: boolean) => { editingRef.current = editing; setEditingForm(editing); }, []);
+  const openingTask = useRef<{ id: string; cached: Promise<CaseDetailData>; task: Promise<{ data: CaseDetailData; readbackError: string }> } | null>(null);
   useEffect(() => {
     let active = true;
-    setOpening(true); setReadbackError(''); setError('');
+    setOpening(true); setReading(true); setReadbackError(''); setError('');
     // One readback per actual case opening, including React's effect replay.
-    if (openingTask.current?.id !== value.id) openingTask.current = { id: value.id, task: (async () => {
-      const cached = await api<CaseDetailData>(`/api/workflow/cases/${value.id}`);
-      if (cached.case.workflow_source !== 'platform') return { data: cached, readbackError: '' };
-      try { return { data: await post<CaseDetailData>(`/api/workflow/cases/${value.id}/refresh`), readbackError: '' }; }
-      catch (e) { return { data: cached, readbackError: `官网刷新未完成，当前显示上次缓存：${message(e)}` }; }
-    })() };
-    void openingTask.current.task.then(result => { if (active) { setData(result.data); setReadbackError(result.readbackError); } })
-      .catch(e => { if (active) setError(message(e)); }).finally(() => { if (active) setOpening(false); });
+    if (openingTask.current?.id !== value.id) {
+      const cached = api<CaseDetailData>(`/api/workflow/cases/${value.id}`);
+      const task = cached.then(async data => {
+        if (data.case.workflow_source !== 'platform') return { data, readbackError: '' };
+        try { return { data: await post<CaseDetailData>(`/api/workflow/cases/${value.id}/refresh`), readbackError: '' }; }
+        catch (e) { return { data, readbackError: `官网刷新未完成，当前显示上次缓存：${message(e)}` }; }
+      });
+      openingTask.current = { id: value.id, cached, task };
+    }
+    void openingTask.current.cached.then(cached => {
+      if (active) { setData(cached); setOpening(false); setReading(cached.case.workflow_source === 'platform'); }
+    }).catch(e => { if (active) setError(message(e)); });
+    void openingTask.current.task.then(result => {
+      if (!active) return;
+      setData(result.data); setReadbackError(result.readbackError);
+      if (!result.readbackError && result.data.case.workflow_source === 'platform') refresh();
+    }).catch(e => { if (active) setError(message(e)); })
+      .finally(() => { if (active) { setOpening(false); setReading(false); } });
     return () => { active = false; };
-  }, [value.id]);
+  }, [value.id, refresh]);
   useEffect(() => {
-    if (opening) return;
+    if (opening || reading) return;
     const abort = new AbortController();
-    void api<CaseDetailData>(`/api/workflow/cases/${value.id}`, { signal: abort.signal }).then(setData)
+    void api<CaseDetailData>(`/api/workflow/cases/${value.id}`, { signal: abort.signal }).then(next => { if (!abort.signal.aborted) setData(next); })
       .catch(e => { if (!abort.signal.aborted) setError(message(e)); });
     return () => abort.abort();
-  }, [value.id, revision, opening]);
+  }, [value.id, revision, opening, reading]);
   const current = data?.case || value, currentStep = STEP_INDEX[current.workflow_stage] ?? 0;
   const readOnlyEntry = !manageable || board === 'intake' && current.workflow_stage !== 'pending_intake';
   const viewingHistory = data ? !data.stage_access[formStage].editable : FORMS.find(f => f.id === formStage)?.step !== currentStep;
-  useEffect(() => { setFormStage(board === 'intake' ? 'intake' : FORM_BY_STAGE[current.workflow_stage] || 'intake'); }, [board, current.workflow_stage]);
+  useEffect(() => { if (!editingRef.current) setFormStage(board === 'intake' ? 'intake' : FORM_BY_STAGE[current.workflow_stage] || 'intake'); }, [board, current.workflow_stage, editingForm]);
   async function changeTab(next: string) { if (await leave()) setTab(next); }
   async function changeStage(next: PlatformStage) { if (await leave()) { setFormStage(next); setTab('platform'); } }
   async function refreshRemote() { if (!await leave()) return; setBusy(true); setError(''); try { setData(await post<CaseDetailData>(`/api/workflow/cases/${current.id}/refresh`)); setReadbackError(''); refresh(); notify('官网办理进度已回读'); } catch (e) { setReadbackError(`官网刷新未完成，当前显示上次缓存：${message(e)}`); } finally { setBusy(false); } }
   async function copyWatermark() { if (!data) return; try { await navigator.clipboard.writeText(data.watermark.text); notify('水印填写内容已复制'); } catch { notify('可在弹窗中选中并复制水印内容'); } }
   async function changeTemplate(templateId: string) { if (!await leave()) return; setBusy(true); setError(''); try { await patch(`/api/cases/${current.id}`, { insurer_template_id: templateId, revision: current.revision }); refresh(); } catch (e) { setError(message(e)); } finally { setBusy(false); } }
-  async function exportInsurer() { setBusy(true); setError(''); try { const photos = await api<PhotoPage>(`/api/photos?case_id=${current.id}&page_size=500`); if (!photos.items.length) throw new Error('本案尚无可提取资料'); if (photos.total > 500) throw new Error('本案超过500项，请到全部照片中分批选择提取'); const job = await post<Job>('/api/packages', { photo_ids: photos.items.map(p => p.id), template_id: current.insurer_template_id, title: '保司过程资料' }); setQueuedExport(job); refresh(); notify(reusedPackageMessage(job) || '保司资料包已排队，完成后可在下方“本案资料包”下载'); } catch (e) { setError(message(e)); } finally { setBusy(false); } }
+  async function exportInsurer() { setBusy(true); setError(''); try { const job = await post<Job>('/api/packages', { case_id: current.id, template_id: current.insurer_template_id, title: '保司过程资料' }); setQueuedExport(job); refresh(); notify(reusedPackageMessage(job) || '正在核对本地与官网照片，补齐后生成资料包；完成后可在下方下载'); } catch (e) { setError(message(e)); } finally { setBusy(false); } }
   async function openReview(id: string) { setBusy(true); try { setReview(await api<ReviewBatch>(`/api/workflow/reviews/${id}`)); } catch (e) { setError(message(e)); } finally { setBusy(false); } }
   return <section className="case-detail">
     <div className="case-detail-heading"><button className="text-button back-button" onClick={back}><ArrowLeft size={16} />返回看板</button><div className="row between wrap"><div><div className="row wrap"><h1>{current.short_code || '短编号待补'}</h1><span className={`workflow-status workflow-${current.workflow_stage}`}>{WORKFLOW_STAGES[current.workflow_stage]}</span></div><p>{current.project_name} · {place(current)}<span className="case-problem">{current.title}</span></p></div><div className="row wrap"><button onClick={() => setWatermarkOpen(true)}><Clipboard size={15} />水印填写内容</button><button onClick={() => showPhotos(current.id)}><FileImage size={15} />本案照片</button>{!readOnlyEntry && <button onClick={() => setVisitsOpen(true)}>进场与维修记录</button>}{!readOnlyEntry && !viewingHistory && <button onClick={() => edit(current)}><Pencil size={15} />编辑案件</button>}</div></div><div className="case-identifiers"><span>报修编号 <b>{current.platform_report_code || '待关联'}</b></span><span>保单编号 <b>{current.policy_number || '待补充'}</b></span><span>报案编号 <b>{current.report_number || '待补充'}</b></span>{current.responsible && <span>负责人 <b>{current.responsible}</b></span>}</div>{!!current.short_code_aliases?.length && <details className="case-code-history"><summary>历史短编号 · {current.short_code_aliases.length} 个</summary><p className="muted break-all">{current.short_code_aliases.join('、')}</p><small>以上旧编号仍可用于照片识别与搜索。</small></details>}</div>
@@ -83,11 +96,12 @@ export default function CaseDetail({ board, value, cases, jobs, revision, notify
     {current.workflow_stage === 'insurer_review' && <div className="case-waiting"><span>本案的受理结果已提交保司复核，等待确认或退回。现场查勘结果直接进入查勘维修，无需经过此分支。</span><button disabled={busy || current.workflow_source !== 'platform'} onClick={() => void refreshRemote()}><RefreshCw size={14} />刷新复核结果</button></div>}
     <nav className="case-detail-tabs" aria-label="案件资料"><button className={tab === 'platform' ? 'active' : ''} onClick={() => void changeTab('platform')}>广州平台</button><button className={tab === 'insurer' ? 'active' : ''} onClick={() => void changeTab('insurer')}>保司资料{data && current.insurer_template_id !== 'picc-record-v1' && !['historical_unverified', 'insurer_intake'].includes(current.workflow_stage) && <small className={data.insurer.missing_count ? 'material-missing' : 'material-ready'}>{data.insurer.missing_count ? `缺 ${data.insurer.missing_count} 项` : '已备齐'}</small>}</button><button className={tab === 'history' ? 'active' : ''} onClick={() => void changeTab('history')}>办理记录</button>{current.followup_eligible && <button className={tab === 'agent' ? 'active' : ''} onClick={() => void changeTab('agent')}>智能审阅</button>}<span className="grow" /><span className="muted">{data?.official_read_at ? `官网附件核对 ${dateTime(data.official_read_at)}` : current.workflow_source === 'platform' ? '官网附件尚未核对' : '本地案件'}</span></nav>
     <ErrorBox error={error} />
-    {opening && <div className="case-waiting" role="status">正在核对官网最新进度和附件…</div>}
+    {opening && <Loading />}
+    {!opening && reading && <div className="case-waiting" role="status" aria-live="polite">已显示本地内容，正在后台核对官网最新进度和附件…</div>}
     {readbackError && <div className="case-waiting"><ErrorBox error={readbackError} /><button disabled={busy} onClick={() => void refreshRemote()}><RefreshCw size={14} />重试官网刷新</button></div>}
-    {tab === 'platform' && !opening && <PlatformWorkspace key={`${current.id}:${formStage}`} cases={cases} initialCaseId={current.id} initialStage={formStage} embedded revision={revision} notify={notify} registerLeave={registerLeave} importFiles={importFiles} onChanged={refresh} onReadback={() => { setReadbackError(''); refresh(); }} />}
+    {tab === 'platform' && !opening && data && <PlatformWorkspace key={`${current.id}:${formStage}`} cases={cases} initialCaseId={current.id} initialStage={formStage} embedded revision={revision} notify={notify} registerLeave={registerLeave} importFiles={importFiles} onChanged={refresh} onReadback={() => { setReadbackError(''); refresh(); }} officialRefreshing={reading} officialRefreshError={readbackError} currentAccess={data.stage_access[formStage]} onEditingChange={editingChanged} />}
     {tab === 'agent' && current.followup_eligible && <div className="case-tab-content"><CaseAgentPanel key={current.id} value={current} notify={notify} /></div>}
-    {tab === 'insurer' && (!data ? <Loading /> : <div className="case-tab-content"><section className="case-panel"><div className="row between wrap"><div><h2>保司过程资料</h2>{!readOnlyEntry && <button className="text-button" onClick={() => setVisitsOpen(true)}>进场与维修记录</button>}<p className="muted">与广州平台共用本案原件，按所选保司要求单独检查与提取。</p></div>{current.insurer_template_id !== 'picc-record-v1' && <button className="primary" disabled={busy || exporting || !manageable} onClick={() => void exportInsurer()}><Download size={15} />{exporting ? "资料包生成中…" : "生成保司资料包"}</button>}</div><label className="inline-field space-top">资料要求<select aria-label="保司资料要求" value={current.insurer_template_id} disabled={busy || readOnlyEntry} onChange={e => void changeTemplate(e.target.value)}>{templates.data?.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></label>{current.insurer_template_id === 'picc-record-v1' ? <PiccRecordForm readOnly={!manageable} key={current.id} caseId={current.id} revision={revision} generating={exporting} generated={job => { setQueuedExport(job); refresh(); }} notify={notify} registerLeave={registerLeave} /> : <div className="table-wrap space-top"><table className="insurer-checks"><thead><tr><th>照片资料</th><th>部位 / 施工内容</th><th>范围</th><th>要求</th><th>已有</th><th>结果</th><th /></tr></thead><tbody>{data.insurer.items.map((r, i) => <tr key={i}><td>{PHOTO_GROUPS[r.photo_group || ''] || `${STAGES[r.stage]} · ${ROLES[r.role]}`}</td><td>{[r.part, r.process].filter(Boolean).join(' · ') || '不限'}</td><td>{r.scope}</td><td>{r.minimum} 张</td><td>{r.count} 张</td><td><span className={r.missing ? 'material-missing' : 'material-ready'}>{r.missing ? `缺 ${r.missing} 张` : '已备齐'}</span></td><td><button className="text-button" onClick={() => showPhotos(current.id, r.photo_group)}>查看照片</button></td></tr>)}</tbody></table></div>}</section><CasePackages readOnly={!manageable} caseId={current.id} revision={revision} jobs={exportJobs} refresh={refresh} notify={notify} /></div>)}
+    {tab === 'insurer' && (!data ? <Loading /> : <div className="case-tab-content"><section className="case-panel"><div className="row between wrap"><div><h2>保司过程资料</h2>{!readOnlyEntry && <button className="text-button" onClick={() => setVisitsOpen(true)}>进场与维修记录</button>}<p className="muted">生成前核对官网照片，自动补齐缺失原件后，按所选保司要求提取。</p></div>{current.insurer_template_id !== 'picc-record-v1' && <button className="primary" disabled={busy || exporting || !manageable} onClick={() => void exportInsurer()}><Download size={15} />{exporting ? "资料包生成中…" : "生成保司资料包"}</button>}</div><label className="inline-field space-top">资料要求<select aria-label="保司资料要求" value={current.insurer_template_id} disabled={busy || readOnlyEntry} onChange={e => void changeTemplate(e.target.value)}>{templates.data?.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></label>{current.insurer_template_id === 'picc-record-v1' ? <PiccRecordForm readOnly={!manageable} key={current.id} caseId={current.id} revision={revision} generating={exporting} generated={job => { setQueuedExport(job); refresh(); }} notify={notify} registerLeave={registerLeave} /> : <div className="table-wrap space-top"><table className="insurer-checks"><thead><tr><th>照片资料</th><th>部位 / 施工内容</th><th>范围</th><th>要求</th><th>已有</th><th>结果</th><th /></tr></thead><tbody>{data.insurer.items.map((r, i) => <tr key={i}><td>{PHOTO_GROUPS[r.photo_group || ''] || `${STAGES[r.stage]} · ${ROLES[r.role]}`}</td><td>{[r.part, r.process].filter(Boolean).join(' · ') || '不限'}</td><td>{r.scope}</td><td>{r.minimum} 张</td><td>{r.count} 张</td><td><span className={r.missing ? 'material-missing' : 'material-ready'}>{r.missing ? `缺 ${r.missing} 张` : '已备齐'}</span></td><td><button className="text-button" onClick={() => showPhotos(current.id, r.photo_group)}>查看照片</button></td></tr>)}</tbody></table></div>}</section><CasePackages readOnly={!manageable} caseId={current.id} revision={revision} jobs={exportJobs} refresh={refresh} notify={notify} /></div>)}
     {tab === 'history' && (!data ? <Loading /> : <div className="case-tab-content"><section className="case-panel"><div className="row between wrap"><h2>办理进度与凭据</h2>{current.workflow_source === 'platform' ? <button disabled={busy} onClick={() => void refreshRemote()}><RefreshCw size={15} />回读官网进度</button> : (!readOnlyEntry || current.workflow_stage === 'insurer_review') && !['closed', 'noncoverage', 'direct_payment'].includes(current.workflow_stage) && <button disabled={!manageable} onClick={() => setResultOpen(true)}>记录外部办理结果</button>}</div>{data.events.length ? <div className="timeline">{data.events.map(event => <div key={event.id}><strong>{WORKFLOW_STAGES[event.to_stage]}</strong><small>{event.source === 'platform' ? '官网回读' : '人工登记'} · {dateTime(event.event_at)}</small>{event.detail.note && <p>{event.detail.note}</p>}</div>)}</div> : <p className="muted space-top">尚无办理记录。保存照片、草稿或资料包不会自动改变案件进度。</p>}</section><section className="case-panel"><h2>预提交核对记录</h2>{data.reviews.length ? <div className="table-wrap space-top"><table><thead><tr><th>环节</th><th>核对时间</th><th>状态</th><th /></tr></thead><tbody>{data.reviews.map(r => <tr key={r.id}><td>{FORMS.find(f => f.id === r.stage)?.label || r.stage}</td><td>{dateTime(r.confirmed_at || r.created_at)}</td><td>{{ prepared: '待确认', reviewed: '已核对 · 未上传', failed: '操作未完成 · 可重试', saved: '官网已保存 · 待核对', save_verified: '已保存官网 · 未提交', stale: '资料已变化', submitting: '提交中 / 待回读', submitted: '官网已响应 · 待核对', verified: '官网回读一致', uncertain: '结果待核实' }[r.state] || r.state}</td><td><button disabled={!manageable} onClick={() => void openReview(r.id)}>查看快照</button></td></tr>)}</tbody></table></div> : <Empty>尚无核对记录</Empty>}</section></div>)}
     {watermarkOpen && data && <Modal title="工人水印填写内容" close={() => setWatermarkOpen(false)} footer={<><button onClick={() => setWatermarkOpen(false)}>关闭</button><button className="primary" onClick={() => void copyWatermark()}><Clipboard size={15} />复制内容</button></>}><p className="muted">工人在自己的水印相机中填写。编号、项目和区域在同一案件内保持一致，施工内容按实际环节调整。</p><pre className="watermark-copy">{data.watermark.text}</pre><div className="watermark-choices">{data.watermark.contents.map(t => <span key={t}>{t}</span>)}</div><p className="muted space-top">时间使用水印相机自带时间。XXX 填实际问题、工序或完工部位。</p></Modal>}
     {visitsOpen && <VisitDialog value={current} close={() => setVisitsOpen(false)} notify={notify} refresh={refresh} />}

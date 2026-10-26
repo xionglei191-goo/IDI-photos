@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import threading
+import time
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -19,6 +20,7 @@ from .mobile_camera import CaptureMetadata, MAX_PHOTO_BYTES, GROUP_LABELS, case_
 from .xhey_camera import XheyClient, XheyError, XheySettings
 from .camera_video import inspect_mp4, MAX_VIDEO_BYTES, MAX_RECORD_SECONDS
 from .photo_dedup import normalize_watermark_code
+from .camera_timing import CameraTiming, SCOPE_KEY
 
 LOG = logging.getLogger(__name__)
 
@@ -100,75 +102,90 @@ class OfficialCamera:
         return {'capture_id': model.capture_id, 'options': options,
                 'has_team_watermark': bool(template)}
 
-    def ingest(self, device, metadata, image):
-        with self.camera.upload_lock, self.lock:
-            return self._ingest(device, metadata, image)
-
-    def _ingest(self, device, metadata, image):
+    def ingest(self, device, metadata, image, timing=None):
+        timing = timing or CameraTiming()
+        # Keep the existing atomic deduplication and archive lock order.
+        with timing.measure('lock'):
+            self.camera.upload_lock.acquire()
+            try:
+                self.lock.acquire()
+            except BaseException:
+                self.camera.upload_lock.release()
+                raise
         try:
-            model = OfficialMetadata.model_validate_json(metadata)
-        except ValidationError as error:
-            raise DomainError('官方照片信息格式无效') from error
-        # This is an untrusted client-side launch time, not evidence of photo time.
-        # A wrong phone clock must not override (or pre-empt) the official verdict.
-        if model.captured_at.tzinfo is None:
-            raise DomainError('手机记录时间需要时区')
-        _, role = GROUP_FIELDS[model.photo_group]
-        if model.photo_group.endswith('checkin'):
-            if model.role not in ('building_checkin', 'door_checkin'):
-                raise DomainError('请选择楼栋或入户门用途')
-        elif model.role and model.role != role:
-            raise DomainError('拍摄环节与照片用途不一致')
-        case = self.domain.case(model.case_id)
-        if case['project_id'] not in device['project_ids']:
-            raise DomainError('设备无此项目权限', 403)
-        video = model.media_type == 'video'
-        if video and model.source != 'xhey_sdk':
-            raise DomainError('视频仅支持安卓原生 SDK 来源')
-        media_info = inspect_mp4(image) if video else None
-        if not video:
-            if not image or len(image) >= MAX_PHOTO_BYTES:
-                raise DomainError('每张官方照片须小于20 MiB；请勿压缩后重新上传', 413)
-            self.camera.image_check(image)
-        meta = model.model_dump(mode='json')
-        # Preserve idempotency hashes for records created before these optional fields.
-        for field in ('sdk_photo_time', 'sdk_anti_fake_code'):
-            if not meta[field]:
-                del meta[field]
-        if not video:
-            del meta['media_type']  # Keep existing photo request hashes stable.
-        image_hash = hashlib.sha256(image).hexdigest()
-        request_hash = digest(dump(meta) + image_hash)
-        existing = self.db.one('SELECT * FROM camera_official_captures WHERE device_id=? AND capture_id=?', (device['id'], model.capture_id))
-        if existing:
-            return self.receipt(existing, request_hash, duplicate=True)
-        self.check_case(case, device, model.case_number)
-        blob = self.storage.put(image, 'xhey-sdk-original.mp4' if video else 'xhey-sdk-original.jpg')
-        if media_info:
-            with self.db.tx() as con:
-                con.execute('UPDATE blobs SET width=?,height=? WHERE hash=?',
-                            (media_info['width'], media_info['height'], blob['hash']))
-        stamp = now()
-        config = self.settings.load()
-        # The configured verifier accepts photos only. Never send MP4 to it.
-        requested = not video and config.get('auto_verify') is True
-        state = ('queued' if self.settings.verification_ready(config) else 'unconfigured') if requested else 'not_requested'
-        with self.db.tx() as con:
-            existing = con.execute('SELECT * FROM camera_official_captures WHERE device_id=? AND capture_id=?', (device['id'], model.capture_id)).fetchone()
+            return self._ingest(device, metadata, image, timing)
+        finally:
+            self.lock.release()
+            self.camera.upload_lock.release()
+
+    def _ingest(self, device, metadata, image, timing):
+        with timing.measure('validate'):
+            try:
+                model = OfficialMetadata.model_validate_json(metadata)
+            except ValidationError as error:
+                raise DomainError('官方照片信息格式无效') from error
+            # This is an untrusted client-side launch time, not evidence of photo time.
+            # A wrong phone clock must not override (or pre-empt) the official verdict.
+            if model.captured_at.tzinfo is None:
+                raise DomainError('手机记录时间需要时区')
+            _, role = GROUP_FIELDS[model.photo_group]
+            if model.photo_group.endswith('checkin'):
+                if model.role not in ('building_checkin', 'door_checkin'):
+                    raise DomainError('请选择楼栋或入户门用途')
+            elif model.role and model.role != role:
+                raise DomainError('拍摄环节与照片用途不一致')
+            case = self.domain.case(model.case_id)
+            if case['project_id'] not in device['project_ids']:
+                raise DomainError('设备无此项目权限', 403)
+            video = model.media_type == 'video'
+            if video and model.source != 'xhey_sdk':
+                raise DomainError('视频仅支持安卓原生 SDK 来源')
+            media_info = inspect_mp4(image) if video else None
+            if not video:
+                if not image or len(image) >= MAX_PHOTO_BYTES:
+                    raise DomainError('每张官方照片须小于20 MiB；请勿压缩后重新上传', 413)
+                self.camera.image_check(image)
+            meta = model.model_dump(mode='json')
+            # Preserve idempotency hashes for records created before these optional fields.
+            for field in ('sdk_photo_time', 'sdk_anti_fake_code'):
+                if not meta[field]:
+                    del meta[field]
+            if not video:
+                del meta['media_type']  # Keep existing photo request hashes stable.
+            image_hash = hashlib.sha256(image).hexdigest()
+            request_hash = digest(dump(meta) + image_hash)
+            existing = self.db.one('SELECT * FROM camera_official_captures WHERE device_id=? AND capture_id=?', (device['id'], model.capture_id))
             if existing:
-                return self.receipt(dict(existing), request_hash, duplicate=True)
-            if con.execute('SELECT 1 FROM camera_captures WHERE device_id=? AND capture_id=?', (device['id'], model.capture_id)).fetchone():
-                raise DomainError('拍摄编号已用于其他照片来源', 409)
-            con.execute('''INSERT INTO camera_official_captures
-                (device_id,capture_id,request_hash,blob_hash,metadata,state,next_attempt_at,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?)''', (device['id'], model.capture_id, request_hash, blob['hash'], dump(meta), state, stamp, stamp, stamp))
-            if not requested:
-                row = dict(con.execute('SELECT * FROM camera_official_captures WHERE device_id=? AND capture_id=?',
-                                       (device['id'], model.capture_id)).fetchone())
-                # Capture, photo, provenance and receipt commit together. No vendor call.
-                self.archive(row, device, meta, connection=con)
-            audit(con, 'camera_official', model.capture_id, 'receive', after={'device_id': device['id'], 'sha256': image_hash, 'state': state})
-        return self.get(device, model.capture_id)
+                return self.receipt(existing, request_hash, duplicate=True)
+            self.check_case(case, device, model.case_number)
+        with timing.measure('store'):
+            blob = self.storage.put(image, 'xhey-sdk-original.mp4' if video else 'xhey-sdk-original.jpg')
+            if media_info:
+                with self.db.tx() as con:
+                    con.execute('UPDATE blobs SET width=?,height=? WHERE hash=?',
+                                (media_info['width'], media_info['height'], blob['hash']))
+        with timing.measure('archive'):
+            stamp = now()
+            config = self.settings.load()
+            # The configured verifier accepts photos only. Never send MP4 to it.
+            requested = not video and config.get('auto_verify') is True
+            state = ('queued' if self.settings.verification_ready(config) else 'unconfigured') if requested else 'not_requested'
+            with self.db.tx() as con:
+                existing = con.execute('SELECT * FROM camera_official_captures WHERE device_id=? AND capture_id=?', (device['id'], model.capture_id)).fetchone()
+                if existing:
+                    return self.receipt(dict(existing), request_hash, duplicate=True)
+                if con.execute('SELECT 1 FROM camera_captures WHERE device_id=? AND capture_id=?', (device['id'], model.capture_id)).fetchone():
+                    raise DomainError('拍摄编号已用于其他照片来源', 409)
+                con.execute('''INSERT INTO camera_official_captures
+                    (device_id,capture_id,request_hash,blob_hash,metadata,state,next_attempt_at,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)''', (device['id'], model.capture_id, request_hash, blob['hash'], dump(meta), state, stamp, stamp, stamp))
+                if not requested:
+                    row = dict(con.execute('SELECT * FROM camera_official_captures WHERE device_id=? AND capture_id=?',
+                                           (device['id'], model.capture_id)).fetchone())
+                    # Capture, photo, provenance and receipt commit together. No vendor call.
+                    self.archive(row, device, meta, connection=con)
+                audit(con, 'camera_official', model.capture_id, 'receive', after={'device_id': device['id'], 'sha256': image_hash, 'state': state})
+            return self.get(device, model.capture_id)
 
     @staticmethod
     def check_case(case, device, number):
@@ -473,7 +490,16 @@ def official_camera_routes(service):
     @router.post('/api/camera/official-captures')
     async def upload(request: Request, metadata: str = Form(...),
                      image: UploadFile | None = File(None), video: UploadFile | None = File(None)):
-        device = service.camera.authenticate(request)
+        timing = request.scope.get(SCOPE_KEY) or CameraTiming()
+        timing.handler()
+        # Authentication reads SQLite. Do not block the ASGI event loop while
+        # another archive transaction is committing.
+        submitted = time.perf_counter()
+        def authenticate():
+            timing.queued(submitted)
+            with timing.measure('auth'):
+                return service.camera.authenticate(request)
+        device = await run_in_threadpool(authenticate)
         if len(metadata) > 12000:
             raise DomainError('照片信息过长', 413)
         if (image is None) == (video is None):
@@ -485,12 +511,22 @@ def official_camera_routes(service):
         if is_video != (video is not None):
             raise DomainError('拍摄类型与上传文件不一致')
         file = video if is_video else image
-        data = await file.read(MAX_VIDEO_BYTES if is_video else MAX_PHOTO_BYTES)
-        return await run_in_threadpool(service.ingest, device, metadata, data)
+        with timing.measure('file_read'):
+            data = await file.read(MAX_VIDEO_BYTES if is_video else MAX_PHOTO_BYTES)
+        submitted = time.perf_counter()
+        def ingest():
+            timing.phases['queue'] += (time.perf_counter() - submitted) * 1000
+            return service.ingest(device, metadata, data, timing=timing)
+        return await run_in_threadpool(ingest)
 
     @router.get('/api/camera/official-captures/{capture_id}')
     def receipt(capture_id: str, request: Request):
-        return service.get(service.camera.authenticate(request), capture_id)
+        timing = request.scope.get(SCOPE_KEY) or CameraTiming()
+        timing.handler()
+        with timing.measure('auth'):
+            device = service.camera.authenticate(request)
+        with timing.measure('lookup'):
+            return service.get(device, capture_id)
 
     @router.post('/api/camera/official-captures/{capture_id}/retry')
     def retry(capture_id: str, request: Request):

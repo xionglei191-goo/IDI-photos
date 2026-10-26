@@ -28,3 +28,20 @@ def check_thread_scope(db, thread, person=None):
         case = db.one('SELECT project_id FROM cases WHERE id=?', (thread['case_id'],))
         if not case or case['project_id'] not in projects or not person.allows(case['project_id']):
             raise DomainError('对话中的案件归属已变化，请新建对话', 403)
+
+
+def all_project_scope(thread):
+    # A deleted project can also leave project_id NULL. Its original label must
+    # never turn that explicitly selected conversation into an all-project one.
+    return (not thread.get('project_id') and not thread.get('case_id')
+            and thread.get('context_label') in ('全部项目', '我的全部项目'))
+
+
+def current_thread_projects(db, thread):
+    """Refresh additions only after access to the saved history is revalidated."""
+    check_thread_scope(db, thread)
+    if not all_project_scope(thread):
+        return json.loads(thread['project_ids'])
+    person = current()
+    return [row['id'] for row in db.all('SELECT id FROM projects ORDER BY name,id')
+            if person is None or person.allows(row['id'])]

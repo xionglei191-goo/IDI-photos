@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,9 @@ from .connectors.secret_store import protect
 from .db import uid
 from .domain import DomainError
 from .storage import Storage
+
+
+log = logging.getLogger(__name__)
 
 
 class PlatformAccountStore:
@@ -205,14 +209,21 @@ class PlatformAccount:
                     retry = self._state.get('next_retry_at')
                     if retry and datetime.fromisoformat(retry) > self.clock():
                         return False
+                previous_state, previous_override = dict(self._state), self._temporary_override
                 self._temporary_override = False
                 self._connecting = True
                 self._state.update(last_attempt_at=self.clock().isoformat(), next_retry_at=None, error='')
-                self._persist()
+                try:
+                    self._persist()
+                except Exception:
+                    self._state, self._temporary_override = previous_state, previous_override
+                    raise
                 keep = True
                 return True
         finally:
             if not keep:
+                with self._meta:
+                    self._connecting = False
                 self._gate.release()
 
     @contextmanager
@@ -276,7 +287,12 @@ class PlatformAccount:
 
     def _loop(self):
         while not self._stop.is_set():
-            self.tick()
+            try:
+                self.tick()
+            except Exception:
+                # A temporary DB failure must not kill this account's reconnect
+                # thread. _begin/_attempt release their single-flight guards.
+                log.exception('Website account reconnect iteration failed')
             self._wake.wait(5)
             self._wake.clear()
 

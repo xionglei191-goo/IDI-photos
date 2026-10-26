@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import subprocess
 import threading
 import zipfile
@@ -45,6 +46,56 @@ def fake_login(value, monkeypatch, failure=None):
         return value.client.status()
     monkeypatch.setattr(value.client, 'login', login)
     return calls
+
+
+def test_begin_persistence_failure_releases_connection_state(account, monkeypatch):
+    restored = configured(account)
+    before = dict(restored._state)
+    persist = restored._persist
+    calls = fake_login(restored, monkeypatch)
+
+    def busy():
+        raise sqlite3.OperationalError('database is locked')
+
+    monkeypatch.setattr(restored, '_persist', busy)
+    with pytest.raises(sqlite3.OperationalError):
+        restored.tick()
+    assert restored._state == before and not restored._connecting
+    assert not restored._gate.locked() and not calls
+    monkeypatch.setattr(restored, '_persist', persist)
+    restored.tick()
+    assert len(calls) == 1 and restored.status()['state'] == 'connected'
+
+
+def test_account_worker_survives_database_busy_and_reconnects(account, monkeypatch, caplog):
+    restored = configured(account)
+    persist = restored._persist
+    calls = fake_login(restored, monkeypatch)
+    connected = threading.Event()
+    failures = []
+
+    def busy_once():
+        if not failures:
+            failures.append(True)
+            restored._wake.set()
+            raise sqlite3.OperationalError('database is locked')
+        persist()
+        if restored._state.get('last_success_at'):
+            connected.set()
+
+    monkeypatch.setattr(restored, '_persist', busy_once)
+    try:
+        restored.start()
+        assert connected.wait(3)
+        assert restored._thread.is_alive()
+        assert restored._gate.acquire(timeout=1)
+        restored._gate.release()
+        assert len(calls) == 1 and restored.status()['state'] == 'connected'
+        assert not restored._connecting and not restored._gate.locked()
+        assert 'reconnect iteration failed' in caplog.text
+        assert PASSWORD not in caplog.text
+    finally:
+        restored.stop()
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows DPAPI')

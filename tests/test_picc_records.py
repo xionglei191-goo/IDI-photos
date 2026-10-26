@@ -134,7 +134,7 @@ def test_content_reuse_changed_header_new_version_and_deleted_document(client, s
     assert services['domain'].photo(p['id'])
 
 
-def test_date_sources_are_automatic_and_refresh_from_case_information(client, services, case, photo):
+def test_date_sources_are_automatic_and_refresh_from_case_information(client, services, case, photo, monkeypatch):
     construction = photo('red', watermark_time='2026-10-01T09:00:00', stage='work', role='construction')
     surveyed = photo('blue', watermark_time='2026-10-18T00:10:00Z', stage='survey', role='problem')
     url = f"/api/cases/{case['id']}/picc-record"
@@ -165,6 +165,17 @@ def test_date_sources_are_automatic_and_refresh_from_case_information(client, se
                     (dump({'survey': {'siteSurveyDate': '2026-10-14T18:30:00Z'}}), case['id']))
     plan = client.get(url).json()
     assert plan['fields']['survey_date'] == '2026-10-15' and plan['survey_date_source'] == '官网查勘信息'
+    # A linked export now reads the official inventory. This date-source unit
+    # test supplies an explicitly empty, verified inventory without a network.
+    def refresh(case_id, check_permission=None):
+        if check_permission:
+            check_permission()
+        with services['db'].tx() as con:
+            con.execute('UPDATE platform_links SET verified_at=?,snapshot=? WHERE case_id=?',
+                        (now(), dump({'row': {'repairAcceptanceId': None}, 'survey': {
+                            'siteSurveyDate': '2026-10-14T18:30:00Z', 'buildingFileInfoList': [],
+                            'houseFileInfoList': [], 'fileInfoList': []}}), case_id))
+    monkeypatch.setattr(services['platform'].workflow, 'refresh_case', refresh)
     package = build(client, services, [surveyed['id']])
     doc = Document(io.BytesIO(client.get(package['document_url']).content))
     assert doc.tables[0].rows[2].cells[1].text == '查勘日期：2026-10-15'
@@ -279,10 +290,12 @@ def test_draft_project_scope_and_document_backup(client, app, services, case, ph
         url = f"/api/cases/{case['id']}/picc-record"
         assert worker.get(url).status_code == 403
         assert worker.put(url, json=saved).status_code == 403
+        assert worker.get(package['document_url']).status_code == 403
         services['access'].save_members(case['project_id'], {'members': [{'user_id': user['id'], 'role': 'member'}]})
         assert worker.get(url).status_code == 200
         assert worker.put(url, json=saved).status_code == 403
-        assert worker.get(package['document_url']).status_code == 403
+        # Project members share completed documents; editing still requires a manager.
+        assert worker.get(package['document_url']).status_code == 200
     backup = services['reporter'].backup({}, lambda *_: None)
     with zipfile.ZipFile(services['storage'].resolve('backups/' + backup['filename'])) as archive:
         doc_path = 'exports/' + package['id'] + '/' + package['manifest']['document_path']

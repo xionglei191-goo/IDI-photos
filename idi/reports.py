@@ -26,6 +26,7 @@ from .storage import Storage, safe_name
 from .package_content import content_fingerprint
 from .photo_package import PHOTO_PACKAGE_FORMAT, PHOTO_DIRECTORIES, case_folder, photo_directory, photo_paths, write_media
 from .picc_records import PICC_FORMAT, PiccRecords, write_record
+from .package_media import supplement
 
 
 def location(case):
@@ -179,6 +180,7 @@ class Reporter:
     def __init__(self, db: Database, storage: Storage, domain: Domain):
         self.db, self.storage, self.domain = db, storage, domain
         self.picc = PiccRecords(db, domain)
+        self.official = None
         self._package_lock = threading.RLock()
 
     def packages(self, case_id=None):
@@ -282,10 +284,12 @@ class Reporter:
             if parent["case_id"] != case_id:
                 raise DomainError("补件记录必须属于同一案件")
         is_picc = template_id == PICC_FORMAT
-        photo_rows = self.picc.all_photos(case_id) if is_picc else [row for start in range(0, len(photo_ids), 500)
+        photo_rows = self.picc.package_photos(case_id) if is_picc else [row for start in range(0, len(photo_ids), 500)
             for row in self.domain.photos(ids=photo_ids[start:start + 500], case_id=case_id, page_size=500)['items']]
         if not is_picc and len(photo_rows) != len(photo_ids):
             raise DomainError("照片所属案件已发生变化，请重新选材")
+        if not is_picc and self.official:
+            photo_rows = supplement(photo_rows, self.official.cached_photos(case_id))
         photo_rows = [row for row in photo_rows if row['media_type'] == 'image' or not is_picc and row['media_type'] == 'video']
         if not photo_rows:
             raise DomainError('本案尚无照片，视频请使用原照片打包方案' if is_picc else '所选资料没有照片或视频；压缩包不包含 PDF 或其他资料')
@@ -303,12 +307,14 @@ class Reporter:
             root_directory, paths = photo_paths(case, photo_rows)
         snapshots = []
         for row in photo_rows:
-            source_rows = self.db.all("SELECT source_type,original_name,group_name,sender,message_time,received_at FROM photo_sources WHERE photo_id=? ORDER BY received_at", (row["id"],))
+            source_rows = row.get('sources') or self.db.all("SELECT source_type,original_name,group_name,sender,message_time,received_at FROM photo_sources WHERE photo_id=? ORDER BY received_at", (row["id"],))
             original = row["original_name"] or (row["id"] + row["extension"])
             path = paths[row['id']]
             allowed = ("id", "blob_hash", "stage", "role", "photo_group", "part", "process", "watermark_time", "exif_time", "recognition_state", "confirmed_fields", "media_type", "mime_type", "size_bytes", "width", "height", "revision", "visit_id", "visit_date", "visit_key", "shared_checkin_visit_id", "shared_checkin_date", "shared_checkin_key")
-            snapshots.append({**{k: row[k] for k in allowed}, "original_name": original, "package_path": path, "sources": source_rows})
-        quality = self.domain.completeness(case_id, template_id, photo_ids)
+            snapshots.append({**{k: row[k] for k in allowed}, "original_name": original, "package_path": path, "sources": source_rows,
+                              **({'official_source': row['official_source']} if row.get('official_source') else {})})
+        quality = self.domain.completeness(case_id, template_id, photo_ids,
+                                          additional_photos=[p for p in photo_rows if p.get('official_source')])
         scope_visits = {r['scope_key'][6:] for r in quality['items'] if r['scope_key'].startswith('visit:')}
         visits = []
         for visit in self.domain.visits(case_id):
@@ -321,6 +327,7 @@ class Reporter:
         return {"case": case, "template": template, "photos": snapshots, "completeness": quality,
                 "visits": visits, "parent_id": parent_id, "format": PICC_FORMAT if is_picc else PHOTO_PACKAGE_FORMAT,
                 "root_directory": root_directory,
+                **({'official_inventory': self.official.signature(case_id)} if self.official and self.official.linked(case_id) else {}),
                 **({'record': record, 'document_path': root_directory + '/查勘及施工记录表.docx'} if is_picc else {})}
 
     def _equivalent(self, content, con, *, include_building=False):
@@ -357,27 +364,57 @@ class Reporter:
         preview = self.preview(photo_ids, template_id)
         return self._enqueue_groups(jobs, preview['cases'], template_id, parent_id, title)
 
-    def enqueue_case_export(self, jobs, case_id, template_id, title=''):
+    def enqueue_case_export(self, jobs, case_id, template_id, title='', parent_id=None):
         # Internal all-case preparation is not limited to one UI selection page.
+        from .identity import require_project
+        if not isinstance(case_id, str):
+            raise DomainError('案件编号格式无效')
+        require_project(self.domain.case(case_id)['project_id'], manage=True)
         ids = [p['id'] for p in self.picc.all_photos(case_id) if p['media_type'] in ('image', 'video')]
-        return self._enqueue_groups(jobs, [{'case': {'id': case_id}, 'photo_ids': ids}], template_id, None, title)
+        return self._enqueue_groups(jobs, [{'case': {'id': case_id}, 'photo_ids': ids}], template_id, parent_id, title)
+
+    def input_fingerprint(self, case_id, photo_ids, template_id, parent_id=None):
+        """Stable inputs even while official files are still being downloaded."""
+        from .domain import CASE_FIELDS
+        case = self.domain.case(case_id)
+        values = {k: case.get(k) for k in sorted((CASE_FIELDS - {'insurer_template_id'}) | {'id', 'project_name', 'workflow_stage'})}
+        return hashlib.sha256(dump([values, sorted(photo_ids), template_id, parent_id,
+            [{k: v for k, v in p.items() if k not in ('revision', 'updated_at')}
+             for p in self.db.all('SELECT * FROM photos WHERE case_id=? ORDER BY id', (case_id,))],
+            self.db.one('SELECT * FROM templates WHERE id=?', (template_id,)),
+            self.db.one('SELECT * FROM picc_record_drafts WHERE case_id=?', (case_id,)),
+            self.official.signature(case_id) if self.official else None]).encode()).hexdigest()
 
     def _enqueue_groups(self, jobs, groups, template_id, parent_id, title):
         with self._package_lock:
+            if not isinstance(template_id, str) or not any(t['id'] == template_id for t in self.domain.templates()):
+                raise DomainError('资料要求模板不存在')
+            if parent_id and (len(groups) != 1 or self.package(parent_id)['case_id'] != groups[0]['case']['id']):
+                raise DomainError('补件记录必须属于同一案件')
+            linked = bool(self.official and any(self.official.linked(g['case']['id']) for g in groups))
             with self.db.read_snapshot() as con:
                 if parent_id and len(groups) != 1:
                     raise DomainError('补件请每次选择一个案件')
-                contents = [self._content(group['case']['id'], group['photo_ids'], template_id, parent_id) for group in groups]
-                fingerprint = hashlib.sha256(dump(sorted((item['case']['id'], content_fingerprint(item)) for item in contents)).encode()).hexdigest()
+                contents = [] if linked else [self._content(group['case']['id'], group['photo_ids'], template_id, parent_id) for group in groups]
+                # Linked cases must read the current official list in the worker
+                # before either generating a snapshot or reusing an older package.
+                fingerprint = hashlib.sha256(dump(sorted(
+                    (g['case']['id'], self.input_fingerprint(g['case']['id'], g['photo_ids'], template_id, parent_id)) for g in groups)
+                    if linked else sorted((item['case']['id'], content_fingerprint(item)) for item in contents)).encode()).hexdigest()
                 for job in con.execute("SELECT id,payload FROM jobs WHERE kind='export' AND state IN ('queued','running') ORDER BY created_at DESC"):
                     if json.loads(job['payload']).get('request_fingerprint') == fingerprint:
-                        return jobs.get(job['id'])
+                        try:
+                            return jobs.get(job['id'])
+                        except DomainError as error:
+                            if error.status != 403:
+                                raise
                 matches = [self._equivalent(content, con) for content in contents]
                 results = [self._export_result(self.package(row['id']), True) for row in matches if row]
             payload = {"photo_ids": [pid for g in groups for pid in g['photo_ids']], "template_id": template_id, "parent_id": parent_id, "title": title,
+                       "check_official_media": linked,
                        "package_ids": {g['case']['id']: uid() for g in groups}, "request_fingerprint": fingerprint,
                        "groups": [{"case": {"id": g['case']['id']}, "photo_ids": g['photo_ids']} for g in groups]}
-            if len(results) == len(contents):
+            if not linked and len(results) == len(contents):
                 return jobs.enqueue('export', payload, result={"state": "completed", "packages": results, "reused_count": len(results)})
             return jobs.enqueue('export', payload)
 
@@ -388,6 +425,8 @@ class Reporter:
                 raise DomainError('资料包已删除，请重新选材生成', 409)
             return json.loads(existing["manifest"])
         with self.db.read_snapshot():
+            if self.official:
+                self.official.require_complete(case_id, include_videos=template_id != PICC_FORMAT)
             content = self._content(case_id, photo_ids, template_id, parent_id)
         with self.db.tx() as con:
             if parent_id:
@@ -406,7 +445,14 @@ class Reporter:
         return manifest
 
     def build(self, package_id, case_id, photo_ids, template_id="general", parent_id=None, title=""):
+        old = self.db.one('SELECT state,manifest FROM packages WHERE id=?', (package_id,))
+        check = bool(self.official and (not old or old['state'] not in ('ready', 'submitted', 'accepted', 'returned', 'deleted')))
+        # Network I/O must not hold the global export/queue lock.
+        token = self.official.check(case_id, include_videos=template_id != PICC_FORMAT) if check else None
         with self._package_lock:
+            if check:
+                if self.official.signature(case_id) != token or old and json.loads(old['manifest']).get('official_inventory') != token:
+                    raise DomainError('官网照片清单已变化，请重新生成资料包', 409)
             return self._build(package_id, case_id, photo_ids, template_id, parent_id, title)
 
     def _build(self, package_id, case_id, photo_ids, template_id, parent_id, title):

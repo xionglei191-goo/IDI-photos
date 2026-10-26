@@ -31,8 +31,8 @@ export interface PhotoPage { items: Photo[]; total: number; page: number; page_s
 export interface Summary { total: number; unassigned: number; unknown: number; failed: number; exceptions: number; cases: number; active_jobs: number; attachment_failures: number; stages: Record<string, number> }
 export interface Rule { stage: string; role: string; photo_group?: string; minimum: number; per_visit: boolean; part?: string; process?: string }
 export interface Template { id: string; name: string; insurer: string; requirements: Rule[] }
-export interface PiccPhoto { id: string; original_name: string; thumbnail_url: string | null; sort_time: string | null; time_source: string; time_label: string; remarks: string }
-export interface PiccRecord { case_id: string; revision: number; fields: Record<string, string>; survey_date_source: string; photos: PiccPhoto[]; excluded_photos: PiccPhoto[]; duplicate_count: number; video_count: number; excluded_file_count: number; missing_time_count: number; blockers: string[] }
+export interface PiccPhoto { id: string; original_name: string; thumbnail_url: string | null; original_url?: string; sort_time: string | null; time_source: string; time_label: string; remarks: string }
+export interface PiccRecord { case_id: string; revision: number; fields: Record<string, string>; survey_date_source: string; photos: PiccPhoto[]; excluded_photos: PiccPhoto[]; duplicate_count: number; video_count: number; excluded_file_count: number; missing_time_count: number; blockers: string[]; official_sync_available?: boolean }
 export interface DefaultPackage { case_id: string; template_id: string; template_name: string; eligible: boolean; state: string; error: string; package: { id: string; version: number; download_url: string } | null }
 export interface Check { stage: string; role: string; photo_group?: string; part: string; process?: string; scope: string; minimum: number; count: number; missing: number; photo_ids: string[] }
 export interface Completeness { case_id: string; case_title: string; total_images: number; missing_count: number; items: Check[] }

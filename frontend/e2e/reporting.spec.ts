@@ -24,6 +24,69 @@ async function openInsurer(page: Page, id: string) {
   await expect(page.getByRole('region', { name: '本案资料包', exact: true })).toBeVisible();
 }
 
+test('historical default package waits for an explicit manual request', async ({ page, request }, testInfo) => {
+  await prepare(page, request);
+  const value = await seed(request, '历史按需');
+  let requests = 0;
+  let state = 'manual';
+  await page.route(`**/api/cases/${value.id}/default-package`, async route => {
+    if (route.request().method() === 'POST') {
+      requests += 1;
+      state = 'preparing';
+    }
+    await route.fulfill({ json: { case_id: value.id, template_id: 'insurer-v2', template_name: '保司基础过程资料',
+      eligible: true, state, error: '', package: null } });
+  });
+  await openInsurer(page, value.id);
+  const card = page.getByRole('region', { name: '默认资料', exact: true });
+  await expect(card).toContainText('本案不自动补生成资料');
+  await expect(card.getByLabel('准备中')).toHaveCount(0);
+  await expect(card.getByRole('button', { name: '手动生成默认资料', exact: true })).toBeEnabled();
+  expect(requests).toBe(0);
+  await page.setViewportSize({ width: 390, height: 900 });
+  await card.scrollIntoViewIfNeeded();
+  await expect(card.getByRole('button', { name: '手动生成默认资料', exact: true })).toBeInViewport();
+  await page.screenshot({ path: testInfo.outputPath('historical-manual-mobile.png'), fullPage: true });
+  await card.getByRole('button', { name: '手动生成默认资料', exact: true }).click();
+  await expect(card).toContainText('默认资料正在后台生成');
+  expect(requests).toBe(1);
+  await expect(card.getByRole('button')).toHaveCount(0);
+});
+
+for (const template of ['general', 'picc-record-v1']) {
+  test(`official-only case can enqueue ${template} without local photo selection`, async ({ page, request }) => {
+    await prepare(page, request);
+    const value = await seed(request, `官网补图${template}`);
+    let queued: Record<string, unknown> | null = null;
+    const job = { id: 'official-check', kind: 'export', state: 'queued', payload: { groups: [{ case: { id: value.id } }] } };
+    await page.route('**/api/packages', async route => {
+      if (route.request().method() !== 'POST') return route.continue();
+      queued = route.request().postDataJSON();
+      await route.fulfill({ json: job });
+    });
+    await page.route('**/api/jobs', route => route.fulfill({ json: queued ? [job] : [] }));
+    if (template === 'picc-record-v1') {
+      const record = await (await request.get(`/api/cases/${value.id}/picc-record`)).json();
+      await page.route(`**/api/cases/${value.id}/picc-record`, route => route.fulfill({ json: {
+        ...record, official_sync_available: true, photos: [], blockers: ['本案尚无照片'],
+      } }));
+    }
+    await openInsurer(page, value.id);
+    if (template === 'picc-record-v1') {
+      await page.getByLabel('保司资料要求', { exact: true }).selectOption(template);
+      await expect(page.getByRole('button', { name: '生成记录表', exact: true })).toBeEnabled();
+      await page.getByRole('button', { name: '生成记录表', exact: true }).click();
+    } else {
+      await page.getByRole('button', { name: '生成保司资料包', exact: true }).click();
+    }
+    await expect.poll(() => queued?.case_id).toBe(value.id);
+    expect(queued).not.toHaveProperty('photo_ids');
+    const panel = page.getByRole('region', { name: '本案资料包', exact: true });
+    await expect(panel.getByRole('status')).toContainText('已排队');
+    await expect(panel.getByRole('link')).toHaveCount(0);
+  });
+}
+
 test('package reuse and deletion work in both case and reporting lists', async ({ page, request }, testInfo) => {
   await prepare(page, request);
   const value = await seed(request, '实包');

@@ -1,5 +1,6 @@
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -199,12 +200,15 @@ def test_upgrade_preserves_a_preexisting_clear_boundary(bot, monkeypatch):
     key = identity(task_for(bot, first), 'feishu')[0]
     summary = bot.db.one('SELECT * FROM agent_context_summaries WHERE scope_key=?', (key,))
     bot.memory.context.edit(summary, {'revision': summary['revision'], 'clear': True})
-    # Recreate the previous schema; migration must honor an already-cleared summary.
+    # Exercise migration 23 against its previous table shape. Newer migrations
+    # are already present in this fixture, so deleting version 23 cannot make
+    # initialize() replay it (the migrator correctly starts after MAX(version)).
     with bot.db.tx() as con:
         con.execute('DROP INDEX feishu_inbox_member_context')
         con.execute('ALTER TABLE agent_context_summaries DROP COLUMN member_context_cursor')
-        con.execute('DELETE FROM schema_version WHERE version=23')
-    bot.db.initialize()
+    migration = Path(__file__).parents[1] / 'idi/migrations/023_feishu_member_context.sql'
+    with bot.db.read() as con:
+        con.executescript(migration.read_text(encoding='utf-8'))
     current = capture(bot, '升级后继续。')
     bot.collect_messages()
     calls = arrange_model(bot, monkeypatch, [response(text='从清空后的对话继续。')])

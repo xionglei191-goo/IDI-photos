@@ -89,10 +89,12 @@ const isVisible = (field: PlatformField, values: Record<string, string | number>
 const displayValues = (plan: PlatformPlan) => plan.access.editable ? plan.draft.values : Object.fromEntries(Object.entries(plan.values).map(([key, value]) => [key, String(value ?? '')]));
 const sameFieldValue = (field: PlatformField, a: string, b: string) => field.kind === 'datetime' ? a.replace('T', ' ').slice(0, 16) === b.replace('T', ' ').slice(0, 16) : a.trim() === b.trim();
 
-export default function PlatformWorkspace({ cases, initialCaseId, initialStage = 'survey', embedded = false, revision, notify, importFiles, registerLeave, onChanged, onReadback }: {
+export default function PlatformWorkspace({ cases, initialCaseId, initialStage = 'survey', embedded = false, revision, notify, importFiles, registerLeave, onChanged, onReadback, officialRefreshing = false, officialRefreshError = '', currentAccess, onEditingChange }: {
   cases: Case[]; initialCaseId: string; revision: number; notify: Notify; importFiles: (caseId: string) => void;
   initialStage?: PlatformStage; embedded?: boolean; onChanged?: () => void; onReadback?: () => void;
   registerLeave: (callback: (() => Promise<boolean>) | null) => void;
+  officialRefreshing?: boolean; officialRefreshError?: string; currentAccess?: PlatformPlan['access'];
+  onEditingChange?: (editing: boolean) => void;
 }) {
   const { person } = useAuth();
   const isAdmin = person.system_role === 'admin';
@@ -100,8 +102,17 @@ export default function PlatformWorkspace({ cases, initialCaseId, initialStage =
   const [review, setReview] = useState<ReviewBatch | null>(null);
   const [removal, setRemoval] = useState<{ target: RemovalTarget; initial?: AttachmentRemoval } | null>(null);
   const [plan, setPlan] = useState<PlatformPlan | null>(null), [values, setValues] = useState<Record<string, string>>({}), [files, setFiles] = useState<Record<string, string[]>>({});
-  const [loading, setLoading] = useState(true), [saving, setSaving] = useState(false), [dirty, setDirty] = useState(false), [error, setError] = useState(''), [reload, setReload] = useState(0);
-  const [binding, setBinding] = useState(false), [picker, setPicker] = useState<PlatformFileField | null>(null);
+  const [loading, setLoading] = useState(true), [saving, setSavingState] = useState(false), [dirty, setDirtyState] = useState(false), [error, setError] = useState(''), [reload, setReload] = useState(0);
+  const [binding, setBinding] = useState(false), [picker, setPickerState] = useState<PlatformFileField | null>(null);
+  const interaction = useRef({ dirty: false, saving: false, picker: false });
+  const markInteraction = useCallback((key: 'dirty' | 'saving' | 'picker', value: boolean) => {
+    interaction.current[key] = value;
+    onEditingChange?.(Object.values(interaction.current).some(Boolean));
+  }, [onEditingChange]);
+  const setDirty = useCallback((value: boolean) => { markInteraction('dirty', value); setDirtyState(value); }, [markInteraction]);
+  const setSaving = useCallback((value: boolean) => { markInteraction('saving', value); setSavingState(value); }, [markInteraction]);
+  const setPicker = useCallback((value: PlatformFileField | null) => { markInteraction('picker', !!value); setPickerState(value); }, [markInteraction]);
+  useEffect(() => () => onEditingChange?.(false), [onEditingChange]);
   const [session, setSession] = useState<PlatformSession | null>(null), [downloads, setDownloads] = useState<PlatformPackage[]>([]);
   const schema = useData<PlatformContract>('/api/platform/contract', reload);
   const currentRef = useRef<PlatformPlan | null>(null), saveRef = useRef<Promise<PlatformPlan | null> | null>(null);
@@ -150,8 +161,9 @@ export default function PlatformWorkspace({ cases, initialCaseId, initialStage =
     api<PlatformPlan>(path + (previewEdits ? '/preview' : ''), { method: previewEdits ? 'POST' : 'GET', ...(previewEdits ? { body: delayedSignature } : {}), signal: abort.signal }).then(p => {
       if (abort.signal.aborted) return;
       if (!p.access.editable) {
-        if (currentRef.current?.access.editable && dirty) notify('办理进度已变化，本环节已锁定，未保存的改动未写入。');
-        setValues(displayValues(p)); setFiles({}); setDirty(false); setPicker(null);
+        if (!dirty) { setValues(displayValues(p)); setFiles({}); }
+        else p.file_fields = p.file_fields.map(field => ({ ...field, selected: p.photos.filter(photo => (files[field.key] || []).includes(photo.id)) }));
+        setPicker(null);
       } else if (!dirty) {
         setValues(displayValues(p)); setFiles(p.draft.files);
       }
@@ -165,7 +177,11 @@ export default function PlatformWorkspace({ cases, initialCaseId, initialStage =
   const save = useCallback(async (showNotice = true): Promise<PlatformPlan | null> => {
     if (saveRef.current) return saveRef.current;
     if (!currentRef.current) return null;
-    if (!currentRef.current.access.editable) return currentRef.current;
+    if (!currentRef.current.access.editable || currentAccess?.editable === false) {
+      if (!dirty) return currentRef.current;
+      setError('官网办理进度已变化，未保存的填写仍保留在本页。请先复制需要的内容，或放弃未保存修改后离开。');
+      return null;
+    }
     if (!dirty && currentRef.current.draft.target_report_id === currentRef.current.link.report_receiving_id) return currentRef.current;
     setSaving(true); setError('');
     const task = put<PlatformPlan>(path, { values, files, revision: currentRef.current.draft.revision, link_revision: currentRef.current.link.revision }).then(p => {
@@ -173,7 +189,7 @@ export default function PlatformWorkspace({ cases, initialCaseId, initialStage =
       if (showNotice) notify('已保存本地官网资料草稿'); return p;
     }).catch(e => { setError(message(e)); return null; }).finally(() => { setSaving(false); saveRef.current = null; });
     saveRef.current = task; return task;
-  }, [dirty, values, files, path, notify]);
+  }, [dirty, values, files, path, notify, currentAccess, setDirty, setSaving]);
   useEffect(() => { registerLeave(async () => !dirty || !!await save(false)); return () => registerLeave(null); }, [dirty, save, registerLeave]);
   useEffect(() => { const handler = (event: BeforeUnloadEvent) => { if (dirty) { event.preventDefault(); event.returnValue = ''; } }; window.addEventListener('beforeunload', handler); return () => window.removeEventListener('beforeunload', handler); }, [dirty]);
 
@@ -227,7 +243,13 @@ export default function PlatformWorkspace({ cases, initialCaseId, initialStage =
     } catch (e) { setError(message(e)); } finally { setSaving(false); }
   }
   const displayedValues = { ...plan?.values, ...values };
-  const canEdit = !!plan?.access.editable && (isAdmin || person.projects[plan.case.project_id] === 'manager');
+  const effectiveAccess = currentAccess?.editable === false ? currentAccess : plan?.access;
+  const canEdit = !!plan?.access.editable && !!effectiveAccess?.editable && (isAdmin || person.projects[plan.case.project_id] === 'manager');
+  const officialReady = !officialRefreshing && !officialRefreshError;
+  function discardUnsaved() {
+    if (!plan) return;
+    setValues(displayValues(plan)); setFiles(canEdit ? plan.draft.files : {}); setDirty(false); setError('');
+  }
   function readValue(field: PlatformField, value: string | number) {
     if (value === '' || value === null || value === undefined) return '未记录';
     if (field.name_key && plan?.values[field.name_key]) return String(plan.values[field.name_key]);
@@ -236,6 +258,7 @@ export default function PlatformWorkspace({ cases, initialCaseId, initialStage =
     return options.find(option => option.code === String(value))?.name || String(value);
   }
   async function reviewDraft() {
+    if (!officialReady) { notify('官网最新状态尚未核对完成，请刷新成功后再预提交审核。', true); return; }
     const p = await save(false); if (!p) return;
     setSaving(true); setError('');
     try { setReview(await post<ReviewBatch>(`/api/workflow/cases/${caseId}/review/${stage}`, { revision: p.draft.revision })); }
@@ -249,8 +272,9 @@ export default function PlatformWorkspace({ cases, initialCaseId, initialStage =
     {!embedded && schema.data && <nav className="tabs platform-stages" aria-label="官网办理环节">{Object.entries(schema.data.stages).map(([id, item]) => <button key={id} disabled={saving || loading} className={stage === id ? 'active' : ''} onClick={() => void changeStage(id as PlatformStage)}><small>指南 {item.guide_page}</small>{item.label}</button>)}</nav>}
     <ErrorBox error={error || schema.error} /><p className="muted">本项目官网写入账号：{session?.account || "尚未连接，请由系统管理员在人员与权限中配置"}。照片保存与正式提交使用本项目账号。</p>
     {!caseId ? <Empty>先建立本地案件，再准备官网资料。</Empty> : loading ? <Loading /> : plan && <div className="platform-body">
-      <section className="platform-binding"><div><strong>{plan.case.project_name} · {place(plan.case)}</strong><p>{plan.case.title}</p><dl><dt>报修编号（平台）</dt><dd>{plan.link.platform_report_code || '未记录'}</dd><dt>报案编号（保司）</dt><dd>{plan.link.insurer_report_number || '未记录'}</dd><dt>官网节点</dt><dd>{plan.link.node}</dd></dl></div><div className="row wrap">{canEdit && isAdmin && <button disabled={saving} onClick={() => void openBinding()}><Link2 size={14} />关联 / 核对案件</button>}{plan.link.report_receiving_id && <button disabled={saving} onClick={() => void refreshLink()}><RefreshCw size={14} />刷新官网资料</button>}</div></section>
-      {!canEdit && <div className="stage-lock-notice" role="status"><LockKeyhole size={18} aria-hidden="true" /><div><strong>{plan.access.reason}</strong><p>{plan.view_source === 'official' ? '显示官网已保存的信息与附件，历史本地草稿不会覆盖这些内容。' : '保留此前的办理内容，当前不能修改字段或附件。'}</p></div></div>}
+      <section className="platform-binding"><div><strong>{plan.case.project_name} · {place(plan.case)}</strong><p>{plan.case.title}</p><dl><dt>报修编号（平台）</dt><dd>{plan.link.platform_report_code || '未记录'}</dd><dt>报案编号（保司）</dt><dd>{plan.link.insurer_report_number || '未记录'}</dd><dt>官网节点</dt><dd>{plan.link.node}</dd></dl></div><div className="row wrap">{canEdit && isAdmin && <button disabled={saving} onClick={() => void openBinding()}><Link2 size={14} />关联 / 核对案件</button>}{plan.link.report_receiving_id && <button disabled={saving || officialRefreshing} onClick={() => void refreshLink()}><RefreshCw size={14} />刷新官网资料</button>}</div></section>
+      {!canEdit && <div className="stage-lock-notice" role="status"><LockKeyhole size={18} aria-hidden="true" /><div><strong>{effectiveAccess?.reason || plan.access.reason}</strong><p>{plan.view_source === 'official' ? '显示官网已保存的信息与附件，历史本地草稿不会覆盖这些内容。' : '保留此前的办理内容，当前不能修改字段或附件。'}</p></div></div>}
+      {dirty && !canEdit && <div className="stage-lock-notice" role="status"><div><strong>官网进度已变化，未保存的修改仍保留在本页</strong><p>请先复制需要保留的填写内容；已完成的环节不能继续保存或提交。</p></div><button onClick={discardUnsaved}>放弃未保存修改</button></div>}
       <div className="platform-columns"><div className="platform-form"><section className="platform-card"><div className="row between wrap"><h2>{plan.label} · 业务信息</h2><div className="row wrap">{canEdit && ['survey', 'repair'].includes(stage) && <button className="platform-prefill-button" disabled={saving || !Object.keys(plan.field_suggestions || {}).some(key => !String(values[key] ?? '').trim())} onClick={() => void prefill()}>根据资料预填</button>}{canEdit && Object.keys(plan.remote_values).length > 0 && !['survey', 'repair'].includes(stage) && <button className="text-button" disabled={saving} onClick={() => { setValues(prev => { const next = { ...prev }; for (const [key, value] of Object.entries(plan.remote_values)) if (!next[key]) next[key] = value; return next; }); setDirty(true); }}>带入官网空白字段</button>}{canEdit && isAdmin && session?.connected && <button className="text-button" disabled={saving} onClick={() => void refreshOptions()}>刷新官网选项</button>}</div></div><p className="muted">{canEdit ? '带 * 的字段为该环节必填项。时间按实际记录填写，不使用导入或上传时间替代。' : '当前表单仅供核对，不提供修改或重新提交操作。'}</p>{canEdit && ['survey', 'repair'].includes(stage) && <p className="platform-prefill-intro">自动上传会按案件记录和照片水印补充空栏，并保留人工填写。每项可查看依据，确认前仍可修改。</p>}<fieldset disabled={saving || !canEdit} className="platform-fieldset"><div className="form-grid">{plan.fields.filter(f => f.kind !== 'files' && isVisible(f, displayedValues)).map(f => {
         const value = values[f.key] ?? String(plan.values[f.key] ?? '');
         const options = f.options || schema.data?.dictionaries[f.dictionary || ''] || [];
@@ -263,7 +287,7 @@ export default function PlatformWorkspace({ cases, initialCaseId, initialStage =
         const suggestionNote = canEdit && !value.trim() ? plan.field_suggestion_notes?.[f.key] : '';
         const hintId = suggestionText || suggestionNote ? `prefill-${stage}-${f.key}` : undefined;
         return <label key={f.key} className={f.kind === 'textarea' || f.kind === 'personnel' ? 'full' : ''}><span>{f.label}{f.required && <b className="required-star"> *</b>}</span>
-          {!canEdit || f.kind === 'readonly' ? <output aria-label={f.label} className="platform-output">{readValue(f, !canEdit ? plan.values[f.key] : plan.values[f.key] || '')}</output> : f.kind === 'textarea' ? <textarea aria-label={f.label} aria-describedby={hintId} rows={3} value={value} onChange={e => edit(f.key, e.target.value)} /> : ['select', 'dictionary'].includes(f.kind) ? <select aria-label={f.label} aria-describedby={hintId} value={value} onChange={e => edit(f.key, e.target.value)}><option value="">请选择</option>{value && !options.some(o => o.code === value) && <option value={value}>旧选项（需核对）：{value}</option>}{options.map(o => <option value={o.code} key={o.code}>{o.name}</option>)}</select> : f.kind === 'personnel' ? <><select aria-label={f.label} aria-describedby={hintId} multiple value={value.split(',').filter(Boolean)} onChange={e => edit(f.key, Array.from(e.target.selectedOptions, o => o.value).join(','))}>{plan.personnel.map(p => <option value={p.userId} key={p.userId}>{p.name}{p.phone ? ` · ${p.phone}` : ''}</option>)}</select><small>需先在线关联案件；可多选，姓名与联系方式随人员记录带入。</small></> : <input aria-label={f.label} aria-describedby={hintId} type={f.kind === 'datetime' ? 'datetime-local' : f.kind === 'date' ? 'date' : f.kind === 'integer' ? 'number' : 'text'} min={f.kind === 'integer' ? 1 : undefined} step={f.kind === 'integer' ? 1 : undefined} value={f.kind === 'datetime' ? value.replace(' ', 'T').slice(0, 16) : value} onChange={e => edit(f.key, e.target.value)} />}
+          {!canEdit || f.kind === 'readonly' ? <output aria-label={f.label} className="platform-output">{readValue(f, dirty && !canEdit ? value : plan.values[f.key] || '')}</output> : f.kind === 'textarea' ? <textarea aria-label={f.label} aria-describedby={hintId} rows={3} value={value} onChange={e => edit(f.key, e.target.value)} /> : ['select', 'dictionary'].includes(f.kind) ? <select aria-label={f.label} aria-describedby={hintId} value={value} onChange={e => edit(f.key, e.target.value)}><option value="">请选择</option>{value && !options.some(o => o.code === value) && <option value={value}>旧选项（需核对）：{value}</option>}{options.map(o => <option value={o.code} key={o.code}>{o.name}</option>)}</select> : f.kind === 'personnel' ? <><select aria-label={f.label} aria-describedby={hintId} multiple value={value.split(',').filter(Boolean)} onChange={e => edit(f.key, Array.from(e.target.selectedOptions, o => o.value).join(','))}>{plan.personnel.map(p => <option value={p.userId} key={p.userId}>{p.name}{p.phone ? ` · ${p.phone}` : ''}</option>)}</select><small>需先在线关联案件；可多选，姓名与联系方式随人员记录带入。</small></> : <input aria-label={f.label} aria-describedby={hintId} type={f.kind === 'datetime' ? 'datetime-local' : f.kind === 'date' ? 'date' : f.kind === 'integer' ? 'number' : 'text'} min={f.kind === 'integer' ? 1 : undefined} step={f.kind === 'integer' ? 1 : undefined} value={f.kind === 'datetime' ? value.replace(' ', 'T').slice(0, 16) : value} onChange={e => edit(f.key, e.target.value)} />}
           {f.hint && <small>{f.hint}</small>}
           {(suggestionText || suggestionNote) && <small className="platform-prefill-source" id={hintId}>{suggestionText || suggestionNote}</small>}
         </label>;
@@ -276,9 +300,9 @@ export default function PlatformWorkspace({ cases, initialCaseId, initialStage =
           {!!f.removed?.length && <div className="platform-removed-files" role="status"><strong>官网已删除 {f.removed.length} 项</strong><p>以下附件已不在官网当前列表中，本地已有原件保留。</p><ul>{f.removed.map(item => <li key={item.id}>{item.oldFileName || item.fileName || item.name || item.id}<small> · 核对于 {dateTime(item.removed_at)}</small></li>)}</ul></div>}
           {!!f.existing.length && <AttachmentGallery label={f.label} items={officialAttachments(f.existing, `/api/platform/cases/${encodeURIComponent(plan.case.id)}/stages/${stage}/files/${encodeURIComponent(f.key)}`)}
             onRemove={canEdit && !f.readonly && ['survey', 'repair'].includes(stage) ? item => void removeAttachment(f, item) : undefined}
-            removeDisabled={saving || !session?.connected || !session?.write_enabled || !!plan.attachment_removals?.length} />}
+            removeDisabled={saving || !officialReady || !session?.connected || !session?.write_enabled || !!plan.attachment_removals?.length} />}
         </article>)}
-      </section></div><aside className="platform-checks">{!canEdit ? <section className="platform-card"><h2>环节记录 · 仅供查看</h2><p>{plan.access.reason}</p>{plan.link.verified_at && <p className="muted space-top">官网回读时间：{dateTime(plan.link.verified_at)}</p>}{plan.access.active_label && <p className="muted">当前可办理：{plan.access.active_label}</p>}</section> : <section className="platform-card"><h2>{plan.error_count ? `待补 / 核对 ${plan.error_count} 项` : '字段与选材已备齐'}</h2><p className="muted">当前只核对本环节；准备完成不代表官网接收或业务验收。</p><ul>{plan.issues.map((i, index) => <li key={`${i.field}-${index}`} className={i.severity === 'error' ? 'platform-issue-error' : 'platform-issue-warning'}><AlertCircle size={15} /><span>{i.message}</span></li>)}</ul>{!plan.issues.length && <p className="success-note"><CheckCircle2 size={15} />已满足当前字段规则</p>}<button disabled={saving || loading || !!plan.error_count || !canEdit} className="primary platform-download" onClick={() => void reviewDraft()}><CheckCircle2 size={15} />预提交审核</button><button disabled={saving || loading} className="platform-download" onClick={() => void prepare()}><Download size={15} />下载按栏位资料</button><p className="muted">ZIP 用于本地整理与核对，内含原件、字段清单和待补说明。</p></section>}
+      </section></div><aside className="platform-checks">{!canEdit ? <section className="platform-card"><h2>环节记录 · 仅供查看</h2><p>{plan.access.reason}</p>{plan.link.verified_at && <p className="muted space-top">官网回读时间：{dateTime(plan.link.verified_at)}</p>}{plan.access.active_label && <p className="muted">当前可办理：{plan.access.active_label}</p>}</section> : <section className="platform-card"><h2>{plan.error_count ? `待补 / 核对 ${plan.error_count} 项` : '字段与选材已备齐'}</h2><p className="muted">当前只核对本环节；准备完成不代表官网接收或业务验收。</p><ul>{plan.issues.map((i, index) => <li key={`${i.field}-${index}`} className={i.severity === 'error' ? 'platform-issue-error' : 'platform-issue-warning'}><AlertCircle size={15} /><span>{i.message}</span></li>)}</ul>{!plan.issues.length && <p className="success-note"><CheckCircle2 size={15} />已满足当前字段规则</p>}<button disabled={saving || loading || !!plan.error_count || !canEdit || !officialReady} className="primary platform-download" onClick={() => void reviewDraft()}><CheckCircle2 size={15} />预提交审核</button><button disabled={saving || loading} className="platform-download" onClick={() => void prepare()}><Download size={15} />下载按栏位资料</button><p className="muted">ZIP 用于本地整理与核对，内含原件、字段清单和待补说明。</p></section>}
         <section className="platform-card"><h2>本地准备记录</h2>{downloads.length ? <ul className="platform-downloads">{downloads.map(p => <li key={p.id}><a href={p.download_url}>{p.label} · {p.file_count}项文件</a><small>{dateTime(p.created_at)} · {p.error_count ? `待核对${p.error_count}项` : '字段备齐'} · 未上传官网</small></li>)}</ul> : <p className="muted">生成按栏位资料包后在这里保留快照。</p>}</section>
       </aside></div><details className="platform-mapping"><summary>字段映射与规则依据</summary><p>官网版本 {plan.contract_version} · 选项核对时间 {dateTime(schema.data?.dictionary_verified_at)} · 操作指南第 {plan.guide_page} 页</p><p>此处仅展示接口字段对应关系；本地文件尚无官网上传 ID，不能直接作为完整提交请求。</p><pre>{JSON.stringify({ endpoint: plan.endpoint, business_fields: plan.business_fields, file_fields: plan.file_fields.map(f => ({ field: f.key, label: f.label, existing_count: f.existing.length, local_file_ids: f.selected.map(p => p.id) })), remote_written: false }, null, 2)}</pre></details>
     </div>}

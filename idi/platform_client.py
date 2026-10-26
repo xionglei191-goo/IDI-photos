@@ -105,6 +105,9 @@ class PlatformClient:
         self._token = ""
         self._account = ""
         self._lock = threading.RLock()
+        # Session inspection must never wait for a network request: a caller may
+        # hold a DB transaction while that request accounts for its budget in DB.
+        self._state_lock = threading.RLock()
         self._login_lock = threading.Lock()
         self._session_generation = 0
         self._connected_at = None
@@ -163,7 +166,7 @@ class PlatformClient:
         return PlatformReadPaused('官网限流或暂不可用，已暂停请求并保留同步进度', delay)
 
     def status(self):
-        with self._lock:
+        with self._state_lock:
             return {"connected": bool(self._token), "account": self._account,
                     "connected_at": self._connected_at, "mode": "reviewed_writes" if self.write_enabled else "read_only", "write_enabled": self.write_enabled}
 
@@ -317,7 +320,7 @@ class PlatformClient:
                 raise PlatformLoginError("官网登录程序未能启动，请检查本机浏览器和运行环境。", 503, retryable=False) from error
             except ValueError as error:
                 raise PlatformLoginError("官网登录程序未返回有效结果，请稍后重试。", 502, retryable=False) from error
-            with self._lock:
+            with self._lock, self._state_lock:
                 if self._closing.is_set() or generation != self._session_generation:
                     raise DomainError('本次连接已取消，请按当前设置重新连接。', 409)
                 self._token = token
@@ -328,7 +331,7 @@ class PlatformClient:
             return self.status()
 
     def logout(self):
-        with self._lock:
+        with self._lock, self._state_lock:
             self._session_generation += 1
             self._token = ""
             self._account = ""

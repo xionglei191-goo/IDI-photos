@@ -51,7 +51,7 @@ def test_native_tools_project_scope_history_and_case_links(chat, services, proje
     assert not chat.db.all('SELECT * FROM platform_drafts')
 
 
-def test_browser_conversations_are_isolated_and_scope_is_frozen(chat, project, case, services, monkeypatch):
+def test_browser_conversations_are_isolated_and_all_projects_scope_refreshes(chat, project, case, services, monkeypatch):
     first = send(chat, '仅属于甲浏览器的对话内容')
     model(chat, monkeypatch, [response(text='你好，请提供案件编号。')])
     chat.run_one()
@@ -65,14 +65,28 @@ def test_browser_conversations_are_isolated_and_scope_is_frozen(chat, project, c
         chat.cancel(OTHER, first['turn_id'])
     services['domain'].save_project({'name': '对话建立后新增的项目'})
     send(chat, '列出项目', thread_id=first['thread_id'])
-    requests = model(chat, monkeypatch, [response(('list_projects', {})), response(text='当前对话范围中有一个项目。')])
+    requests = model(chat, monkeypatch, [response(('list_projects', {})), response(text='当前对话范围中有两个项目。')])
     chat.run_one()
-    assert '对话建立后新增的项目' not in dump(requests)
+    assert '对话建立后新增的项目' in dump(requests)
+    assert len(json.loads(chat.db.one('SELECT project_ids FROM workspace_chat_threads WHERE id=?', (first['thread_id'],))['project_ids'])) == 2
     second = send(chat, '新的独立话题', key=OTHER, project_id=project['id'])
     requests = model(chat, monkeypatch, [response(text='你好。')])
     chat.run_one()
     assert '仅属于甲浏览器' not in dump(requests)
     assert len(chat.get(OTHER, second['thread_id'])['turns']) == 1
+
+
+@pytest.mark.parametrize('selection', ['project', 'case'])
+def test_selected_project_and_case_scopes_do_not_expand(chat, project, case, services, monkeypatch, selection):
+    first = send(chat, **({'project_id': project['id']} if selection == 'project' else {'case_id': case['id']}))
+    model(chat, monkeypatch, [response(text='已读取所选范围。')])
+    chat.run_one()
+    services['domain'].save_project({'name': '新建但未选择的项目'})
+    send(chat, '再次列出范围', thread_id=first['thread_id'])
+    requests = model(chat, monkeypatch, [response(('list_projects', {})), response(text='仍为所选项目。')])
+    chat.run_one()
+    assert '新建但未选择的项目' not in dump(requests)
+    assert json.loads(chat.db.one('SELECT project_ids FROM workspace_chat_threads WHERE id=?', (first['thread_id'],))['project_ids']) == [project['id']]
 
 
 @pytest.mark.parametrize('name,args', [

@@ -18,7 +18,7 @@ from .domain import DomainError, WORKFLOW_STAGES
 from .project_agent_tools import ProjectAgentTools
 from .project_followup import plain
 from .agent_memory import AgentMemory
-from .context_memory import bounded_tool_result, history_notice
+from .context_memory import bounded_tool_result, history_notice, tool_batch_error
 from .feishu_topics import FeishuTopics, speaker_tag
 from .agent_capabilities import GUIDANCE
 from .agent_dates import parsed
@@ -419,6 +419,10 @@ class FeishuAgent:
         return count
 
     def project_snapshot(self, project_id, instant=None, followup_only=False):
+        with self.db.read_snapshot():
+            return self._project_snapshot(project_id, instant, followup_only)
+
+    def _project_snapshot(self, project_id, instant=None, followup_only=False):
         instant = instant or datetime.now(timezone.utc)
         local = instant.astimezone(CHINA)
         start, end = stamp(local.replace(hour=0, minute=0, second=0, microsecond=0)), stamp(instant)
@@ -451,6 +455,7 @@ class FeishuAgent:
                 time_note='官网同步发现变化的时间，实际办理时间未知' if observed else '人工登记的办理时间')
             changes.append(change)
         changes.sort(key=lambda change: change['evidence_at'], reverse=True)
+        changes_total = len(changes)
         changes = changes[:8]
         sync = self.workflow.sync_status()
         latest = sync.get('latest') or {}
@@ -458,7 +463,11 @@ class FeishuAgent:
                 'timezone': 'Asia/Shanghai', 'case_count': len(cases), 'all_case_count': all_case_count, 'followup_only': followup_only,
                 'stages': dict(stages), 'photos': {k: v or 0 for k, v in photos.items()}, 'draft_states': dict(drafts),
                 'open_checks': {r['kind']: r['n'] for r in issues}, 'recent_recorded_changes': changes,
-                'last_official_sync': {'state': latest.get('state'), **{k: parsed_time(latest[k]).astimezone(CHINA).isoformat() if latest.get(k) else None for k in ('started_at', 'finished_at')}},
+                'recorded_changes_total': changes_total, 'recorded_changes_has_more': changes_total > len(changes),
+                'more_changes_tool': 'read_case_progress',
+                'last_official_sync': {'state': latest.get('state'),
+                    'scope': '全局同步任务状态，不代表本项目所有案件详情均已回读',
+                    **{k: parsed_time(latest[k]).astimezone(CHINA).isoformat() if latest.get(k) else None for k in ('started_at', 'finished_at')}},
                 'scope': ('查勘维修清单范围；' if followup_only else '') + '本机台账及最近官网同步；照片数量不是工程完成率，待核对提示不等于施工缺陷，内部缺项先核对已有材料。'}
 
     def brief_preview(self, project_id):
@@ -513,10 +522,21 @@ class FeishuAgent:
         labels.update({ref: case.get('platform_report_code') or case.get('short_code') or case['title']
             for ref, case in context.cases.items()})
         labels.update({ref: '图片' + str(int(ref[1:])) for ref in context.photos})
+        inspection = getattr(getattr(context, 'capabilities', None), 'inspection', None)
+        if inspection:
+            labels.update(inspection.package_labels)
+            labels.update({ref: '识别记录' + str(int(ref[1:])) for ref in inspection.evidence})
+            appendix = inspection.reply_appendix(6000 if context.task.get('thread_id') else 1300)
+            if appendix:
+                if not context.task.get('thread_id') and len(answer) + len(appendix) > 1750:
+                    answer = answer[:max(0, 1700 - len(appendix))] + '…（说明已缩短，查询证据如下）'
+                answer += '\n\n' + appendix
         for ref, label in labels.items():
             token = r'(?<![A-Za-z0-9])' + re.escape(ref) + r'(?![A-Za-z0-9])'
             answer = re.sub(token + r'\s*[-·：:]?\s*' + re.escape(label), lambda match: label, answer)
             answer = re.sub(token, lambda match: label, answer)
+        if inspection and inspection.delivered and not context.task.get('thread_id') and len(answer) > 1780:
+            answer = answer[:1700].rsplit('\n', 1)[0] + '\n证据尚未完全展示；请按案件或页码继续查询。'
         return answer
 
     def run_one(self):
@@ -586,17 +606,21 @@ class FeishuAgent:
                     if not candidate:
                         raise DomainError('模型未给出有效答复或工具调用')
                     try:
+                        context.validate_delivery()
                         answer = context.dates.finish(candidate)
                     except DomainError as exc:
                         messages += [{'role': 'assistant', 'content': candidate},
                                      {'role': 'user', 'content': '服务器日期校验未通过：' + str(exc)}]
                         continue
                     break
-                if not isinstance(calls, list) or len(calls) > 4:
-                    raise DomainError('模型一次调用了过多工具，本次停止')
-                if any(c.get('function', {}).get('name') == 'finish_reply' for c in calls) and len(calls) != 1:
-                    raise DomainError('结束答复必须单独调用，不能与写入操作混合')
+                batch_error = tool_batch_error(calls)
                 messages.append({'role': 'assistant', 'content': message.get('content'), 'tool_calls': calls})
+                if batch_error:
+                    for call in calls:
+                        step += 1
+                        self._trace(task['id'], step, call['function']['name'], {}, batch_error)
+                        messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': dump({'error': batch_error})})
+                    continue
                 images = []
                 for call in calls:
                     step += 1
@@ -607,7 +631,9 @@ class FeishuAgent:
                         if not isinstance(arguments, str) or len(arguments) > 16000:
                             raise DomainError('工具参数无效或过长')
                         args = json.loads(arguments)
-                        output, additions = context.execute(name, args)
+                        if name == 'organize_image' and any(c.get('function', {}).get('name') == 'read_images' for c in calls):
+                            raise DomainError('请先接收并查看 read_images 返回的图片，再在下一轮调用 organize_image。')
+                        output, additions = context.execute_for_model(name, args)
                         images += additions
                         self._trace(task['id'], step, name, args, dump(output))
                         if name == 'finish_reply':
