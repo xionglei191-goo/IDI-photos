@@ -4,6 +4,11 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAHgAAABkCAIAAADCEmNlAAAA80lEQVR
 
 test('official photos appear in both form and review, with local preview and retry', async ({ page, request }, testInfo) => {
   await page.emulateMedia({ reducedMotion: 'reduce' });
+  const auth = await (await request.get('/api/auth/status')).json();
+  expect((await request.post(auth.setup_required ? '/api/auth/setup' : '/api/auth/login', {
+    headers: { 'X-IDI-Request': '1' }, data: { username: 'upload-ui-admin', password: 'isolated-upload-ui-password', display_name: '隔离测试管理员' },
+  })).ok()).toBeTruthy();
+  await page.context().addCookies((await request.storageState()).cookies);
   const headers = { 'X-IDI-Request': '1' }, errors: string[] = [], confirmations: unknown[] = [];
   page.on('pageerror', error => errors.push(error.message));
   const project = await (await request.post('/api/projects', { headers, data: { name: '官网照片预览验收', short_prefix: 'MEDIA' } })).json();
@@ -48,7 +53,8 @@ test('official photos appear in both form and review, with local preview and ret
   });
   await page.route('**/api/photos/new-picture/*', route => route.fulfill({ contentType: 'image/png', body: png }));
   await page.goto('/');
-  const proposal = page.getByRole('region', { name: '拟提交事项', exact: true });
+  await page.getByRole('region', { name: '拟提交事项', exact: true }).getByRole('button', { name: '查看待办' }).click();
+  const proposal = page.getByRole('dialog', { name: '拟提交待办', exact: true });
   await proposal.getByRole('button', { name: '核对拟提交信息', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '现场查勘 · 预提交审核', exact: true });
   await expect(dialog.locator('.attachment-card[data-source=official]')).toHaveCount(5);
@@ -85,7 +91,8 @@ test('official photos appear in both form and review, with local preview and ret
   }
   await page.setViewportSize({ width: 1440, height: 1000 });
   await dialog.getByRole('button', { name: '关闭', exact: true }).last().click();
-  await proposal.getByRole('button', { name: item.short_code, exact: true }).click();
+  await expect(proposal.locator('.proposal-item-project')).toHaveText('官网照片预览验收 · C4栋 1101');
+  await proposal.getByRole('button', { name: '案件号待关联', exact: true }).click();
   const fields = page.locator('.platform-file-field');
   await expect(fields.locator('.attachment-card[data-source=official]')).toHaveCount(5);
   for (const img of await fields.locator('.attachment-gallery img').all()) {

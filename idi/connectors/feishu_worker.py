@@ -42,7 +42,8 @@ def main():
     parser.add_argument('--data-dir', required=True)
     parser.add_argument('--parent-pid', type=int, required=True)
     args = parser.parse_args()
-    service = create_app(Settings(Path(args.data_dir).resolve(), worker_enabled=False)).state.services['connectors']
+    services = create_app(Settings(Path(args.data_dir).resolve(), worker_enabled=False)).state.services
+    service = services['connectors']
     connector = service.get(args.connector_id)
     if connector['kind'] != 'feishu' or not connector['enabled']:
         return
@@ -80,7 +81,7 @@ def main():
     thread = threading.Thread(target=work, name='feishu-download', daemon=True)
     thread.start()
     try:
-        ws = create_ws(capture, connector['config']['app_id'], secret)
+        ws = create_ws(capture, connector['config']['app_id'], secret, services['review_cards'])
         ws.start()
     except Exception:
         capture.state(phase='error', error='飞书长连接启动失败，请检查凭据、应用发布及事件订阅配置')
@@ -88,7 +89,7 @@ def main():
         client.close()
 
 
-def create_ws(capture, app_id, secret):
+def create_ws(capture, app_id, secret, cards=None):
     # Official SDK owns the main asyncio loop. Suppress its URL-bearing logs.
     import lark_oapi as lark
     lark.logger.disabled = True
@@ -97,7 +98,16 @@ def create_ws(capture, app_id, secret):
     def receive(data):
         capture.receive(normalize(json.loads(lark.JSON.marshal(data.event))), live=True)
 
-    handler = lark.EventDispatcherHandler.builder('', '').register_p2_im_message_receive_v1(receive).build()
+    builder = lark.EventDispatcherHandler.builder('', '').register_p2_im_message_receive_v1(receive)
+    if cards is not None:
+        from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+
+        def card_action(data):
+            response = cards.receive_callback(capture.connector_id, app_id, json.loads(lark.JSON.marshal(data)))
+            return P2CardActionTriggerResponse(response)
+
+        builder.register_p2_card_action_trigger(card_action)
+    handler = builder.build()
 
     class ObservedClient(lark.ws.Client):
         # lark-oapi==1.7.5: _connect returns only after the socket is established.

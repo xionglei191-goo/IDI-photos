@@ -63,6 +63,28 @@ def image_bytes(color="navy"):
     return stream.getvalue()
 
 
+def rewind_additive_test_schema(con, version):
+    """Reconstruct old schemas only inside an isolated migration-test database."""
+    if version < 43:
+        con.execute('DROP INDEX review_notifications_followup')
+        for column in ('purpose', 'official_checked_at', 'retry_at'):
+            con.execute('ALTER TABLE review_notifications DROP COLUMN ' + column)
+    if version < 42:
+        for table in ('feishu_review_actions', 'feishu_card_images', 'feishu_identity_bindings'):
+            con.execute('DROP TABLE ' + table)
+        for column in ('message_type', 'app_id', 'card_token', 'card_view', 'card_dirty',
+                       'card_error', 'card_retry_at', 'card_checked_at', 'pending_action_id'):
+            con.execute('ALTER TABLE review_notifications DROP COLUMN ' + column)
+    if version < 41:
+        con.execute('DROP TABLE camera_capture_deletions')
+    if version < 40:
+        con.execute('DROP TABLE camera_video_times')
+    if version < 39:
+        con.execute('DROP TABLE default_package_requests')
+        con.execute("DELETE FROM settings WHERE key='default_package_auto_policy'")
+    con.execute('DELETE FROM schema_version WHERE version>?', (version,))
+
+
 @pytest.fixture
 def photo(services, case):
     def add(color="navy", name="照片.png", **metadata):

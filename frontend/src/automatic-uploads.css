@@ -5,3 +5,68 @@
 .upload-progress{overflow:hidden;background:#fff}.upload-progress-table{width:100%;border-collapse:collapse;table-layout:fixed;font-size:13px;line-height:1.6}.upload-progress-table th,.upload-progress-table td{padding:8px 14px;text-align:left;vertical-align:middle;overflow-wrap:anywhere}.upload-progress-table thead{background:#f8fbf9;color:#52665b}.upload-progress-table thead th{font-size:12px;font-weight:600}.upload-progress-table th:first-child{width:240px}.upload-progress-table tbody tr{border-top:1px solid #e0e8e3}.upload-progress-table tbody tr:hover{background:#f8fbf9}.upload-progress-table .upload-case-code{padding:3px 0;line-height:1.6;font-size:13px}.upload-progress .upload-empty{margin:0;padding:14px}.upload-progress .error-box{margin-top:10px}@media(max-width:600px){.upload-progress-table thead{display:none}.upload-progress-table tbody,.upload-progress-table tr,.upload-progress-table th,.upload-progress-table td{display:block;width:auto}.upload-progress-table th:first-child{width:auto}.upload-progress-table tbody tr{padding:4px 12px 10px}.upload-progress-table tbody tr:first-child{border-top:0}.upload-progress-table th,.upload-progress-table td{padding:0}.upload-progress-table .upload-case-code{min-height:44px}.upload-progress-table td{line-height:1.7}}
 .upload-notification{margin-top:6px;overflow-wrap:anywhere}.upload-notification .text-button{min-height:44px;padding:4px 0;text-align:left}
 .upload-account-help{margin:0;padding:12px 16px;color:#52665b;font-size:13px;line-height:1.7}.upload-account-message{min-width:0;display:grid;gap:4px;overflow-wrap:anywhere;line-height:1.6}.upload-account-message small{color:#64736b}.upload-project-connections .upload-connection button{flex-shrink:0;min-height:44px}
+
+.automatic-uploads.proposal-strip {
+  flex-shrink: 0;
+  margin: 0 24px 8px;
+  border-color: var(--line);
+  border-radius: 8px;
+  background: var(--soft);
+  color: var(--text);
+}
+.proposal-bar { display: flex; align-items: center; gap: 12px; min-height: 48px; padding: 8px 12px; }
+.proposal-bar-heading, .proposal-bar-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.proposal-bar-heading > svg { color: var(--primary); }
+.proposal-bar-heading strong { font-size: 14px; line-height: 20px; }
+.proposal-total { display: inline-flex; align-items: center; justify-content: center; min-width: 24px; height: 24px; padding: 0 4px; border-radius: 4px; background: var(--primary-soft); color: var(--primary); font-weight: 600; font-variant-numeric: tabular-nums; }
+.proposal-bar-copy { flex: 1; min-width: 0; color: var(--muted); font-size: 14px; line-height: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proposal-bar-actions { margin-left: auto; }
+.proposal-bar-actions button { min-height: 32px; padding: 4px 8px; white-space: nowrap; font-size: 14px; line-height: 20px; }
+.proposal-bar-actions button:hover { background: var(--primary-soft); }
+.proposal-strip :is(button,input,summary):focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* Use the existing dialog width; the list scrolls independently of the ledger. */
+.modal.proposal-drawer { inset: 0 0 0 auto; margin: 0; width: min(660px, 100%); height: 100dvh; max-height: 100dvh; border-radius: 0; }
+.proposal-drawer > .modal-head { padding: 16px 24px; }
+.proposal-drawer > .modal-head h2 { font-size: 20px; line-height: 28px; font-weight: 600; }
+.proposal-drawer > .modal-head button { min-width: 40px; min-height: 40px; }
+.proposal-drawer > .modal-body { flex: 1; min-height: 0; padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+.proposal-queue-tools { flex-shrink: 0; padding: 16px 24px; border-bottom: 1px solid var(--line); }
+.proposal-queue-tools > p { margin: 0 0 12px; font-size: 14px; line-height: 20px; color: var(--muted); }
+.proposal-search { display: flex; align-items: center; gap: 8px; padding: 0 12px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); }
+.proposal-search input { width: 100%; min-width: 0; min-height: 40px; padding: 8px 0; border: 0; font-size: 14px; line-height: 20px; }
+.proposal-search:focus-within { outline: 2px solid var(--primary); outline-offset: 2px; }
+.proposal-search input:focus-visible { outline: none; }
+.proposal-filters { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 12px; }
+.proposal-filters button { min-height: 32px; padding: 4px 8px; border-color: transparent; background: transparent; font-size: 14px; line-height: 20px; font-variant-numeric: tabular-nums; }
+.proposal-filters button[aria-pressed=true] { background: var(--primary-soft); color: var(--primary); font-weight: 600; }
+.proposal-queue-list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 24px 24px; }
+.proposal-queue-item { padding: 16px 0; border-bottom: 1px solid var(--line); }
+.proposal-item-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.proposal-case-identity { min-width: 0; display: flex; align-items: baseline; flex-wrap: wrap; column-gap: 8px; }
+.proposal-case-identity > span { color: var(--muted); font-size: 12px; line-height: 16px; white-space: nowrap; }
+.proposal-item-heading .upload-case-code { min-width: 0; min-height: 24px; padding: 0; font-size: 14px; line-height: 20px; font-weight: 600; }
+.proposal-status { flex-shrink: 0; padding: 4px 8px; background: var(--primary-soft); color: var(--primary); border-radius: 4px; font-size: 12px; line-height: 16px; }
+.proposal-status.needs-checkins { background: var(--warning-bg); color: var(--warning); }
+.proposal-item-project { margin: 4px 0 0; color: var(--text); font-size: 14px; line-height: 20px; font-weight: 500; overflow-wrap: anywhere; }
+.proposal-item-context { margin: 4px 0 0; font-size: 12px; line-height: 16px; color: var(--muted); overflow-wrap: anywhere; }
+.proposal-item-context strong { color: var(--primary); font-weight: 500; }
+.proposal-item-note { margin: 8px 0; color: var(--text); font-size: 14px; line-height: 20px; overflow-wrap: anywhere; }
+.proposal-item-actions { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: start; }
+.proposal-item-actions > button { min-height: 32px; padding: 4px 8px; font-size: 14px; line-height: 20px; color: var(--primary); }
+.proposal-item-details { min-width: 0; }
+.proposal-item-details summary { width: fit-content; min-height: 32px; padding: 4px 0; font-size: 12px; line-height: 24px; color: var(--muted); }
+.proposal-item-details > div { padding: 8px 0 0; font-size: 12px; line-height: 20px; overflow-wrap: anywhere; }
+.proposal-item-details .upload-notification { margin-top: 4px; }
+.proposal-queue-empty { margin: 0; padding: 32px 0; text-align: center; color: var(--muted); font-size: 14px; line-height: 20px; }
+.proposal-drawer .error-box { margin: 12px 24px; }
+@media (max-width: 760px) {
+  .automatic-uploads.proposal-strip { margin-inline: 12px; }
+  .proposal-bar { gap: 8px; padding: 4px 8px; }
+  .proposal-bar-heading > svg, .proposal-bar-copy { display: none; }
+  .proposal-bar-actions { gap: 0; }
+  .proposal-bar-actions button, .proposal-filters button, .proposal-item-actions > button, .proposal-item-details summary { min-height: 44px; }
+  .proposal-drawer > .modal-head, .proposal-queue-tools { padding: 16px; }
+  .proposal-queue-list { padding: 0 16px 16px; }
+  .proposal-item-actions { gap: 8px; }
+}

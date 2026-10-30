@@ -34,6 +34,42 @@ class FeishuFeedbackClient(FeishuClient):
         return self._send('im/v1/messages', {'receive_id_type': 'chat_id'},
             {'receive_id': chat_id, 'msg_type': 'text', 'content': content, 'uuid': delivery_id})['message_id']
 
+    def send_card(self, chat_id, content, delivery_id):
+        return self._send('im/v1/messages', {'receive_id_type': 'chat_id'},
+            {'receive_id': chat_id, 'msg_type': 'interactive', 'content': content, 'uuid': delivery_id})['message_id']
+
+    def update_card(self, message_id, content):
+        if not re.fullmatch(r'om_[A-Za-z0-9_-]{1,180}', message_id or ''):
+            raise DomainError('卡片消息标识无效')
+        return self._card_request('PATCH', 'im/v1/messages/' + message_id, json={'content': content})
+
+    def upload_card_image(self, data):
+        result = self._card_request('POST', 'im/v1/images', data={'image_type': 'message'},
+                                    files={'image': ('preview.jpg', data, 'image/jpeg')})
+        key = result.get('image_key')
+        if not isinstance(key, str) or not key:
+            raise DomainError('飞书没有返回图片标识')
+        return key
+
+    def _card_request(self, method, path, **kwargs):
+        # Only explicit authentication rejection is replayed here. Card updates
+        # are retried separately; they never retry the underlying business action.
+        for attempt in range(2):
+            token = self.authenticate()
+            try:
+                response = self.http.request(method, path, headers={'Authorization': 'Bearer ' + token}, **kwargs)
+                response.raise_for_status()
+                data = response.json()
+            except (httpx.HTTPError, ValueError):
+                raise DomainError('飞书卡片更新或图片预览暂未完成，请稍后刷新卡片', 502) from None
+            if data.get('code') in TOKEN_ERRORS and attempt == 0:
+                self.expires = 0
+                continue
+            if data.get('code') != 0:
+                raise DomainError(api_error(data.get('code', 'unknown')))
+            return data.get('data') or {}
+        raise DomainError('飞书登录令牌刷新失败')
+
     def reply_feedback(self, chat_id, source_message_id, content, delivery_id, *, in_thread=False):
         if not isinstance(source_message_id, str) or not re.fullmatch(r'om_[A-Za-z0-9_-]{1,180}', source_message_id):
             raise DomainError('原消息标识无效，未发送', 409)

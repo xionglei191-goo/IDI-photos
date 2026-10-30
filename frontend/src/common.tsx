@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { X, LoaderCircle, Inbox } from 'lucide-react';
 import { api, message } from './api';
 
@@ -23,9 +23,9 @@ export function useDebounce<T>(value: T, delay = 250) { const [current, setCurre
 export function Loading() { return <div className="empty-state"><LoaderCircle className="spin" size={22} /><span>正在读取资料…</span></div>; }
 export function Empty({ children, action }: { children: ReactNode; action?: ReactNode }) { return <div className="empty-state"><Inbox size={30} /><p>{children}</p>{action}</div>; }
 export function ErrorBox({ error }: { error: string }) { return error ? <div className="error-box" role="alert">{error}</div> : null; }
-export function Modal({ title, children, footer, close, wide = false }: { title: string; children: ReactNode; footer?: ReactNode; close: () => void; wide?: boolean }) {
+export function Modal({ title, children, footer, close, wide = false, className = '' }: { title: string; children: ReactNode; footer?: ReactNode; close: () => void; wide?: boolean; className?: string }) {
   const ref = useRef<HTMLDialogElement>(null), titleId = useId();
-  useEffect(() => { const dialog = ref.current; if (dialog && !dialog.open) dialog.showModal(); return () => { if (dialog?.open) dialog.close(); }; }, []);
-  return <dialog ref={ref} className={`modal ${wide ? 'modal-wide' : ''}`} aria-labelledby={titleId} onCancel={e => { e.preventDefault(); e.stopPropagation(); close(); }} onClick={e => { if (e.target === e.currentTarget) { const rect = e.currentTarget.getBoundingClientRect(); if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) close(); } }}><header className="modal-head"><h2 id={titleId}>{title}</h2><button type="button" className="icon-button" aria-label="关闭" onClick={close}><X size={20} /></button></header><div className="modal-body">{children}</div>{footer && <footer className="modal-foot">{footer}</footer>}</dialog>;
+  useLayoutEffect(() => { const dialog = ref.current; if (dialog && !dialog.open) dialog.showModal(); return () => { if (dialog?.open) dialog.close(); }; }, []);
+  return <dialog ref={ref} className={`modal ${wide ? 'modal-wide' : ''} ${className}`} aria-labelledby={titleId} onCancel={e => { e.preventDefault(); e.stopPropagation(); close(); }} onClick={e => { if (e.target === e.currentTarget) { const rect = e.currentTarget.getBoundingClientRect(); if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) close(); } }}><header className="modal-head"><h2 id={titleId}>{title}</h2><button type="button" className="icon-button" aria-label="关闭" onClick={close}><X size={20} /></button></header><div className="modal-body">{children}</div>{footer && <footer className="modal-foot">{footer}</footer>}</dialog>;
 }
 export function SelectOptions({ values, empty }: { values: Record<string, string>; empty?: string }) { return <>{empty !== undefined && <option value="">{empty}</option>}{Object.entries(values).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</>; }

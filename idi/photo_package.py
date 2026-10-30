@@ -12,6 +12,9 @@ from .storage import IMAGE_EXTS, VIDEO_EXTS, safe_name
 
 PHOTO_PACKAGE_FORMAT = 'media-by-stage-400kb-v1'
 PHOTO_MAX_BYTES = 400_000
+# Leave room for the ZIP's location and Windows' extraction destination.
+PHOTO_PATH_MAX_BYTES = 220
+PHOTO_ROOT_MAX_BYTES = 100
 PHOTO_DIRECTORIES = (
     '查勘照片', '查勘照片/查勘楼栋房号打卡照片',
     '施工照片', '施工照片/施工楼栋房号打卡照片', '验收照片',
@@ -23,16 +26,26 @@ GROUP_DIRECTORIES = {
 }
 
 
+def _bounded_name(value, limit):
+    name = safe_name(str(value), limit)
+    while len(name.encode('utf-8')) > limit:
+        name = name[:-1].rstrip(' .')
+    return safe_name(name, limit)
+
+
 def case_folder(case):
     code = case.get('platform_report_code')
     if not code:
         raise DomainError('案件尚无报修编号，请先补充报修编号后打包：' + case['title'])
     code = safe_name(str(code), 80)
-    parts = (case['project_name'], case.get('building'),
-             str(case['unit']) + '单元' if case.get('unit') else '',
-             case.get('room') or case.get('location_detail'), case['title'])
-    prefix = '-'.join(str(value).strip() for value in parts if value and str(value).strip())
-    return safe_name(prefix, 109 - len(code)) + '-' + code
+    parts = [safe_name(case['project_name']), safe_name(str(case.get('room') or '未填房号'))]
+    # Keep both identifying labels and the case number; Chinese names need a
+    # byte budget, not just a character count, for Windows ZIP compatibility.
+    budget = max(18, PHOTO_ROOT_MAX_BYTES - len(code.encode('utf-8')) - 2)
+    while sum(len(part.encode('utf-8')) for part in parts) > budget:
+        index = max(range(2), key=lambda i: len(parts[i].encode('utf-8')))
+        parts[index] = parts[index][:-1].rstrip(' .')
+    return '-'.join([*(safe_name(part) for part in parts), code])
 
 
 def photo_directory(photo):
@@ -61,18 +74,22 @@ def photo_paths(case, photos):
         if photo['media_type'] == 'image' and photo['size_bytes'] > PHOTO_MAX_BYTES and extension.lower() not in ('.jpg', '.jpeg'):
             extension = '.jpg'
         stem = source.stem if source.suffix else source.name
-        filename = safe_name(stem, 100 - len(extension)) + extension
-        candidates.append((photo['id'], photo_directory(photo), filename, extension))
-    counts = Counter((directory + '/' + filename).casefold() for _, directory, filename, _ in candidates)
+        directory = photo_directory(photo)
+        limit = min(100, PHOTO_PATH_MAX_BYTES - len((root + '/' + directory + '/').encode('utf-8')))
+        filename = _bounded_name(stem, limit - len(extension)) + extension
+        candidates.append((photo['id'], directory, filename, extension, limit))
+    counts = Counter((directory + '/' + filename).casefold() for _, directory, filename, _, _ in candidates)
     used, paths = set(), {}
-    for photo_id, directory, filename, extension in sorted(candidates):
+    for photo_id, directory, filename, extension, limit in sorted(candidates):
         if counts[(directory + '/' + filename).casefold()] > 1:
-            filename = safe_name(filename[:-len(extension)], 85 - len(extension)) + '__' + photo_id[:12] + extension
+            suffix = '__' + photo_id[:12] + extension
+            filename = _bounded_name(filename[:-len(extension)], limit - len(suffix)) + suffix
         candidate = directory + '/' + filename
         number = 1
         while candidate.casefold() in used:
             number += 1
-            candidate = directory + '/' + safe_name(filename[:-len(extension)], 90 - len(extension)) + f'__{number}' + extension
+            suffix = f'__{number}' + extension
+            candidate = directory + '/' + _bounded_name(filename[:-len(extension)], limit - len(suffix)) + suffix
         used.add(candidate.casefold())
         paths[photo_id] = root + '/' + candidate
     return root, paths

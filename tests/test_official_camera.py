@@ -53,6 +53,10 @@ def test_video_archives_original_once_without_photo_verifier(client, official, s
     assert photo['media_type'] == 'video' and photo['mime_type'] == 'video/mp4'
     assert photo['original_name'].endswith('.mp4') and photo['width'] == 720 and photo['height'] == 1280
     assert photo['watermark_time'] is None and '视频暂不支持本地验真' in photo['notes']
+    capture = client.get('/api/camera/admin/official').json()['captures'][0]
+    assert capture['project_name'] == official['meta']['project_name']
+    assert capture['location'] == official['meta']['location']
+    assert capture['photo_time'] is None and capture['time_basis'] == 'unavailable'
     assert services['domain'].completeness(case['id']) == before
     archived = client.get('/api/photos/' + receipt['photo_id'] + '/original')
     assert archived.status_code == 200 and archived.content == original
@@ -138,9 +142,13 @@ def upload(client, fixture, **changes):
                        files={'image': ('official.jpg', fixture['image'], 'image/jpeg')})
 
 
-def test_admin_capture_details_survive_device_deletion(client, official, services):
+def test_admin_capture_details_survive_device_deletion(client, official, services, project, case):
     official['service'].settings.save({'auto_verify': False})
-    receipt = upload(client, official).json()
+    receipt = upload(client, official, sdk_photo_time='2026-10-20 11:12:13').json()
+    # The history describes the selected location at capture, even after the ledger changes.
+    with services['db'].tx() as con:
+        con.execute('UPDATE projects SET name=? WHERE id=?', ('修改后的小区', project['id']))
+        con.execute('UPDATE cases SET building=?,room=? WHERE id=?', ('9', '999', case['id']))
     path = '/api/camera/admin/devices/' + official['device']['device_id']
     assert client.delete(path).status_code == 200
     assert client.delete(path + '/record').status_code == 200
@@ -149,6 +157,10 @@ def test_admin_capture_details_survive_device_deletion(client, official, service
     assert capture['photo_group'] == 'construction'
     assert capture['stage_label'] == '施工过程'
     assert capture['device_name'] == '官方测试手机'
+    assert capture['project_name'] == official['meta']['project_name']
+    assert capture['location'] == '1栋 · 201室'
+    assert capture['photo_time'] == '2026-10-20 11:12:13'
+    assert capture['time_basis'] == 'sdk_returned_unverified'
     assert capture['photo_id'] == receipt['photo_id']
     assert client.get('/api/photos/' + receipt['photo_id'] + '/original').content == official['image']
     assert client.get('/api/camera/official-captures/' + capture['capture_id'], headers=official['headers']).status_code == 401
@@ -204,6 +216,9 @@ def test_local_archive_defaults_off_for_existing_config_and_never_calls_vendor(c
     assert services['domain'].case(case['id']) == before
     photo = services['domain'].photo(receipt['photo_id'])
     assert photo['watermark_time'] == '2026-10-20 10:11:12'
+    capture = client.get('/api/camera/admin/official').json()['captures'][0]
+    assert capture['photo_time'] == '2026-10-20 10:11:12'
+    assert capture['time_basis'] == 'sdk_returned_unverified'
     assert '未做本地验真' in photo['notes'] and '验真通过' not in photo['notes']
     source = json.loads(services['db'].one('SELECT metadata FROM photo_sources')['metadata'])
     assert source['time_basis'] == 'sdk_returned_unverified'
@@ -219,14 +234,18 @@ def test_local_archive_defaults_off_for_existing_config_and_never_calls_vendor(c
     assert not official['calls']
 
 
-def test_local_archive_missing_sdk_time_does_not_promote_phone_clock(client, official, services):
+@pytest.mark.parametrize('sdk_time', ['', 'invalid'])
+def test_local_archive_missing_sdk_time_does_not_promote_phone_clock(client, official, services, sdk_time):
     official['service'].settings.save({'auto_verify': False})
-    result = upload(client, official, captured_at='2099-01-01T01:00:00+08:00', sdk_photo_time='invalid')
+    result = upload(client, official, captured_at='2099-01-01T01:00:00+08:00', sdk_photo_time=sdk_time)
     assert result.status_code == 200
     photo = services['domain'].photo(result.json()['photo_id'])
     assert photo['watermark_time'] is None
     source = json.loads(services['db'].one('SELECT metadata FROM photo_sources')['metadata'])
     assert source['time_basis'] == 'unavailable' and not official['calls']
+    capture = client.get('/api/camera/admin/official').json()['captures'][0]
+    assert capture['received_at']  # Receiving the upload does not establish when it was shot.
+    assert capture['photo_time'] is None and capture['time_basis'] == 'unavailable'
 
 
 def test_local_archive_parallel_delivery_is_once_and_closed_cases_stay_blocked(client, official, services, case):
@@ -377,6 +396,43 @@ def test_native_signing_uses_new_contract_without_credentials_or_verification(cl
         assert official['config'][key] not in first.text + config.text
     assert services['db'].one('SELECT COUNT(*) n FROM photos')['n'] == 0
     assert not official['calls']
+
+
+def test_native_authorization_is_reusable_scoped_and_never_exports_secrets(client, official, services):
+    client.cookies.clear()  # A paired phone has no IDI browser login session.
+    assert client.get('/api/camera/native-authorization').status_code == 401
+    assert client.get('/api/camera/native-authorization', headers={'Authorization': 'Bearer invalid-device-token'}).status_code == 401
+    assert client.get('/api/camera/admin/official', headers=official['headers']).status_code == 401
+    response = client.get('/api/camera/native-authorization', headers=official['headers'])
+    assert response.status_code == 200, response.text
+    value = response.json()
+    options = value['options']
+    assert value['ready'] and value['device_id'] == official['device']['device_id']
+    assert value['sdk_version'] == '1.3.70.9b61b4a6' and value['video_enabled']
+    assert value['expires_at'] == options['timestamp'] + 23 * 60 * 60
+    assert abs(value['server_time'] - options['timestamp']) <= 2
+    assert options['signature'] == sdk_signature(official['config']['sdk_secret_key'], {
+        key: options[key] for key in ('appid', 'noncestr', 'timestamp')})
+    assert 'customInputItems' not in options and 'capture_id' not in value
+    assert options['groupWatermarkId'] == 'template-test'
+    assert response.headers['cache-control'] == 'no-store'
+    for key in ('sdk_secret_key', 'group_key', 'group_secret'):
+        assert official['config'][key] not in response.text
+    assert not official['calls']
+    assert not services['db'].all('SELECT * FROM photos')
+    official['service'].settings.save({'enabled': False})
+    disabled = client.get('/api/camera/native-authorization', headers=official['headers']).json()
+    assert not disabled['ready'] and 'options' not in disabled and 'expires_at' not in disabled
+
+
+def test_native_authorization_rejects_lost_permissions_and_revoked_pairing(client, official, services):
+    client.cookies.clear()
+    with services['db'].tx() as con:
+        con.execute("UPDATE camera_devices SET project_ids='[]' WHERE id=?", (official['device']['device_id'],))
+    assert client.get('/api/camera/native-authorization', headers=official['headers']).status_code == 403
+    with services['db'].tx() as con:
+        con.execute('UPDATE camera_devices SET revoked_at=? WHERE id=?', (now(), official['device']['device_id']))
+    assert client.get('/api/camera/native-authorization', headers=official['headers']).status_code == 401
 
 
 def test_native_session_validates_case_role_and_device_scope(client, official, services, case):
@@ -607,12 +663,16 @@ def test_hash_change_after_create_cannot_archive(client, official, services):
 
 
 def test_phone_clock_cannot_override_official_time(client, official, services):
-    result = upload(client, official, captured_at='2099-01-01T01:00:00+08:00')
+    result = upload(client, official, captured_at='2099-01-01T01:00:00+08:00',
+                    sdk_photo_time='2026:10:20 07:59:00')
     assert result.status_code == 200
     official['service'].process_one()
     official['service'].process_one()
     photo = services['db'].one('SELECT watermark_time FROM photos')
     assert photo['watermark_time'] == '2026-10-20 08:00:00'
+    capture = client.get('/api/camera/admin/official').json()['captures'][0]
+    assert capture['photo_time'] == '2026-10-20 08:00:00'
+    assert capture['time_basis'] == 'xhey_verification'
 
 
 def test_receipt_retry_survives_later_case_closure(client, official, services, case):

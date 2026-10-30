@@ -129,7 +129,7 @@ test('package reuse and deletion work in both case and reporting lists', async (
   await download.saveAs(target);
   expect((await fs.readFile(target)).subarray(0, 2).toString()).toBe('PK');
   expect(download.suggestedFilename()).toContain('-v1.zip');
-  expect(download.suggestedFilename()).toContain(`-1-1201-${value.title}-${value.platform_report_code}-v1.zip`);
+  expect(download.suggestedFilename()).toBe(`${value.project_name}-1201-${value.platform_report_code}-v1.zip`);
   await openInsurer(page, value.id);
   await expect(link).toHaveAttribute('href', href!);
   await page.setViewportSize({ width: 1366, height: 900 });

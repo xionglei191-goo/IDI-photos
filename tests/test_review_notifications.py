@@ -4,6 +4,7 @@ import pytest
 
 from idi.connectors.feishu_feedback import UncertainDelivery
 from idi.domain import DomainError
+from idi.review_notifications import digest
 from tests.test_automatic_uploads import setup_flow, ready, tick
 from tests.test_platform_preparation import platform, enter_stage, draft_data
 from tests.test_project_followup import followup, channel, bind
@@ -23,6 +24,33 @@ def records(service):
     return service.db.all('SELECT * FROM review_notifications ORDER BY created_at,id')
 
 
+def card_text(content):
+    return json.dumps(content, ensure_ascii=False)
+
+
+@pytest.mark.parametrize('state', ['sent', 'unknown', 'failed', 'queued', 'cancelled'])
+def test_upgrade_keeps_legacy_text_notification_without_duplicate_delivery(notification_flow, case, state):
+    notifier, auto, client, writes = notification_flow
+    cards, notifier.cards = notifier.cards, None
+    delivery = notifier.queue(case['id'])
+    notifier.cards = cards
+    legacy_key = digest([delivery['proposal_key'], delivery['connector_id'], delivery['chat_id'], delivery['open_id']])
+    with notifier.db.tx() as con:
+        con.execute('UPDATE review_notifications SET dedupe_key=?,state=? WHERE id=?',
+                    (legacy_key, state, delivery['id']))
+    before = list(writes)
+    if state != 'cancelled':
+        assert auto.get(case['id'])['notification']['state'] == state
+    assert notifier.run_once() == (1 if state in ('queued', 'cancelled') else 0)
+    assert notifier.run_once() == 0
+    rows = records(notifier)
+    assert len(rows) == 1 and rows[0]['id'] == delivery['id']
+    assert rows[0]['message_type'] == ('interactive' if state == 'cancelled' else 'text')
+    assert len(client.sent) == (1 if state in ('queued', 'cancelled') else 0)
+    assert len(client.cards) == (1 if state == 'cancelled' else 0)
+    assert writes == before
+
+
 def test_ready_proposal_mentions_bound_owner_once_across_refresh_and_restart(notification_flow, case):
     notifier, auto, client, writes = notification_flow
     previous_writes = list(writes)
@@ -31,10 +59,11 @@ def test_ready_proposal_mentions_bound_owner_once_across_refresh_and_restart(not
     assert len(client.sent) == 1
     chat, content, delivery_id = client.sent[0]
     assert chat == 'oc_test'
-    assert '<at user_id="ou_lead">项目负责人</at>' in content['text']
-    assert '从化铂悦府' in content['text'] and 'ZLBH20260001' in content['text']
-    assert '现场查勘资料待核对' in content['text'] and '核对拟提交信息' in content['text']
-    assert '楼栋打卡图片 1 项' in content['text']
+    assert '<at id=ou_lead></at>' in card_text(content)
+    assert '从化铂悦府' in card_text(content) and 'ZLBH20260001' in card_text(content)
+    assert '现场查勘资料待核对' in card_text(content) and '核对拟提交信息' in card_text(content)
+    assert '楼栋打卡图片 1 项' in card_text(content)
+    assert content['schema'] == '2.0' and len(client.cards) == 1
     assert records(notifier)[0]['state'] == 'sent'
     assert auto.get(case['id'])['notification']['state'] == 'sent'
     assert notifier.run_once() == 0
@@ -74,8 +103,8 @@ def test_complete_photos_notify_pending_fields_once_then_require_fresh_review(se
     assert [f['field'] for f in row['detail']['pending_fields']] == ['repairMethod']
     notifier, feedback = services['review_notifications'], channel[1]
     assert notifier.run_once() == 1
-    assert '待管理员确认：维修方式' in feedback.sent[0][1]['text']
-    assert '已收照片已合并' in feedback.sent[0][1]['text']
+    assert '待管理员确认：' in card_text(feedback.sent[0][1]) and '维修方式' in card_text(feedback.sent[0][1])
+    assert '已收照片已合并' in card_text(feedback.sent[0][1])
     tick(auto, case['id'])
     notifier.recover()
     assert notifier.run_once() == 0 and len(feedback.sent) == 1
@@ -86,7 +115,7 @@ def test_complete_photos_notify_pending_fields_once_then_require_fresh_review(se
     complete = services['reviews'].get(row['review_id'])
     assert not complete['snapshot'].get('review_only')
     assert notifier.run_once() == 1 and len(feedback.sent) == 2
-    assert '待管理员确认：' not in feedback.sent[-1][1]['text']
+    assert '待管理员确认：' not in card_text(feedback.sent[-1][1])
     assert services['reviews'].confirm(complete['id'], complete['fingerprint'])['state'] == 'verified'
     assert [payload['state'] for _, payload in writes].count(1) == 1
 
@@ -129,8 +158,8 @@ def test_reassigned_owner_receives_new_notice_and_old_recipient_is_cancelled(not
     notifier.deliver(old['id'])
     assert records(notifier)[0]['state'] == 'cancelled' and not client.sent
     notifier.run_once()
-    assert len(client.sent) == 1 and 'user_id="ou_newlead"' in client.sent[0][1]['text']
-    assert 'user_id="ou_lead"' not in client.sent[0][1]['text']
+    assert len(client.sent) == 1 and '<at id=ou_newlead>' in card_text(client.sent[0][1])
+    assert '<at id=ou_lead>' not in card_text(client.sent[0][1])
 
 
 def test_changed_business_fields_get_one_new_notification(notification_flow, case, platform):

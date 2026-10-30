@@ -21,6 +21,8 @@ from .xhey_camera import XheyClient, XheyError, XheySettings
 from .camera_video import inspect_mp4, MAX_VIDEO_BYTES, MAX_RECORD_SECONDS
 from .photo_dedup import normalize_watermark_code
 from .camera_timing import CameraTiming, SCOPE_KEY
+from .camera_video_times import APP_VIDEO_TIME_BASIS, app_video_time
+from .camera_capture_deletion import deletion_record, ensure_not_deleted
 
 LOG = logging.getLogger(__name__)
 
@@ -31,6 +33,8 @@ class OfficialMetadata(CaptureMetadata):
     # SDK callback values are useful metadata, not a verification verdict.
     sdk_photo_time: str = Field(default='', max_length=40)
     sdk_anti_fake_code: str = Field(default='', max_length=256)
+    # Optional client evidence; validated separately so bad time data can use OCR.
+    video_capture_time: dict | None = None
 
 
 def sdk_photo_time(meta):
@@ -53,6 +57,8 @@ class OfficialCamera:
         self.closing = threading.Event()
         self.thread = None
         self.dedup = None
+        self.video_times = None
+        self.deletions = None
 
     def session_metadata(self, device, metadata, source):
         try:
@@ -63,6 +69,7 @@ class OfficialCamera:
             raise DomainError('拍摄来源与授权接口不一致')
         case = self.domain.case(model.case_id)
         self.check_case(case, device, model.case_number)
+        ensure_not_deleted(self.db, device['id'], model.capture_id)
         if model.project_name != case['project_name'] or model.location != location(case):
             raise DomainError('案件位置或小区已更新，请重新同步后拍摄', 409)
         stage = GROUP_LABELS[model.photo_group]
@@ -85,6 +92,27 @@ class OfficialCamera:
         return {'capture_id': model.capture_id, 'sdk_version': '1.3.70.9b61b4a6',
                 'media_type': model.media_type, 'max_record_seconds': MAX_RECORD_SECONDS,
                 'options': options, 'has_team_watermark': bool(template)}
+
+    def native_authorization(self, device):
+        """Prepare reusable SDK credentials during pairing/case synchronization.
+
+        Xhey signs appid/noncestr/timestamp for 24 hours, independently of the
+        capture and watermark fields. Keep a one-hour expiry margin. This is
+        not an upload permission lease: every upload still authenticates the
+        device and checks its current project/case access.
+        """
+        result = {**self.settings.h5_status(), 'mode': 'native',
+                  'device_id': device['id'], 'sdk_version': '1.3.70.9b61b4a6',
+                  'server_time': int(time.time()), 'video_enabled': True,
+                  'max_record_seconds': MAX_RECORD_SECONDS,
+                  'max_video_bytes': MAX_VIDEO_BYTES, 'video_verification_supported': False}
+        if result['ready']:
+            signed, template = self.settings.h5_signature()
+            result['options'] = {**signed}
+            if template:
+                result['options']['groupWatermarkId'] = template
+            result['expires_at'] = signed['timestamp'] + 23 * 60 * 60
+        return result
 
     def h5_session(self, device, metadata):
         model, fields = self.session_metadata(device, metadata, 'xhey_h5')
@@ -137,6 +165,7 @@ class OfficialCamera:
             case = self.domain.case(model.case_id)
             if case['project_id'] not in device['project_ids']:
                 raise DomainError('设备无此项目权限', 403)
+            ensure_not_deleted(self.db, device['id'], model.capture_id)
             video = model.media_type == 'video'
             if video and model.source != 'xhey_sdk':
                 raise DomainError('视频仅支持安卓原生 SDK 来源')
@@ -150,6 +179,8 @@ class OfficialCamera:
             for field in ('sdk_photo_time', 'sdk_anti_fake_code'):
                 if not meta[field]:
                     del meta[field]
+            if meta['video_capture_time'] is None:
+                del meta['video_capture_time']
             if not video:
                 del meta['media_type']  # Keep existing photo request hashes stable.
             image_hash = hashlib.sha256(image).hexdigest()
@@ -171,6 +202,7 @@ class OfficialCamera:
             requested = not video and config.get('auto_verify') is True
             state = ('queued' if self.settings.verification_ready(config) else 'unconfigured') if requested else 'not_requested'
             with self.db.tx() as con:
+                ensure_not_deleted(self.db, device['id'], model.capture_id, connection=con)
                 existing = con.execute('SELECT * FROM camera_official_captures WHERE device_id=? AND capture_id=?', (device['id'], model.capture_id)).fetchone()
                 if existing:
                     return self.receipt(dict(existing), request_hash, duplicate=True)
@@ -184,6 +216,8 @@ class OfficialCamera:
                                            (device['id'], model.capture_id)).fetchone())
                     # Capture, photo, provenance and receipt commit together. No vendor call.
                     self.archive(row, device, meta, connection=con)
+                    if video and self.video_times:
+                        self.video_times.enqueue(con, row, meta)
                 audit(con, 'camera_official', model.capture_id, 'receive', after={'device_id': device['id'], 'sha256': image_hash, 'state': state})
             return self.get(device, model.capture_id)
 
@@ -204,6 +238,8 @@ class OfficialCamera:
 
     @staticmethod
     def receipt(row, request_hash=None, duplicate=False):
+        if row['state'] == 'deleted':
+            raise DomainError('资料已删除，不会重新归档', 410)
         if request_hash and request_hash != row['request_hash']:
             raise DomainError('同一拍摄编号的照片或信息不同，拒绝覆盖', 409)
         if row['archived_at'] and not row['photo_id']:
@@ -218,6 +254,12 @@ class OfficialCamera:
                 'error': row['error'], 'verification': json.loads(row['result']), 'report': json.loads(row['report'])}
 
     def get(self, device, capture_id):
+        deleted = deletion_record(self.db, device['id'], capture_id)
+        if deleted:
+            case = self.domain.case(deleted['case_id'])
+            if case['project_id'] not in device['project_ids']:
+                raise DomainError('设备无此项目权限', 403)
+            raise DomainError('资料已删除，不会重新归档', 410)
         row = self.row(device['id'], capture_id)
         meta = json.loads(row['metadata'])
         case = self.domain.case(meta['case_id'])
@@ -229,10 +271,14 @@ class OfficialCamera:
         fields['updated_at'] = now()
         with self.db.tx() as con:
             con.execute('UPDATE camera_official_captures SET ' + ','.join(key + '=?' for key in fields)
-                        + ' WHERE device_id=? AND capture_id=?', (*fields.values(), row['device_id'], row['capture_id']))
+                        + " WHERE device_id=? AND capture_id=? AND state<>'deleted'"
+                        + ' AND NOT EXISTS (SELECT 1 FROM camera_capture_deletions d'
+                        + ' WHERE d.device_id=camera_official_captures.device_id AND d.capture_id=camera_official_captures.capture_id)',
+                        (*fields.values(), row['device_id'], row['capture_id']))
 
     def retry(self, device_id, capture_id):
         with self.lock:
+            ensure_not_deleted(self.db, device_id, capture_id)
             row = self.row(device_id, capture_id)
             self.receipt(row)  # Honor deletion tombstones.
             if row['state'] not in ('error', 'unconfigured', 'cancelled'):
@@ -255,7 +301,10 @@ class OfficialCamera:
             config = self.settings.load()
             if config.get('auto_verify') is not True or not self.settings.verification_ready(config):
                 return False
-            row = self.db.one("SELECT * FROM camera_official_captures WHERE state IN ('queued','processing') AND next_attempt_at<=? ORDER BY created_at LIMIT 1", (now(),))
+            row = self.db.one("""SELECT * FROM camera_official_captures c
+                WHERE state IN ('queued','processing') AND next_attempt_at<=?
+                AND NOT EXISTS (SELECT 1 FROM camera_capture_deletions d WHERE d.device_id=c.device_id AND d.capture_id=c.capture_id)
+                ORDER BY created_at LIMIT 1""", (now(),))
             if not row:
                 return False
             try:
@@ -265,10 +314,14 @@ class OfficialCamera:
                 device = self.camera.effective_device(device)
                 meta = json.loads(row['metadata'])
                 self.check_case(self.domain.case(meta['case_id']), device, meta['case_number'])
+                ensure_not_deleted(self.db, row['device_id'], row['capture_id'])
                 client = self.client_factory(config)
                 if row['state'] == 'queued':
                     with self.db.tx() as con:
-                        claimed = con.execute("UPDATE camera_official_captures SET state='submitting',updated_at=? WHERE device_id=? AND capture_id=? AND state='queued'",
+                        claimed = con.execute("""UPDATE camera_official_captures SET state='submitting',updated_at=?
+                            WHERE device_id=? AND capture_id=? AND state='queued'
+                            AND NOT EXISTS (SELECT 1 FROM camera_capture_deletions d
+                                WHERE d.device_id=camera_official_captures.device_id AND d.capture_id=camera_official_captures.capture_id)""",
                                               (now(), row['device_id'], row['capture_id'])).rowcount
                     if not claimed:
                         return True
@@ -314,14 +367,16 @@ class OfficialCamera:
         video = meta.get('media_type') == 'video'
         if video and verified:
             raise DomainError('视频不支持照片验真接口', 409)
-        photo_time = result['photoTime'] if verified else None if video else sdk_photo_time(meta)
-        time_basis = 'xhey_verification' if verified else 'sdk_returned_unverified' if photo_time else 'unavailable'
+        photo_time = result['photoTime'] if verified else app_video_time(meta) if video else sdk_photo_time(meta)
+        time_basis = ('xhey_verification' if verified else APP_VIDEO_TIME_BASIS if video and photo_time
+                      else 'sdk_returned_unverified' if photo_time else 'unavailable')
         provenance = {**meta, 'original_hash': row['blob_hash'], 'device_id': device['id'], 'time_basis': time_basis,
                       'uploaded_by': device.get('user_id'), 'uploaded_by_name': device.get('user_name', ''),
                       'verification_state': state, 'verification': result or {}, 'verification_task_id': row['task_id'],
                       'archived_at': stamp, 'verified_at': stamp if verified else None,
                       'case_fields_basis': 'user_selected_not_verified_by_xhey'}
         with (self.db.tx() if connection is None else nullcontext(connection)) as con:
+            ensure_not_deleted(self.db, device['id'], row['capture_id'], connection=con)
             current = con.execute('SELECT * FROM camera_official_captures WHERE device_id=? AND capture_id=?', (row['device_id'], row['capture_id'])).fetchone()
             if current['archived_at']:
                 return  # Includes a deleted photo; it must never be recreated.
@@ -384,6 +439,7 @@ class OfficialCamera:
 
     def report(self, device_id, capture_id):
         with self.lock:
+            ensure_not_deleted(self.db, device_id, capture_id)
             row = self.row(device_id, capture_id)
             self.receipt(row)
             config = self.settings.load()
@@ -440,6 +496,12 @@ def official_camera_routes(service):
         from fastapi.responses import JSONResponse
         return JSONResponse(result, headers={'Cache-Control': 'no-store', 'Pragma': 'no-cache'})
 
+    @router.get('/api/camera/native-authorization')
+    def native_authorization(request: Request):
+        result = service.native_authorization(service.camera.authenticate(request))
+        from fastapi.responses import JSONResponse
+        return JSONResponse(result, headers={'Cache-Control': 'no-store', 'Pragma': 'no-cache'})
+
     @router.get('/api/camera/h5-config')
     def h5_config(request: Request):
         service.camera.authenticate(request)
@@ -454,15 +516,39 @@ def official_camera_routes(service):
     @router.get('/api/camera/admin/official')
     def admin(request: Request):
         camera_admin()
-        rows = service.db.all('''SELECT c.*,d.name AS device_name FROM camera_official_captures c
+        rows = service.db.all('''SELECT c.*,d.name AS device_name,v.state AS video_time_state,v.result AS video_time_result
+            FROM camera_official_captures c
             LEFT JOIN camera_devices d ON d.id=c.device_id
-            WHERE c.archived_at IS NULL OR c.photo_id IS NOT NULL
+            LEFT JOIN camera_video_times v ON v.device_id=c.device_id AND v.capture_id=c.capture_id
+            WHERE c.state<>'deleted' AND (c.archived_at IS NULL OR c.photo_id IS NOT NULL)
             ORDER BY c.created_at DESC,c.device_id,c.capture_id DESC LIMIT 100''')
         captures = []
         for row in rows:
             meta = json.loads(row['metadata'])
-            captures.append({**service.receipt(row), 'device_id': row['device_id'],
+            receipt = service.receipt(row)
+            # Keep the captured case snapshot; today's ledger may have changed.
+            # Client launch and server receipt times are not photo times.
+            photo_time = None
+            time_basis = 'unavailable'
+            time_state = row['video_time_state'] if receipt['media_type'] == 'video' else None
+            if receipt['media_type'] == 'video':
+                photo_time = app_video_time(meta)
+                if photo_time:
+                    time_basis, time_state = APP_VIDEO_TIME_BASIS, 'recorded'
+                elif row['video_time_state'] == 'recognized':
+                    photo_time = json.loads(row['video_time_result']).get('watermark_time')
+                    if photo_time:
+                        time_basis = 'video_watermark_ocr'
+            if receipt['media_type'] != 'video':
+                verified = row['state'] == 'verified'
+                photo_time = receipt['verification'].get('photoTime') if verified else sdk_photo_time(meta)
+                if photo_time:
+                    time_basis = 'xhey_verification' if verified else 'sdk_returned_unverified'
+            captures.append({**receipt, 'device_id': row['device_id'],
                              'device_name': row['device_name'] or '未知终端',
+                             'project_name': meta.get('project_name', ''), 'location': meta.get('location', ''),
+                             'photo_time': photo_time, 'time_basis': time_basis,
+                             'time_state': time_state,
                              'case_number': meta['case_number'], 'photo_group': meta.get('photo_group', ''),
                              'stage_label': GROUP_LABELS.get(meta.get('photo_group'), '未知阶段')})
         return {'config': service.settings.status(), 'captures': captures}
@@ -527,6 +613,11 @@ def official_camera_routes(service):
             device = service.camera.authenticate(request)
         with timing.measure('lookup'):
             return service.get(device, capture_id)
+
+    @router.delete('/api/camera/official-captures/{capture_id}')
+    def delete_capture(capture_id: str, request: Request, data: dict = Body(...)):
+        device = service.camera.authenticate(request)
+        return service.deletions.delete(device, capture_id, data)
 
     @router.post('/api/camera/official-captures/{capture_id}/retry')
     def retry(capture_id: str, request: Request):

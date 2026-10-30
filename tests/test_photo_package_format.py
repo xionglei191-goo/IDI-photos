@@ -11,7 +11,8 @@ from openpyxl import load_workbook
 from PIL import Image
 
 from idi.db import dump, uid
-from idi.photo_package import PHOTO_DIRECTORIES, PHOTO_PACKAGE_FORMAT, PHOTO_MAX_BYTES, photo_directory
+from idi.photo_package import (PHOTO_DIRECTORIES, PHOTO_PACKAGE_FORMAT, PHOTO_MAX_BYTES,
+                               PHOTO_PATH_MAX_BYTES, case_folder, photo_directory, photo_paths)
 
 
 REPORT_CODE = 'ZLBH202610132005010577'
@@ -19,6 +20,42 @@ REPORT_CODE = 'ZLBH202610132005010577'
 
 def number_case(services, case):
     return services['domain'].save_case({'platform_report_code': REPORT_CODE, 'report_number': 'INSURER-OTHER-NUMBER'}, case['id'])
+
+
+def test_long_chinese_names_and_collisions_fit_windows_zip_paths():
+    case = {'project_name': '金茂万科都会四季C地块' * 12, 'room': '地下室车位' * 20,
+            'platform_report_code': REPORT_CODE, 'title': '不应放入目录的描述', 'building': '不应放入目录的楼栋'}
+    photos = [{'id': 'same-prefix-000' + str(i), 'original_name': '施工现场照片' * 40 + '.jpg',
+               'stage': 'survey', 'role': 'door_checkin', 'media_type': 'image', 'size_bytes': 100}
+              for i in range(3)]
+    root, paths = photo_paths(case, photos)
+    assert root.endswith('-' + REPORT_CODE) and len(root.encode('utf-8')) <= 100
+    assert '不应放入目录' not in root
+    assert len(set(paths.values())) == 3
+    assert all(len(path.encode('utf-8')) <= PHOTO_PATH_MAX_BYTES for path in paths.values())
+    assert all(path.endswith('.jpg') for path in paths.values())
+    assert case_folder({**case, 'project_name': '项目', 'room': ''}) == '项目-未填房号-' + REPORT_CODE
+
+
+def test_renaming_creates_new_version_and_preserves_historical_package(client, services, case, photo):
+    case = number_case(services, case)
+    p = photo(stage='survey', role='problem')
+    reporter = services['reporter']
+    package_id = uid()
+    old = reporter._snapshot(package_id, case['id'], [p['id']], 'general', None, '')
+    previous_root = old['root_directory']
+    old['root_directory'] = f"从化铂悦府-1-201-{case['title']}-{REPORT_CODE}"
+    for item in old['photos']:
+        item['package_path'] = old['root_directory'] + item['package_path'][len(previous_root):]
+    with services['db'].tx() as con:
+        con.execute('UPDATE packages SET manifest=? WHERE id=?', (dump(old), package_id))
+    historical = reporter.build(package_id, case['id'], [p['id']])
+    before = client.get(historical['download_url']).content
+    new = reporter.build(uid(), case['id'], [p['id']])
+    assert new['version'] == 2
+    assert new['manifest']['root_directory'] == f'从化铂悦府-201-{REPORT_CODE}'
+    assert reporter.build(uid(), case['id'], [p['id']])['id'] == new['id']
+    assert client.get(historical['download_url']).content == before
 
 
 def test_example_directories_images_videos_and_original_hashes(client, services, case, photo):
@@ -38,7 +75,7 @@ def test_example_directories_images_videos_and_original_hashes(client, services,
     visit = services['domain'].save_visit(case['id'], {'stage': 'work', 'visit_date': '2026-10-23', 'notes': '无照片进场仍需核对'})
     ids = [p['id'] for p in photos] + [pdf, video]
     preview = services['reporter'].preview(ids, 'insurer-v2')
-    root = f"从化铂悦府-1-201-{case['title']}-{REPORT_CODE}"
+    root = f"从化铂悦府-201-{REPORT_CODE}"
     assert preview['photo_count'] == 7 and preview['video_count'] == 1 and preview['excluded_file_count'] == 1
     assert preview['cases'][0]['root_directory'] == root
     assert any(row['scope_key'] == 'visit:' + visit['id'] and row['missing'] for row in preview['cases'][0]['completeness']['items'])

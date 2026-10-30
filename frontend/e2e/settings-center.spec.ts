@@ -14,7 +14,7 @@ test('settings and task details have one organized home without changing configu
   await page.locator('.utility-menu summary').click();
   await page.getByRole('button', { name: '系统设置', exact: true }).click();
   const nav = page.getByRole('navigation', { name: '设置分类', exact: true });
-  await expect(nav.getByRole('button')).toHaveCount(6);
+  await expect(nav.getByRole('button')).toHaveCount(7);
   await expect(page.getByRole('heading', { name: '系统设置', exact: true })).toBeVisible();
   await expect(page.getByRole('region', { name: '自动保存设置', exact: true })).toBeVisible();
   await expect(page.getByRole('checkbox', { name: '自动规则整理', exact: true })).toBeVisible();

@@ -5,6 +5,7 @@ import pytest
 from tests.test_platform_preparation import (
     REPAIR_ID, draft_data, enter_stage, platform, remote_file,
 )
+from tests.conftest import image_bytes
 
 
 @pytest.mark.parametrize('method', ['1', '2'])
@@ -50,6 +51,7 @@ def test_new_repair_save_then_submit_reuses_files_and_created_record(
 
     monkeypatch.setattr(platform.client, 'upload', upload)
     monkeypatch.setattr(platform.client, 'submit', write)
+    monkeypatch.setattr(platform.client, 'download_attachment', lambda *_: image_bytes('silver'))
     platform.client.write_enabled = True
     response = client.post(f"/api/workflow/reviews/{batch['id']}/confirm", json={
         'acknowledged': True, 'fingerprint': batch['fingerprint'], 'action': 'save'})

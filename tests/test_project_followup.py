@@ -25,7 +25,11 @@ class FakeFeedback:
     def __init__(self):
         self.people = [{'open_id': 'ou_lead', 'name': '项目负责人'}]
         self.sent = []
+        self.cards = []
+        self.updated_cards = []
+        self.card_images = []
         self.error = None
+        self.update_error = None
 
     def members(self, chat):
         return self.people
@@ -35,6 +39,19 @@ class FakeFeedback:
         if self.error:
             raise self.error
         return 'om_feedback_verified'
+
+    def send_card(self, chat, content, delivery_id):
+        self.cards.append((chat, json.loads(content), delivery_id))
+        return self.send_feedback(chat, content, delivery_id)
+
+    def update_card(self, message_id, content):
+        self.updated_cards.append((message_id, json.loads(content)))
+        if self.update_error:
+            raise self.update_error
+
+    def upload_card_image(self, data):
+        self.card_images.append(data)
+        return 'img_card_' + str(len(self.card_images))
 
     def close(self):
         pass

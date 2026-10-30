@@ -49,8 +49,9 @@ test('review edits missing and existing fields inline then submits once', async 
   });
   page.on('request', req => { if (req.method() === 'PUT' || /\/review\/survey$/.test(req.url())) extraWrites.push(req.url()); });
   await page.goto('/');
-  const panel = page.getByRole('region', { name: '拟提交事项', exact: true });
-  await expect(panel.getByText('已收照片已合并，待确认：维修方式。请确认是否传齐。')).toBeVisible();
+  await page.getByRole('region', { name: '拟提交事项', exact: true }).getByRole('button', { name: '查看待办' }).click();
+  const panel = page.getByRole('dialog', { name: '拟提交待办', exact: true });
+  await expect(panel.getByText('待确认：维修方式', { exact: true })).toBeVisible();
   await panel.getByRole('button', { name: '核对拟提交信息', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '现场查勘 · 预提交审核', exact: true });
   await expect(dialog.getByText('照片已齐，以下字段仍需管理员确认')).toHaveCount(0);
@@ -136,15 +137,17 @@ test('automatic upload control persists and proposal requires human confirmation
     return route.fulfill({ json: { ...review, state: 'verified', result: { action: 'submit', phase: 'done' } } });
   });
   await page.reload();
-  await expect(panel.getByText('1 案待确认')).toBeVisible();
+  await expect(panel.getByText('待核对 1 · 待补打卡 0')).toBeVisible();
+  await panel.getByRole('button', { name: '查看待办' }).click();
+  const queue = page.getByRole('dialog', { name: '拟提交待办', exact: true });
   for (const width of [1440, 390, 320]) {
     await page.setViewportSize({ width, height: 1000 });
-    await expect(panel.getByRole('button', { name: '核对拟提交信息' })).toBeVisible();
+    await expect(queue.getByRole('button', { name: '核对拟提交信息' })).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
     await page.screenshot({ path: testInfo.outputPath(`automatic-upload-${width}.png`), fullPage: true });
   }
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await panel.getByRole('button', { name: '核对拟提交信息' }).click();
+  await queue.getByRole('button', { name: '核对拟提交信息' }).click();
   const dialog = page.getByRole('dialog', { name: '现场查勘 · 预提交审核' });
   await expect(dialog).toBeVisible();
   const submit = dialog.getByRole('button', { name: '确认并提交', exact: true });
@@ -232,17 +235,18 @@ test('background saves stay quiet until a complete proposal is ready', async ({ 
   status.counts = { awaiting_confirmation: 1 };
   status.items[0].review_id = 'quiet-proposal';
   status.items[0].detail.issues = [];
-  await expect(panel.getByRole('button', { name: '核对拟提交信息' })).toBeVisible();
+  await expect(panel.getByRole('button', { name: '查看待办' })).toBeVisible();
   await expect(panel.getByText('拟提交', { exact: true })).toBeVisible();
-  await expect(panel.getByText('1 案待确认', { exact: true })).toBeVisible();
-  await expect(panel.getByText('待管理人员确认', { exact: true })).toBeVisible();
+  await expect(panel.getByText('待核对 1 · 待补打卡 0', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: /^后台保存/ })).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath('quiet-background-proposal.png'), fullPage: true });
   expect(confirmations).toEqual([]);
 
   // Explicit review actions still report failures, while routine saves remain quiet.
   await page.route('**/api/workflow/reviews/quiet-proposal', route => route.fulfill({ status: 409, json: { detail: '拟提交资料已更新，请重新核对' } }));
-  await panel.getByRole('button', { name: '核对拟提交信息' }).click();
+  await panel.getByRole('button', { name: '查看待办' }).click();
+  const queue = page.getByRole('dialog', { name: '拟提交待办', exact: true });
+  await queue.getByRole('button', { name: '核对拟提交信息' }).click();
   await expect(page.getByText('拟提交资料已更新，请重新核对', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: /^后台保存/ })).toHaveCount(0);
 
@@ -251,7 +255,9 @@ test('background saves stay quiet until a complete proposal is ready', async ({ 
   status.counts = { needs_fields: 1 };
   status.items[0].review_id = null;
   status.items[0].detail.issues = ['新收到的照片仍待核对'];
-  await expect(panel.getByRole('button', { name: '核对拟提交信息' })).toHaveCount(0);
+  await expect(queue.getByRole('button', { name: '核对拟提交信息' })).toHaveCount(0);
+  await expect(queue.getByText('暂无待核对事项。')).toBeVisible();
+  await queue.getByRole('button', { name: '关闭', exact: true }).click();
   await expect(panel).toHaveCount(0);
   expect(confirmations).toEqual([]);
   expect(errors).toEqual([]);

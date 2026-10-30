@@ -6,13 +6,16 @@ import json
 import logging
 import re
 import threading
+import time
 
 from .connectors.feishu_feedback import UncertainDelivery
 from .db import audit, dump, now, uid
 from .domain import DomainError
 from .project_followup import plain
+from .review_requirements import pending_checkins
 
 log = logging.getLogger(__name__)
+QUEUE_RECHECK_SECONDS = 60
 
 
 def digest(value):
@@ -36,6 +39,8 @@ class ReviewNotifications:
         self.automatic, self.followup = automatic, followup
         self.db, self.platform, self.reviews = automatic.db, automatic.platform, automatic.reviews
         self._lock, self._stop, self._thread = threading.RLock(), threading.Event(), None
+        self.cards = None
+        self._queue_checks = {}
 
     def enabled(self):
         policy = self.automatic.policy()
@@ -51,9 +56,16 @@ class ReviewNotifications:
         if connector['kind'] != 'feishu' or not connector['enabled']:
             raise DomainError('负责人绑定的飞书群入口已暂停，请启用后继续提醒。', 409)
         return {**contact, 'chat_id': connector['config']['chat_id'],
-                'chat_name': connector['config'].get('chat_name') or connector['name']}
+                'chat_name': connector['config'].get('chat_name') or connector['name'],
+                'app_id': connector['config']['app_id']}
 
     def current(self, case_id):
+        # A proposal performs many related reads. Reuse one consistent SQLite
+        # connection, including for the uncached send/callback validation paths.
+        with self.platform.material_lock, self.db.read_snapshot():
+            return self._current(case_id)
+
+    def _current(self, case_id):
         row = self.db.one('SELECT * FROM automatic_upload_cases WHERE case_id=?', (case_id,))
         if not self.enabled() or not row or not row['enabled'] or row['state'] != 'awaiting_confirmation' or not row['review_id']:
             raise DomainError('案件当前不再等待核对拟提交信息，提醒已取消。', 409)
@@ -67,15 +79,72 @@ class ReviewNotifications:
             raise DomainError('当前环节或拟提交内容已变化，提醒已取消。', 409)
         return row, plan
 
+    def _queue_observation(self, case_id):
+        """Cheap inputs for background polling, never authority to send/submit."""
+        with self.db.read_snapshot():
+            case = self.automatic.domain.case(case_id)
+            upload = self.db.one('SELECT * FROM automatic_upload_cases WHERE case_id=?', (case_id,))
+            review = self.db.one('SELECT id,state,fingerprint,save_only FROM platform_review_batches WHERE id=?',
+                                 (upload['review_id'],))
+            deliveries = self.db.all(
+                'SELECT id,review_id,proposal_key,dedupe_key,state,card_token,card_view,pending_action_id '
+                'FROM review_notifications WHERE case_id=? ORDER BY id', (case_id,))
+            return digest([case, upload, review, deliveries, self.automatic.policy(),
+                           self.automatic.signature(case_id, proposal=True),
+                           self.recipient(case['project_id']), self.platform.dictionaries()])
+
+    def _queue_if_changed(self, case_id):
+        with self.platform.material_lock:
+            observed = self._queue_observation(case_id)
+            stamp = time.monotonic()
+            previous = self._queue_checks.get(case_id)
+            if previous and previous[0] == observed and stamp - previous[1] < QUEUE_RECHECK_SECONDS:
+                return
+            try:
+                self.queue(case_id)
+            except DomainError:
+                # A blocked proposal is reconsidered when its inputs change or
+                # the bounded retry expires; it must not spin every two seconds.
+                self._queue_checks[case_id] = (observed, stamp)
+                raise
+            # Save the observation from BEFORE queue(): a concurrent change or
+            # a delivery created/renewed here must be visible on the next tick.
+            self._queue_checks[case_id] = (observed, stamp)
+
     @staticmethod
     def dedupe(key, recipient):
-        return digest([key, recipient['connector_id'], recipient['chat_id'], recipient['open_id']])
+        return digest([key, recipient['connector_id'], recipient['chat_id'], recipient['open_id'], recipient['app_id']])
+
+    def existing(self, key, recipient, plan=None):
+        row = self.db.one('SELECT * FROM review_notifications WHERE dedupe_key=?', (self.dedupe(key, recipient),))
+        if row:
+            return row
+        # Pre-card reminders have no app identity and used the original four-part
+        # key. Preserve their delivery outcome instead of resending on upgrade.
+        legacy = digest([key, recipient['connector_id'], recipient['chat_id'], recipient['open_id']])
+        row = self.db.one("SELECT * FROM review_notifications WHERE dedupe_key=? "
+                          "AND message_type='text' AND app_id=''", (legacy,))
+        if row or not plan:
+            return row
+        # A missing-check-in reminder follows one case/stage in its original
+        # message as evidence arrives. Ordinary completed proposals keep their
+        # existing content-based deduplication and legacy delivery outcomes.
+        return self.db.one(
+            "SELECT n.* FROM review_notifications n JOIN platform_review_batches r ON r.id=n.review_id "
+            "WHERE n.case_id=? AND n.stage=? AND n.purpose='checkin_gap' AND n.message_type='interactive' "
+            "AND n.connector_id=? AND n.chat_id=? AND n.open_id=? AND n.app_id=? "
+            "AND json_extract(r.snapshot,'$.link.report_receiving_id')=? "
+            "AND r.state NOT IN ('submitting','submitted','verified','uncertain','saved','save_verified') "
+            'ORDER BY n.created_at DESC,n.id DESC LIMIT 1',
+            (plan['case']['id'], plan['stage'], recipient['connector_id'], recipient['chat_id'],
+             recipient['open_id'], recipient['app_id'], plan['link']['report_receiving_id']))
 
     def message(self, plan, recipient):
         case = plan['case']
+        checkins = pending_checkins(plan)
         lines = [
             f'<at user_id="{recipient["open_id"]}">{plain(recipient["name"])}</at>',
-            f'{plain(case["project_name"])} · {plain(plan["label"])}资料待核对',
+            f'{plain(case["project_name"])} · {plain(plan["label"])}资料' + ('待补齐' if checkins else '待核对'),
             '案件：' + plain(case.get('short_code') or case.get('platform_report_code') or '编号待补'),
         ]
         if case.get('platform_report_code'):
@@ -85,7 +154,10 @@ class ReviewNotifications:
         files = [f'{plain(f["label"])} {len(f["existing"])} 项' for f in plan['file_fields'] if f['existing']]
         if files:
             lines.append('已保存：' + '；'.join(files))
-        if plan.get('pending_fields'):
+        if checkins:
+            lines.append('已核对官网本环节附件，待补：' + '、'.join(plain(item['label']) for item in checkins) + '。')
+            lines.append('本环节主要资料已保存，请补齐打卡照片；补齐并核对后才能正式提交。')
+        elif plan.get('pending_fields'):
             lines.append('待管理员确认：' + '、'.join(plain(f['label']) for f in plan['pending_fields']) + '。')
             lines.append('本环节已收照片已合并，已自动填写可确定内容。请在 IDI 工作台的“拟提交”中点击“核对拟提交信息”，确认照片是否传齐、补齐待确认字段并审核；确认后系统自动正式提交。')
         else:
@@ -102,25 +174,41 @@ class ReviewNotifications:
             recipient = self.recipient(plan['case']['project_id'])
             key = proposal_key(plan)
             dedupe = self.dedupe(key, recipient)
-            existing = self.db.one('SELECT * FROM review_notifications WHERE dedupe_key=?', (dedupe,))
-            if existing and existing['state'] != 'cancelled':
+            existing = self.existing(key, recipient, plan)
+            if (existing and existing['purpose'] == 'checkin_gap' and existing['proposal_key'] != key
+                    and existing['state'] == 'sent' and not existing['pending_action_id'] and self.cards):
+                with self.db.tx() as con:
+                    con.execute('UPDATE review_notifications SET proposal_key=?,dedupe_key=?,official_checked_at=? WHERE id=?',
+                                (key, dedupe, plan['link']['verified_at'], existing['id']))
+                existing = self.db.one('SELECT * FROM review_notifications WHERE id=?', (existing['id'],))
+                return self.cards.renew(existing, row['review_id'])
+            replace_queued = (existing and existing['purpose'] == 'checkin_gap'
+                              and existing['state'] == 'queued' and existing['proposal_key'] != key)
+            if existing and existing['state'] != 'cancelled' and not replace_queued:
+                if self.cards and existing['message_type'] == 'interactive' and existing['state'] == 'sent' and not existing['pending_action_id']:
+                    view = json.loads(existing['card_view'])
+                    if view.get('mode') == 'stale' or (view.get('review_state') == 'save_verified' and existing['review_id'] != row['review_id']):
+                        self.cards.renew(existing, row['review_id'])
                 return existing
             content = self.message(plan, recipient)
             with self.db.tx() as con:
                 if existing:
-                    con.execute("UPDATE review_notifications SET state='queued',review_id=?,content=?,error=NULL WHERE id=?",
-                                (row['review_id'], content, existing['id']))
+                    con.execute("UPDATE review_notifications SET state='queued',review_id=?,content=?,dedupe_key=?,"
+                                "proposal_key=?,error=NULL,retry_at=0 WHERE id=?",
+                                (row['review_id'], content, dedupe, key, existing['id']))
                     delivery_id = existing['id']
                 else:
                     delivery_id = uid()
                     con.execute('''INSERT INTO review_notifications(
                         id,dedupe_key,case_id,stage,project_id,review_id,proposal_key,
-                        connector_id,open_id,name,chat_id,chat_name,content,created_at)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                        connector_id,open_id,name,chat_id,chat_name,content,created_at,purpose)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                         (delivery_id, dedupe, case_id, row['stage'], plan['case']['project_id'], row['review_id'], key,
                          recipient['connector_id'], recipient['open_id'], recipient['name'],
-                         recipient['chat_id'], recipient['chat_name'], content, now()))
-            return self.db.one('SELECT * FROM review_notifications WHERE id=?', (delivery_id,))
+                         recipient['chat_id'], recipient['chat_name'], content, now(),
+                         'checkin_gap' if pending_checkins(plan) else 'review'))
+            delivery = self.db.one('SELECT * FROM review_notifications WHERE id=?', (delivery_id,))
+            return self.cards.initialize(delivery, plan) if self.cards else delivery
 
     def status_for(self, upload):
         if upload['state'] != 'awaiting_confirmation' or not upload.get('review_id'):
@@ -130,10 +218,10 @@ class ReviewNotifications:
         try:
             record = self.reviews.get(upload['review_id'])
             recipient = self.recipient(record['snapshot']['case']['project_id'])
-            key = self.dedupe(proposal_key(record['snapshot']), recipient)
-            row = self.db.one('SELECT * FROM review_notifications WHERE dedupe_key=?', (key,))
+            row = self.existing(proposal_key(record['snapshot']), recipient, record['snapshot'])
             if row:
-                return {k: row[k] for k in ('id', 'state', 'error', 'name', 'chat_name', 'sent_at')}
+                return {**{k: row[k] for k in ('id', 'state', 'error', 'name', 'chat_name', 'sent_at', 'purpose', 'official_checked_at')},
+                        'error': row['error'] or row['card_error'] or None}
             return {'state': 'queued', 'name': recipient['name'], 'chat_name': recipient['chat_name']}
         except DomainError as error:
             return {'state': 'blocked', 'message': str(error)}
@@ -146,11 +234,47 @@ class ReviewNotifications:
             raise DomainError('拟提交资料、群或项目负责人已变更，旧提醒已取消。', 409)
         return row, plan
 
+    def _verify_official_checkins(self, delivery):
+        """Do a fresh official read immediately before a gap reminder is sent."""
+        if delivery['purpose'] != 'checkin_gap':
+            return True
+        from .project_accounts import case_context
+        case_id = delivery['case_id']
+        try:
+            with case_context(self.platform, case_id):
+                self.automatic.workflow.refresh_case(case_id)
+                detail = self.platform.link(case_id)['snapshot'].get(delivery['stage']) or {}
+                if any(not isinstance(detail.get(key), list)
+                       for key in ('buildingFileInfoList', 'houseFileInfoList')):
+                    raise DomainError('官网未返回可核实的本环节打卡附件列表', 502)
+        except Exception as error:
+            # An unavailable website is not evidence of missing attachments.
+            with self.db.tx() as con:
+                con.execute('UPDATE review_notifications SET error=?,retry_at=? WHERE id=?',
+                            ('暂无法核对官网本环节附件，补资料提醒尚未发送；稍后自动重试。',
+                             time.time() + 60, delivery['id']))
+            if not isinstance(error, DomainError):
+                log.exception('Official check-in verification failed for %s', delivery['id'])
+            return False
+        with self.db.tx() as con:
+            con.execute('UPDATE review_notifications SET official_checked_at=?,error=NULL,retry_at=0 WHERE id=?',
+                        (now(), delivery['id']))
+        try:
+            self._matches(delivery)
+        except DomainError:
+            # The fresh read may have found check-ins absent from the cache, or
+            # an already-completed stage. Let the normal workflow rebuild first.
+            with self.db.tx() as con:
+                con.execute("UPDATE automatic_upload_cases SET signature='',retry_at=? WHERE case_id=?",
+                            (time.time() + 1, case_id))
+            raise DomainError('官网本环节资料已更新，旧补资料提醒已取消，正在重新核对。', 409)
+        return True
+
     def deliver(self, delivery_id):
         # Share the contact-edit lock, then the material lock (same order as photo deletion).
         with self._lock, self.followup._send_lock, self.platform.material_lock:
             delivery = self.db.one('SELECT * FROM review_notifications WHERE id=?', (delivery_id,))
-            if not delivery or delivery['state'] != 'queued':
+            if not delivery or delivery['state'] != 'queued' or delivery['retry_at'] > time.time():
                 return
             client, sent_id, started = None, None, False
             try:
@@ -160,12 +284,18 @@ class ReviewNotifications:
                     raise DomainError('项目负责人已不在群中，请重新绑定。')
                 # Membership lookup may take time; recheck readiness immediately before sending.
                 self._matches(delivery)
+                if self.cards and delivery['message_type'] == 'interactive':
+                    delivery = self.cards.prepare_send(delivery, client)
+                if not self._verify_official_checkins(delivery):
+                    return
+                self._matches(delivery)
                 if self._stop.is_set():
                     return
                 with self.db.tx() as con:
                     con.execute("UPDATE review_notifications SET state='sending',error=NULL WHERE id=?", (delivery_id,))
                 started = True
-                sent_id = client.send_feedback(delivery['chat_id'], delivery['content'], delivery_id)
+                send = client.send_card if delivery['message_type'] == 'interactive' else client.send_feedback
+                sent_id = send(delivery['chat_id'], delivery['content'], delivery_id)
                 with self.db.tx() as con:
                     con.execute("UPDATE review_notifications SET state='sent',remote_message_id=?,sent_at=? WHERE id=?",
                                 (sent_id, now(), delivery_id))
@@ -190,7 +320,7 @@ class ReviewNotifications:
                 raise DomainError('仅明确失败的提醒可以重试；结果不确定时请先核对群内记录。', 409)
             self._matches(row)
             with self.db.tx() as con:
-                con.execute("UPDATE review_notifications SET state='queued',error=NULL WHERE id=?", (delivery_id,))
+                con.execute("UPDATE review_notifications SET state='queued',error=NULL,retry_at=0 WHERE id=?", (delivery_id,))
         return {'state': 'queued'}
 
     def confirm(self, delivery_id, received):
@@ -210,21 +340,27 @@ class ReviewNotifications:
         return {'state': state}
 
     def run_once(self):
+        if self.cards and not self._stop.is_set():
+            self.cards.run_once()
         if self._stop.is_set() or not self._lock.acquire(blocking=False):
             return 0
         try:
             if not self.enabled():
+                self._queue_checks.clear()
                 if self.db.one("SELECT id FROM review_notifications WHERE state='queued' LIMIT 1"):
                     with self.db.tx() as con:
                         con.execute("UPDATE review_notifications SET state='cancelled',error='飞书核对提醒已暂停' WHERE state='queued'")
                 return 0
-            for row in self.db.all("SELECT case_id FROM automatic_upload_cases WHERE enabled=1 AND state='awaiting_confirmation'"):
+            candidates = self.db.all("SELECT case_id FROM automatic_upload_cases WHERE enabled=1 AND state='awaiting_confirmation'")
+            case_ids = {row['case_id'] for row in candidates}
+            self._queue_checks = {key: value for key, value in self._queue_checks.items() if key in case_ids}
+            for row in candidates:
                 try:
-                    self.queue(row['case_id'])
+                    self._queue_if_changed(row['case_id'])
                 except DomainError:
                     # Missing bindings/readiness are visible beside the proposal and retried after changes.
                     continue
-            deliveries = self.db.all("SELECT id FROM review_notifications WHERE state='queued' ORDER BY created_at LIMIT 10")
+            deliveries = self.db.all("SELECT id FROM review_notifications WHERE state='queued' AND retry_at<=? ORDER BY created_at LIMIT 10", (time.time(),))
             for row in deliveries:
                 if self._stop.is_set():
                     break
@@ -234,8 +370,11 @@ class ReviewNotifications:
             self._lock.release()
 
     def recover(self):
+        self._queue_checks.clear()
         with self.db.tx() as con:
             con.execute("UPDATE review_notifications SET state='unknown',error='发送时服务中断，请先核对飞书群内记录' WHERE state='sending'")
+        if self.cards:
+            self.cards.recover()
 
     def start(self):
         if self._thread:

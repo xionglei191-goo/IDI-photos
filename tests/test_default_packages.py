@@ -382,6 +382,7 @@ def test_new_submission_waits_for_verified_receipt_and_only_runs_once(services, 
 
 
 def test_upgrade_baseline_preserves_packages_without_enrolling_old_cases(services, platform, case, photo):
+    from tests.conftest import rewind_additive_test_schema
     photo(stage='work', role='construction')
     submitted(services, platform, case)
     first = finish(services, case)
@@ -392,9 +393,7 @@ def test_upgrade_baseline_preserves_packages_without_enrolling_old_cases(service
     # the real migration. Previously confirmed submissions must stay historical.
     with db.tx() as con:
         con.execute("UPDATE platform_review_batches SET confirmed_at='2020-01-01T00:00:00Z'")
-        con.execute('DROP TABLE default_package_requests')
-        con.execute("DELETE FROM settings WHERE key='default_package_auto_policy'")
-        con.execute('DELETE FROM schema_version WHERE version=39')
+        rewind_additive_test_schema(con, 38)
     db.initialize()
     services['domain'].save_case({'description': '历史案件备注修订'}, case['id'])
     photo('red', stage='work', role='construction')

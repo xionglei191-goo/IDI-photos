@@ -40,9 +40,9 @@ test('project requirement is saved and submitted repairs are prepared before dow
   await page.locator(`[data-case-id="${value.id}"] .case-link`).click();
   await page.getByRole('button', { name: /^保司资料/ }).click();
   const card = page.getByRole('region', { name: '默认资料', exact: true });
-  await expect(card).toContainText('修复成果提交并经官网确认后');
-  // Seed only the isolated browser-test database with a simulated official readback.
-  // The production scheduler and document worker perform the actual preparation.
+  await expect(card).toContainText('在本系统新提交修复成果并经官网确认后');
+  // Seed an isolated verified submission with local photos. Official attachment
+  // download and account readiness have separate backend integration coverage.
   const system = await (await request.get('/api/system')).json();
   const root = path.resolve(import.meta.dirname, '../..');
   const data = path.resolve(system.data_dir);
@@ -53,7 +53,10 @@ from datetime import datetime,timezone
 db=sqlite3.connect(sys.argv[1]); case_id=sys.argv[2]; stamp=datetime.now(timezone.utc).isoformat()
 snapshot={'scope':'repair','row':{'repairAcceptanceFlowStatus':'1','repairAcceptanceState':'1'},'fetched_at':stamp}
 db.execute("UPDATE cases SET workflow_source='platform',workflow_stage='acceptance',workflow_verified_at=? WHERE id=?",(stamp,case_id))
-db.execute('INSERT INTO platform_links VALUES(?,?,?,?,?,?,?,?)',(case_id,'isolated-auto-readback','UIAUTO001','',json.dumps(snapshot),stamp,1,stamp))
+db.execute('INSERT INTO platform_links VALUES(?,?,?,?,?,?,?,?)',(case_id,'','UIAUTO001','',json.dumps(snapshot),stamp,1,stamp))
+review_snapshot={'link':{'report_receiving_id':''},'file_fields':[]}
+db.execute('INSERT INTO platform_review_batches(id,case_id,stage,state,fingerprint,snapshot,result,created_at,confirmed_at,finished_at,save_only) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+    ('browser-submission-'+case_id,case_id,'repair','verified','isolated-browser',json.dumps(review_snapshot),json.dumps({'action':'submit','business_submitted':True}),stamp,stamp,stamp,0))
 db.commit(); db.close()`, path.join(data, 'archive.sqlite3'), value.id]);
   const link = card.getByRole('link', { name: '下载默认记录表 v1', exact: true });
   await expect(link).toBeVisible({ timeout: 20000 });
@@ -62,7 +65,7 @@ db.commit(); db.close()`, path.join(data, 'archive.sqlite3'), value.id]);
   const download = await downloadEvent;
   expect(download.suggestedFilename()).toContain('UIAUTO001-v1.docx');
   await download.saveAs(testInfo.outputPath('default-record.docx'));
-  await expect(card).toContainText('已提前准备，可直接下载');
+  await expect(card).toContainText('已生成，可直接下载');
   const packages = await (await request.get(`/api/packages?case_id=${value.id}`)).json();
   expect(packages).toHaveLength(1);
   // Switching the case's manual export choice must not regenerate the project

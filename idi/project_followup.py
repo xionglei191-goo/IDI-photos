@@ -97,13 +97,21 @@ class ProjectFollowup:
         return {case['id']: case for case in self.domain.cases() if case['followup_eligible']}
 
     def signature(self):
+        with self.db.read_snapshot():
+            return self._signature()
+
+    def _signature(self):
         cases = self.followup_cases()
         photos = [p for p in self.db.all('SELECT id,case_id,revision,updated_at FROM photos ORDER BY id') if p['case_id'] in cases]
         visits = [v for v in self.db.all('SELECT * FROM visits ORDER BY id') if v['case_id'] in cases]
         visit_ids = {v['id'] for v in visits}
         return digest({'version': RULE_VERSION, 'config': self.config(), 'vision': self.db.setting('recognition', {}),
-                       'cases': [{k: c[k] for k in ('id', 'project_id', 'revision', 'workflow_stage', 'workflow_verified_at')}
-                                 for c in sorted(cases.values(), key=lambda c: c['id'])],
+                       # Official readback advances audit timestamps and the
+                       # optimistic-lock revision even when business data is
+                       # unchanged. Those must not restart a full photo review.
+                       'cases': [{k: v for k, v in c.items() if k not in (
+                           'revision', 'created_at', 'updated_at', 'workflow_verified_at', 'remote_updated_at')}
+                           for c in sorted(cases.values(), key=lambda c: c['id'])],
                        'photos': photos, 'visits': visits,
                        'ai_tasks': self.db.all('SELECT id,state,updated_at FROM photo_ai_tasks ORDER BY id'),
                        'shared': [s for s in self.db.all('SELECT * FROM visit_shared_checkins ORDER BY photo_id,visit_id') if s['visit_id'] in visit_ids],

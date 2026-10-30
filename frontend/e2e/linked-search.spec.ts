@@ -101,8 +101,7 @@ test('navigation and case lists share search across pagination, details, boards 
   await expect(tree).toHaveCount(1);
   await page.getByRole('button', { name: '展开快速导航', exact: true }).click();
   await expect(search).toHaveValue('20014');
-  await expect(rows).toHaveCount(1);
-  await expect(rows).toHaveAttribute('data-case-id', target.id);
+  await expect.poll(() => rows.evaluateAll(items => items.map(item => item.getAttribute('data-case-id')))).toEqual([target.id]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath('linked-search-mobile.png'), fullPage: true });
   expect(errors).toEqual([]);

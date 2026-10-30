@@ -31,7 +31,9 @@ test('proposal shows Feishu delivery and supports failure recovery without submi
   });
   page.on('request', request => { if (/\/reviews\/[^/]+\/confirm$/.test(request.url())) submissions.push(request.url()); });
   await page.goto('/');
-  const proposals = page.getByRole('region', { name: '拟提交事项', exact: true });
+  await page.getByRole('region', { name: '拟提交事项', exact: true }).getByRole('button', { name: '查看待办' }).click();
+  const proposals = page.getByRole('dialog', { name: '拟提交待办', exact: true });
+  await proposals.getByText('资料与提醒 · 提醒失败', { exact: true }).click();
   await expect(proposals.getByText('飞书提醒发送失败：负责人已不在群中，请重新绑定。')).toBeVisible();
   await proposals.getByRole('button', { name: '重试飞书提醒', exact: true }).click();
   await expect(proposals.getByText('已在“项目照片收集群” @ 项目负责人 提醒核对')).toBeVisible();

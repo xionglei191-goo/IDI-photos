@@ -13,10 +13,13 @@ from .db import audit, dump, now
 from .domain import DomainError
 from .photo_ai import digest
 from .platform_prefill import PREFILL_RULES_VERSION, canonical_value
+from .review_requirements import pending_checkins
 
 log = logging.getLogger(__name__)
 UNRESOLVED = ('submitting', 'saved', 'submitted', 'uncertain')
 PROPOSAL_QUIET_SECONDS = 300
+CHECKIN_RECHECK_SECONDS = 300
+REVIEW_RULES_VERSION = 2
 
 
 class AutomaticUploads:
@@ -111,7 +114,7 @@ class AutomaticUploads:
         drafts = self.db.all('SELECT stage,revision,target_report_id FROM platform_drafts WHERE case_id=? ORDER BY stage', (case_id,))
         if draft_override:
             drafts = sorted([d for d in drafts if d['stage'] != draft_override['stage']] + [draft_override], key=lambda d: d['stage'])
-        data = [PREFILL_RULES_VERSION, self.rules.case_signature(case), photos, self.platform.prefill_defaults(), drafts,
+        data = [PREFILL_RULES_VERSION, REVIEW_RULES_VERSION, self.rules.case_signature(case), photos, self.platform.prefill_defaults(), drafts,
                 self.db.all('SELECT stage,field,photo_id,photo_revision,blob_hash,target_report_id FROM platform_manual_file_selections WHERE case_id=? ORDER BY stage,field,photo_id', (case_id,)),
                 self.platform.link(case_id)['revision']]
         if getattr(self.platform, 'project_accounts', None):
@@ -368,10 +371,15 @@ class AutomaticUploads:
                     'reason': f'照片已保存；连续 {PROPOSAL_QUIET_SECONDS} 秒无新照片后合并生成拟提交信息',
                     'proposal_not_before': self.get(case_id)['proposal_not_before']}, retry=remaining)
             proposal = self.reviews.prepare(case_id, stage, plan['draft']['revision'], review_only=bool(issues))
+            checkins = pending_checkins(plan)
             return self._record(case_id, 'awaiting_confirmation', {**detail,
                 'pending_fields': proposal['snapshot'].get('pending_fields', []),
-                'reason': '已收照片已合并，请确认是否传齐并补齐待确认字段' if issues else '已收资料已合并，请核对照片和拟提交信息；确认后正式提交'},
-                review_id=proposal['id'], guard=guard)
+                'pending_checkins': checkins,
+                'official_verified_at': plan['link']['verified_at'],
+                'reason': '本环节主要资料已保存，待补打卡照片；补齐后核对提交' if checkins else
+                          '已收照片已合并，请确认是否传齐并补齐待确认字段' if issues else
+                          '已收资料已合并，请核对照片和拟提交信息；确认后正式提交'},
+                review_id=proposal['id'], guard=guard, retry=CHECKIN_RECHECK_SECONDS if checkins else 0)
 
     def start(self):
         if self._thread:

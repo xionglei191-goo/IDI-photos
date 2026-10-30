@@ -90,7 +90,7 @@ test('create case, upload, review, select, export, receive, and restore saved vi
   await page.getByRole('button', { name: '提取所选', exact: true }).click();
   dialog = page.getByRole('dialog');
   await expect(dialog.getByText(/^打包1张照片，涉及1个案件/)).toBeVisible();
-  await expect(dialog.getByText('父文件夹：浏览器验收项目-1-201-客厅油漆起皮-ZLBH202610132005010577')).toBeVisible();
+  await expect(dialog.getByText('父文件夹：浏览器验收项目-201-ZLBH202610132005010577')).toBeVisible();
   await expect(dialog.getByText(/目录：查勘照片/)).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('photo-package-preview.png'), fullPage: true });
   await dialog.getByRole('button', { name: '生成ZIP资料包', exact: true }).click();

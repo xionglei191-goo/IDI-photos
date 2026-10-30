@@ -214,7 +214,8 @@ class Access:
         camera_device_paths = ('/api/camera/cases', '/api/camera/captures', '/api/camera/official-captures',
                                '/api/camera/sdk-config', '/api/camera/native-config', '/api/camera/native-session',
                                '/api/camera/h5-config', '/api/camera/h5-session')
-        if any(path == prefix or path.startswith(prefix + '/') for prefix in camera_device_paths):
+        if path == '/api/camera/native-authorization' or any(
+                path == prefix or path.startswith(prefix + '/') for prefix in camera_device_paths):
             timing = request.scope.get(SCOPE_KEY) or CameraTiming()
             submitted = time.perf_counter()
             def authenticate():

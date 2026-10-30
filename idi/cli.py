@@ -93,6 +93,9 @@ def restore(source: Path, target: Path, resume=False):
             if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_notifications'").fetchone():
                 con.execute("UPDATE review_notifications SET state='cancelled',error='从备份恢复，核对提醒已暂停' WHERE state IN ('queued','failed')")
                 con.execute("UPDATE review_notifications SET state='unknown',error='恢复前发送结果需核对群内记录' WHERE state='sending'")
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feishu_review_actions'").fetchone():
+                con.execute("UPDATE feishu_review_actions SET state='interrupted',error='从备份恢复，请重新核对，未自动重放' WHERE state IN ('queued','running')")
+                con.execute("UPDATE review_notifications SET pending_action_id=NULL,card_token='',card_dirty=0,card_error='恢复前卡片已失效，请重新生成拟提交信息'")
             if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='platform_attachment_removals'").fetchone():
                 con.execute("UPDATE platform_attachment_removals SET state='stale',error='从备份恢复，请重新核对删除对象' WHERE state='prepared'")
                 con.execute("UPDATE platform_attachment_removals SET state='uncertain',error='恢复前撤回结果需回读官网核实' WHERE state='removing'")

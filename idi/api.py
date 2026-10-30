@@ -47,6 +47,8 @@ from .photo_ai import PhotoAI
 from .photo_workflow import PhotoWorkflow
 from .automatic_uploads import AutomaticUploads, automatic_upload_routes
 from .review_notifications import ReviewNotifications
+from .feishu_identities import FeishuIdentities, feishu_identity_routes
+from .feishu_review_cards import FeishuReviewCards
 from .operations import Operations, operations_routes
 from .mobile_camera import MobileCamera, camera_routes
 from .official_camera import OfficialCamera, official_camera_routes
@@ -98,6 +100,9 @@ def create_app(settings: Settings | None = None):
     automatic_uploads = AutomaticUploads(workflow, reviews, photo_workflow)
     reviews.automatic_uploads = automatic_uploads
     review_notifications = ReviewNotifications(automatic_uploads, followup)
+    feishu_identities = FeishuIdentities(access, followup)
+    review_cards = FeishuReviewCards(review_notifications, feishu_identities)
+    review_notifications.cards = review_cards
     automatic_uploads.notifications = review_notifications
     workspace_chat = WorkspaceChat(feishu_agent)
 
@@ -170,6 +175,9 @@ def create_app(settings: Settings | None = None):
     app.state.services['automatic_uploads'] = automatic_uploads
     app.state.services['default_packages'] = default_packages
     app.state.services['review_notifications'] = review_notifications
+    app.state.services['review_cards'] = review_cards
+    app.state.services['feishu_identities'] = feishu_identities
+    app.include_router(feishu_identity_routes(feishu_identities))
     app.include_router(automatic_upload_routes(automatic_uploads))
     app.state.services['case_agent'] = case_agent
     app.state.services['feishu_agent'] = feishu_agent
@@ -190,6 +198,12 @@ def create_app(settings: Settings | None = None):
     app.include_router(camera_routes(mobile_camera))
     official_camera = OfficialCamera(mobile_camera)
     official_camera.dedup = photo_dedup
+    from .camera_video_times import CameraVideoTimes
+    official_camera.video_times = CameraVideoTimes(db, storage, recognizer, jobs)
+    from .camera_capture_deletion import CameraCaptureDeletion
+    official_camera.deletions = CameraCaptureDeletion(official_camera,
+        (followup._send_lock, followup._review_lock, photo_workflow._lock, platform.material_lock))
+    app.state.services['camera_video_times'] = official_camera.video_times
     app.state.services['official_camera'] = official_camera
     app.state.services['photo_dedup'] = photo_dedup
     app.state.services['access'] = access

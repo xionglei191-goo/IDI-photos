@@ -35,10 +35,12 @@ class ReviewBatches:
 
     @staticmethod
     def review_blockers(plan):
-        """A proposal may await business fields, but never missing/invalid files."""
+        """Review may request missing check-ins; actual submission stays strict."""
+        from .review_requirements import pending_checkins
+        checkins = {item['field'] for item in pending_checkins(plan)}
         business_keys = {f['key'] for f in plan['fields'] if f['kind'] not in ('files', 'readonly')}
         return [i for i in plan['issues'] if i['severity'] == 'error'
-                and not (i.get('code') == 'required' and i['field'] in business_keys)]
+                and not (i.get('code') == 'required' and i['field'] in business_keys | checkins)]
 
     @scoped_case()
     def snapshot(self, case_id, stage, *, save_only=False, review_only=False):
@@ -80,11 +82,13 @@ class ReviewBatches:
             fingerprint_data['save_only'] = True
             plan = {**plan, 'actions': ['save'], 'save_only': True}
         if review_only:
+            from .review_requirements import pending_checkins
             fingerprint_data['review_only'] = True
             labels = {f['key']: f['label'] for f in plan['fields']}
             pending = [{'field': i['field'], 'label': labels.get(i['field'], i['field']), 'message': i['message']}
                        for i in plan['issues'] if i['severity'] == 'error']
-            plan = {**plan, 'actions': [], 'review_only': True, 'pending_fields': pending}
+            plan = {**plan, 'actions': [], 'review_only': True, 'pending_fields': pending,
+                    'pending_checkins': pending_checkins(plan)}
         fingerprint = hashlib.sha256(dump(fingerprint_data).encode()).hexdigest()
         return plan, fingerprint
 
@@ -113,14 +117,16 @@ class ReviewBatches:
         return row
 
     @scoped_record('platform_review_batches', 'review_confirmation')
-    def confirm(self, review_id, fingerprint, local_only=False, action='submit', values=None):
+    def confirm(self, review_id, fingerprint, local_only=False, action='submit', values=None, *, check_permission=None):
         from .identity import current
         if getattr(self.platform, 'project_accounts', None) and not local_only and action != 'save' and current() is None:
             raise DomainError('正式提交须由登录的 IDI 系统管理员或本项目管理员核对确认', 403)
         with self._execution(review_id), self.platform.material_lock:
+            if check_permission:
+                check_permission()
             if values is not None:
                 fingerprint = self._apply_edits(review_id, fingerprint, values, local_only, action)
-            self._confirm(review_id, fingerprint, local_only, action)
+            self._confirm(review_id, fingerprint, local_only, action, check_permission=check_permission)
         return self.get(review_id)
 
     def _edit_plan(self, review_id, fingerprint, values):

@@ -156,7 +156,7 @@ def test_vps_invalid_network_fails_closed(monkeypatch, name, value):
         network_config()
 
 
-def test_docker_gateway_camera_admin_requires_local_host_and_no_proxy_headers(tmp_path):
+def test_docker_gateway_setup_stays_local_and_camera_admin_requires_login(tmp_path):
     network = network_config()
     app = create_app(Settings(tmp_path, worker_enabled=False, **network))
     with TestClient(app, base_url="http://127.0.0.1:18766", client=("172.30.80.1", 1234), headers={'X-IDI-Request': '1'}) as client:
@@ -169,11 +169,12 @@ def test_docker_gateway_camera_admin_requires_local_host_and_no_proxy_headers(tm
         assert client.get("/api/system").json()["deployment"] == "vps"
         assert client.get("/api/system").json()["lan_urls"] == []
         assert client.get("/api/camera/admin").status_code == 200
-        assert client.get("/api/camera/admin", headers={"X-Forwarded-Proto": "https"}).status_code == 403
-        assert client.get("/api/camera/admin", headers={"Host": "172.30.80.10:8766"}).status_code == 403
+        assert client.get("/api/camera/admin", headers={"X-Forwarded-Proto": "https"}).status_code == 200
+        assert client.get("/api/camera/admin", headers={"Host": "172.30.80.10:8766"}).status_code == 200
     with TestClient(app, client=("172.30.80.20", 1234)) as client:
+        assert client.get("/api/camera/admin").status_code == 401
         client.post('/api/auth/login', json={'username': 'vps-admin', 'password': 'vps-test-password'},
                     headers={'X-IDI-Request': '1'})
-        assert client.get("/api/camera/admin").status_code == 403
+        assert client.get("/api/camera/admin").status_code == 200
     with TestClient(app, client=("203.0.113.5", 1234)) as client:
         assert client.get("/api/cases", headers={"X-Forwarded-For": "172.30.80.1"}).status_code == 403

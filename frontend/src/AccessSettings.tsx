@@ -6,6 +6,7 @@ import type { Person } from './Auth';
 import type { Notify, Project } from './types';
 import PlatformAccountSettings from './PlatformAccountSettings';
 import RecordPagination, { useRecordPage } from './RecordPagination';
+import FeishuIdentitySettings from './FeishuIdentitySettings';
 
 interface User extends Person { enabled: boolean }
 interface Operation {
@@ -77,6 +78,7 @@ export default function AccessSettings({ projects, notify, initialProjectId, foc
       <PlatformAccountSettings key={projectId} endpoint={`/api/access/project-accounts/${projectId}`} title="本项目官网写入账号" description="本项目所有人员的照片上传、资料修改、撤回和正式提交均使用此账号。首次配置会开启自动整理与官网草稿保存；以后可在自动上传设置中暂停。" refresh={refresh} notify={notify} registerLeave={noop} />
     </div>}
     <section className="settings-card"><h3>手机与人员绑定</h3><p>先建立人员账号并分配项目，再选择该人员生成手机配对码。停用人员或移除项目后，手机访问权限会立即变化。</p><div className="row"><a className="button" href="/camera-setup" target="_blank" rel="noreferrer">管理手机连接</a><a className="button" href="/camera/download">下载安卓 APP</a></div></section>
+    <FeishuIdentitySettings users={users.data || []} notify={notify} />
     <WebsiteOperations projectId={projectId} revision={revision} />
     {editing && <UserEditor user={editing === 'new' ? null : editing} close={() => setEditing(null)} saved={() => { refresh(); notify('人员账号已保存'); }} />}
   </div>;

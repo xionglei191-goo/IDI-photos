@@ -29,6 +29,9 @@ async function setup(page: Page, request: APIRequestContext, pending = false) {
   page.on('pageerror', error => errors.push(error.message));
   await page.route('**/api/workflow/uploads', route => route.fulfill({ json: status }));
   await page.route('**/api/platform/session', route => route.fulfill({ json: { connected: true, write_enabled: true, account: 'test' } }));
+  await page.route(`**/api/access/project-accounts/${project.id}`, route => route.fulfill({ json: {
+    configured: true, write_enabled: true, session: { connected: true, write_enabled: true, account: 'test' },
+  } }));
   await page.route('**/api/workflow/reviews/removal-review', route => route.fulfill({ json: review }));
   await page.route('**/api/workflow/reviews/*/confirm', route => {
     submissions.push(route.request().postDataJSON());
@@ -60,7 +63,7 @@ async function setup(page: Page, request: APIRequestContext, pending = false) {
     return route.fulfill({ json: record });
   });
   await page.goto('/');
-  await expect(page.getByRole('button', { name: '官网已连接', exact: true })).toBeVisible();
+  await expect(page.getByRole('region', { name: '拟提交事项', exact: true })).toBeVisible();
   return { item, plan, confirms, submissions, locals, reads, errors };
 }
 

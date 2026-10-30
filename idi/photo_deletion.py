@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 
 from .db import audit, dump, now
 from .domain import DomainError
@@ -16,14 +17,14 @@ def preview(domain, ids):
         for p in photos], 'total': len(photos)}
 
 
-def delete_photos(domain, ids, revisions=None):
+def delete_photos(domain, ids, revisions=None, *, connection=None, actor='local'):
     selected = set(ids)
     if revisions is not None and (not isinstance(revisions, dict) or set(revisions) != selected
             or any(type(v) is not int for v in revisions.values())):
         raise DomainError('照片版本信息不完整，请重新打开删除确认框')
     marks = ','.join('?' for _ in ids)
     stamp = now()
-    with domain.db.tx() as con:
+    with (domain.db.tx() if connection is None else nullcontext(connection)) as con:
         photos = [dict(row) for row in con.execute(f'SELECT * FROM photos WHERE id IN ({marks})', ids)]
         if len(photos) != len(ids):
             raise DomainError('部分照片已不存在，请刷新列表后重新选择', 409)
@@ -53,7 +54,7 @@ def delete_photos(domain, ids, revisions=None):
             sources = [dict(r) for r in con.execute('SELECT * FROM photo_sources WHERE photo_id=?', (photo['id'],))]
             recognitions = [dict(r) for r in con.execute('SELECT * FROM recognitions WHERE photo_id=?', (photo['id'],))]
             audit(con, 'photo', photo['id'], 'delete', {**photo, 'sources': sources, 'recognitions': recognitions},
-                  {'original_retained': True, 'reason': '用户删除不用的照片'})
+                  {'original_retained': True, 'reason': '用户删除不用的照片'}, actor=actor)
 
         # Preserve histories, but detach them from active photos and prevent old
         # import/message retries from bringing the removed record back.

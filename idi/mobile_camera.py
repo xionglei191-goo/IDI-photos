@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from .db import audit, dump, now, uid
+from .camera_capture_deletion import ensure_not_deleted
 from .domain import DomainError, GROUP_FIELDS, WORKFLOW_STAGES
 from .identity import current
 
@@ -209,6 +210,7 @@ class MobileCamera:
         case = self.domain.case(model.case_id)
         if case['project_id'] not in device['project_ids']:
             raise DomainError('这台手机没有该项目的上传权限', 403)
+        ensure_not_deleted(self.db, device['id'], model.capture_id)
         existing = self.db.one('SELECT * FROM camera_captures WHERE device_id=? AND capture_id=?', (device['id'], model.capture_id))
         if existing:
             return self.receipt(existing, request_hash, duplicate=True)
@@ -234,6 +236,7 @@ class MobileCamera:
                       'time_basis': 'device_capture', 'watermark_order': ['time', 'case_number', 'project', 'location', 'stage', 'content']}
         with self.db.tx() as con:
             # Recheck under the write lock: parallel requests return one receipt.
+            ensure_not_deleted(self.db, device['id'], model.capture_id, connection=con)
             if con.execute('SELECT 1 FROM camera_official_captures WHERE device_id=? AND capture_id=?', (device['id'], model.capture_id)).fetchone():
                 raise DomainError('拍摄编号已用于官方照片', 409)
             concurrent = con.execute('SELECT * FROM camera_captures WHERE device_id=? AND capture_id=?', (device['id'], model.capture_id)).fetchone()
