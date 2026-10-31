@@ -14,7 +14,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .db import audit, dump, now, uid
 from .domain import DomainError
-from .identity import Principal, current, require_admin, require_project
+from .identity import Principal, current, require_admin, require_project, require_case
 from .camera_timing import CameraTiming, SCOPE_KEY
 
 COOKIE = 'idi_session'
@@ -58,7 +58,11 @@ class Access:
             raise DomainError('人员账号已停用或不存在，请重新登录', 401)
         projects = {m['project_id']: m['role'] for m in self.db.all(
             'SELECT project_id,role FROM project_members WHERE user_id=?', (user_id,))}
-        return Principal(row['id'], row['username'], row['display_name'], row['system_role'], projects)
+        assigned = frozenset(m['case_id'] for m in self.db.all('''SELECT wa.case_id
+            FROM case_worker_assignments wa JOIN cases c ON c.id=wa.case_id AND c.project_id=wa.project_id
+            JOIN project_members pm ON pm.project_id=wa.project_id AND pm.user_id=wa.user_id
+            WHERE wa.user_id=? AND pm.role='worker' ''', (user_id,)))
+        return Principal(row['id'], row['username'], row['display_name'], row['system_role'], projects, assigned)
 
     def session(self, request):
         token = request.cookies.get(COOKIE, '')
@@ -102,6 +106,9 @@ class Access:
         return self.issue_session(user['id'], request, response)
 
     def users(self):
+        if current() and not current().admin:
+            from .project_people import ProjectPeople
+            return ProjectPeople(self.db).users()
         require_admin()
         rows = self.db.all('SELECT id,username,display_name,system_role,enabled,created_at,updated_at FROM idi_users ORDER BY created_at')
         for row in rows:
@@ -111,6 +118,9 @@ class Access:
         return rows
 
     def save_user(self, data, user_id=None, *, bootstrap=False):
+        if not bootstrap and current() and not current().admin:
+            from .project_people import ProjectPeople
+            return ProjectPeople(self.db).save_user(data, user_id)
         if not bootstrap:
             require_admin()
         existing = self.db.one('SELECT * FROM idi_users WHERE id=?', (user_id,)) if user_id else None
@@ -143,12 +153,15 @@ class Access:
                 con.execute('DELETE FROM idi_sessions WHERE user_id=?', (user_id,))
                 if data.get('password') or not enabled:
                     con.execute('UPDATE camera_devices SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL', (now(), user_id))
-                    con.execute('DELETE FROM camera_pairings WHERE user_id=? AND used_at IS NULL', (user_id,))
+                    con.execute('DELETE FROM camera_pairings WHERE (user_id=? OR issued_by=?) AND used_at IS NULL', (user_id, user_id))
             audit(con, 'idi_user', user_id, 'update' if existing else 'create',
                   after={'username': username, 'display_name': name, 'system_role': role, 'enabled': enabled})
         return {'id': user_id, 'username': username, 'display_name': name, 'system_role': role, 'enabled': enabled}
 
     def save_members(self, project_id, data):
+        if current() and not current().admin:
+            from .project_people import ProjectPeople
+            return ProjectPeople(self.db).save_members(project_id, data)
         require_admin()
         if not self.db.one('SELECT id FROM projects WHERE id=?', (project_id,)):
             raise DomainError('项目不存在', 404)
@@ -157,24 +170,33 @@ class Access:
             raise DomainError('项目人员列表无效')
         seen = set()
         for member in members:
-            if not isinstance(member, dict) or member.get('role') not in ('manager', 'member'):
-                raise DomainError('请选择项目管理员或项目成员')
+            if not isinstance(member, dict) or member.get('role') not in ('manager', 'member', 'worker'):
+                raise DomainError('请选择项目管理员、项目成员或工人')
             if member.get('user_id') in seen or not self.db.one('SELECT id FROM idi_users WHERE id=?', (member.get('user_id'),)):
                 raise DomainError('项目人员重复或不存在')
             seen.add(member['user_id'])
         with self.db.tx() as con:
+            before = {r['user_id']: r['role'] for r in con.execute('SELECT user_id,role FROM project_members WHERE project_id=?', (project_id,))}
             con.execute('DELETE FROM project_members WHERE project_id=?', (project_id,))
             con.executemany('INSERT INTO project_members VALUES(?,?,?,?,?)',
                             [(project_id, m['user_id'], m['role'], now(), now()) for m in members])
+            from .case_assignments import revoke_ineligible
+            revoke_ineligible(con, project_id)
+            from .project_people import invalidate_pairings
+            desired = {m['user_id']: m['role'] for m in members}
+            invalidate_pairings(con, project_id, {u for u in before.keys() | desired.keys() if before.get(u) != desired.get(u)})
             audit(con, 'project_members', project_id, 'replace', after=members)
         return {'project_id': project_id, 'members': members}
 
-    def resource(self, table, resource_id, *, manage=False):
+    def resource(self, table, resource_id, *, manage=False, assigned=False):
         # table is selected only by fixed route declarations below.
         row = self.db.one(f'SELECT project_id FROM {table} WHERE id=?', (resource_id,))
         if not row:
             raise DomainError('资料不存在', 404)
-        require_project(row['project_id'], manage=manage)
+        if table == 'cases' and assigned and not manage:
+            require_case(row['project_id'], resource_id)
+        else:
+            require_project(row['project_id'], manage=manage)
         return row['project_id']
 
     def upload_scope(self, project_id, case_id):
@@ -229,8 +251,8 @@ class Access:
         if not path.startswith('/api/'):
             if path == '/camera-setup':
                 person = self.session(request)
-                if not person.admin:
-                    raise DomainError('手机配对管理需要系统管理员权限', 403)
+                if not person.admin and 'manager' not in person.projects.values():
+                    raise DomainError('手机配对管理需要系统管理员或项目管理员权限', 403)
                 return person
             return None
         return self.session(request)
@@ -244,6 +266,34 @@ class Access:
         if path.startswith('/api/camera/') and hasattr(request.state, 'camera_device'):
             return
         if path in ('/api/auth/me', '/api/auth/logout', '/api/auth/password'):
+            return
+        if 'manager' in person.projects.values():
+            if path == '/camera-setup' and read:
+                return
+            if (path == '/api/access/users' and (read or method == 'POST')
+                    or re.fullmatch(r'/api/access/users/[^/]+', path) and method == 'PATCH'):
+                return  # ProjectPeople rechecks live role, every target and shared-account scope.
+            match = re.fullmatch(r'/api/access/projects/([^/]+)/members', path)
+            if match and method == 'PUT':
+                require_project(match[1], manage=True)
+                return
+            if (read and path in ('/api/camera/admin', '/api/camera/admin/official')
+                    or method == 'POST' and path == '/api/camera/admin/pairings'
+                    or method == 'DELETE' and re.fullmatch(r'/api/camera/admin/devices/[^/]+(?:/record)?', path)):
+                return  # Camera services validate project and bound-person scope.
+        if path == '/api/access/case-assignments' and method == 'POST':
+            return  # The transactional service checks every case and worker.
+        match = re.fullmatch(r'/api/access/projects/([^/]+)/workers', path)
+        if match and read:
+            require_project(match[1], manage=True)
+            return
+        match = re.fullmatch(r'/api/cases/([^/]+)/workers', path)
+        if match and read:
+            self.resource('cases', match[1], manage=True)
+            return
+        match = re.fullmatch(r'/api/cases/([^/]+)', path)
+        if match and read:
+            self.resource('cases', match[1], assigned=True)
             return
         if path.startswith('/api/workspace-chat') and (path == '/api/workspace-chat' or path.startswith('/api/workspace-chat/')):
             if 'manager' not in person.projects.values():
@@ -381,6 +431,8 @@ class Access:
 
 def access_routes(service):
     router = APIRouter()
+    from .case_assignments import worker_routes
+    router.include_router(worker_routes(service))
 
     @router.get('/api/auth/status')
     def status(request: Request):
@@ -423,7 +475,7 @@ def access_routes(service):
             con.execute('UPDATE idi_users SET password_hash=?,updated_at=? WHERE id=?', (encoded, now(), person.id))
             con.execute('DELETE FROM idi_sessions WHERE user_id=?', (person.id,))
             con.execute('UPDATE camera_devices SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL', (now(), person.id))
-            con.execute('DELETE FROM camera_pairings WHERE user_id=? AND used_at IS NULL', (person.id,))
+            con.execute('DELETE FROM camera_pairings WHERE (user_id=? OR issued_by=?) AND used_at IS NULL', (person.id, person.id))
             audit(con, 'idi_user', person.id, 'change_password')
         return service.issue_session(person.id, request, response)
 

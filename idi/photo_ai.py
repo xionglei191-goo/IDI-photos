@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from .db import dump, now, uid
 from .domain import DomainError
 from .model_runtime import ModelUnavailable, config_key
+from .background import background_work
 
 log = logging.getLogger(__name__)
 
@@ -23,8 +24,11 @@ class PhotoAI:
         self.db, self.domain, self.storage = db, domain, storage
         self.recognizer, self.followup = recognizer, followup
         self.runtime = recognizer.runtime
-        self._stop, self._wake, self._lock = threading.Event(), threading.Event(), threading.Lock()
+        self._stop, self._lock = threading.Event(), threading.Lock()
+        self._signal = db.runtime.watch('photo-ai', {'photo_ai_tasks': {'state', 'retry_at'},
+            'model_health': {'state', 'retry_at', 'probe_until'}, 'settings': None})
         self._thread = None
+        self._provider_due = 0
 
     def enqueue(self, kind, photo, signature, *, source='followup', source_id='', context=None, force=False, connection=None):
         config = self.db.setting('recognition', {})
@@ -38,7 +42,6 @@ class PhotoAI:
             con.execute('INSERT OR IGNORE INTO photo_ai_tasks(id,task_key,photo_id,kind,source,source_id,signature,config_key,context_json,deferred,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                         (job_id, key, photo['id'], kind, source, source_id, signature, config_key(config), dump(context), int(not self.runtime.status()['can_attempt']), stamp, stamp))
             row = dict(con.execute('SELECT * FROM photo_ai_tasks WHERE task_key=?', (key,)).fetchone())
-        self._wake.set()
         return row
 
     def quality(self, photo, case, signature, *, requested=False):
@@ -103,13 +106,18 @@ class PhotoAI:
             return self.enqueue(row['kind'], photo, row['signature'], source=row['source'], source_id=row['source_id'],
                                 context={**json.loads(row['context_json']), 'retry_of': job_id}, force=True, connection=con)
 
+    @background_work('photo_ai.run')
     def run_one(self):
         if self._stop.is_set() or not self._lock.acquire(blocking=False):
             return False
         try:
+            self._provider_due = 0
             # No per-photo HTTP probe and no new attempt while the provider is paused.
-            health = self.runtime.status()
             rows = self.db.all("SELECT * FROM photo_ai_tasks WHERE state IN ('queued','waiting') AND retry_at<=? ORDER BY created_at,id LIMIT 20", (self.runtime.clock(),))
+            if not rows:
+                self.db.runtime.count('photo_ai.run', 'empty_polls')
+                return False
+            health = self.runtime.status()
             for row in rows:
                 try:
                     photo, case = self.eligible(row)
@@ -120,13 +128,20 @@ class PhotoAI:
                     self._finish(row['id'], 'failed', error='已达到此资料版本的三次自动分析上限，请人工核对或重新发起')
                     continue
                 if not health['can_attempt']:
-                    with self.db.tx() as con:
-                        con.execute("UPDATE photo_ai_tasks SET deferred=1 WHERE state IN ('queued','waiting') AND deferred=0")
+                    if health['state'] in ('paused', 'probing'):
+                        recovery = self.db.one('SELECT retry_at,probe_until FROM model_health WHERE config_key=?',
+                                               (config_key(self.runtime.config()),))
+                        if recovery:
+                            self._provider_due = max(recovery['retry_at'], recovery['probe_until'])
+                    if any(not candidate['deferred'] for candidate in rows):
+                        with self.db.tx() as con:
+                            con.execute("UPDATE photo_ai_tasks SET deferred=1 WHERE state IN ('queued','waiting') AND deferred=0")
                     return False
                 with self.db.tx() as con:
                     changed = con.execute("UPDATE photo_ai_tasks SET state='running',updated_at=? WHERE id=? AND state IN ('queued','waiting')", (now(), row['id']))
                 if not changed.rowcount:
                     continue
+                self.db.runtime.queue_delay('photo_ai.run', row['created_at'])
                 self._execute(row, photo, case)
                 return True
             return False
@@ -187,16 +202,24 @@ class PhotoAI:
 
     def stop(self):
         self._stop.set()
-        self._wake.set()
+        self._signal.wake(False)
         if self._thread:
             self._thread.join(timeout=2)
 
+    def next_delay(self):
+        current = self.runtime.clock()
+        row = self.db.one("SELECT MIN(retry_at) AS due FROM photo_ai_tasks WHERE state IN ('queued','waiting') AND retry_at>?", (current,))
+        deadlines = [value - current for value in (row['due'], self._provider_due) if value and value > current]
+        return max(.05, min(15, *deadlines)) if deadlines else 15
+
     def _loop(self):
         while not self._stop.is_set():
+            observed = self._signal.token()
+            delay = 15
             try:
                 if self.run_one():
                     continue
+                delay = self.next_delay()
             except Exception:
                 log.exception('Photo AI queue failed')
-            self._wake.wait(2)
-            self._wake.clear()
+            self.db.runtime.wait('photo_ai.run', self._signal, observed, delay, self._stop)

@@ -2,20 +2,30 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
-    <application android:label="IDI 水印相机" android:theme="@style/AppTheme"
+    <application android:name=".CameraApplication" android:label="IDI 水印相机" android:theme="@style/AppTheme"
         android:icon="@drawable/ic_launcher" android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:supportsRtl="true" android:usesCleartextTraffic="true">
+        <provider android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup" tools:node="merge">
+            <meta-data android:name="androidx.work.WorkManagerInitializer" tools:node="remove" />
+        </provider>
+        <service android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync" tools:node="merge" />
         <activity android:name=".NativeCameraActivity" android:exported="false"
-            android:screenOrientation="sensorPortrait" android:configChanges="orientation|screenSize|keyboardHidden" />
+            android:theme="@style/CameraCoordinatorTheme"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
         <activity android:name=".EditableCameraActivity" android:exported="false"
             android:screenOrientation="sensorPortrait" android:configChanges="orientation|screenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize"
-            android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+            android:theme="@style/CameraPreviewTheme" />
         <activity android:name="com.xhey.xheycamerasdk.CameraActivity" android:exported="false"
             android:screenOrientation="sensorPortrait" android:configChanges="orientation|screenSize|keyboardHidden"
             android:theme="@android:style/Theme.Material.Light.NoActionBar" />

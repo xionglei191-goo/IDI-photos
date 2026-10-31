@@ -1,0 +1,95 @@
+import { test, expect } from '@playwright/test';
+import { mkdir } from 'node:fs/promises';
+import path from 'node:path';
+
+const headers = { 'X-IDI-Request': '1' }, password = 'isolated-project-people-password';
+const out = path.resolve('..', 'artifacts', 'project-manager-people-20261031');
+
+test('project manager manages lower personnel and pairs a project-scoped worker phone', async ({ page, request }) => {
+  const auth = await (await request.get('/api/auth/status')).json();
+  if (auth.setup_required) expect((await request.post('/api/auth/setup', { headers, data: { username: 'camera-ui-admin', display_name: '相机测试管理员', password: 'isolated-camera-ui-password' } })).ok()).toBeTruthy();
+  else expect((await request.post('/api/auth/login', { headers, data: { username: 'camera-ui-admin', password: 'isolated-camera-ui-password' } })).ok()).toBeTruthy();
+  async function create(url: string, data: object) {
+    const response = await request.post(url, { headers, data });
+    expect(response.ok(), await response.text()).toBeTruthy(); return response.json();
+  }
+  const own = await create('/api/projects', { name: '项目人员管理验收' });
+  const other = await create('/api/projects', { name: '仅参与不可管理项目' });
+  const manager = await create('/api/access/users', { username: 'people-manager', display_name: '项目负责人', password });
+  const shared = await create('/api/access/users', { username: 'shared-person', display_name: '跨项目人员', password });
+  const outsider = await create('/api/access/users', { username: 'other-person', display_name: '外部项目人员', password });
+  for (const [project, members] of [[own, [{ user_id: manager.id, role: 'manager' }, { user_id: shared.id, role: 'worker' }]],
+    [other, [{ user_id: manager.id, role: 'member' }, { user_id: shared.id, role: 'member' }, { user_id: outsider.id, role: 'worker' }]]] as const)
+    expect((await request.put(`/api/access/projects/${project.id}/members`, { headers, data: { members } })).ok()).toBeTruthy();
+  const errors: string[] = [], failures: string[] = [];
+  page.on('pageerror', e => errors.push(e.message));
+  page.on('response', r => { if (r.url().includes('/api/') && r.status() >= 400 && !r.url().endsWith('/auth/me')) failures.push(`${r.status()} ${r.url()}`); });
+  await page.goto('/');
+  await page.getByLabel('人员账号', { exact: true }).fill(manager.username);
+  await page.getByLabel('密码', { exact: true }).fill(password);
+  await page.getByRole('button', { name: '登录', exact: true }).click();
+  await page.getByRole('button', { name: '系统设置', exact: true }).click();
+  await page.getByRole('navigation', { name: '设置分类' }).getByRole('button', { name: '人员与权限', exact: true }).click();
+  const config = page.getByRole('region', { name: '项目人员配置', exact: true });
+  await expect(config.getByLabel('选择项目').locator('option')).toHaveCount(2); // placeholder and managed project
+  await expect(config.getByLabel('选择项目')).toHaveValue(own.id);
+  const accounts = page.getByRole('region', { name: '人员账号', exact: true });
+  await expect(accounts).not.toContainText(outsider.display_name);
+  await expect(accounts.getByRole('row').filter({ hasText: shared.display_name }).getByRole('button', { name: '编辑 / 重设密码' })).toBeDisabled();
+  await accounts.getByRole('button', { name: '添加人员', exact: true }).click();
+  let dialog = page.getByRole('dialog');
+  await expect(dialog.getByLabel('系统角色')).toHaveCount(0);
+  await dialog.getByLabel('姓名', { exact: true }).fill('现场王师傅');
+  await dialog.getByLabel('登录账号', { exact: true }).fill('new-project-worker');
+  await dialog.getByLabel('初始密码', { exact: true }).fill(password);
+  await expect(dialog.getByLabel('项目角色')).toHaveValue('worker');
+  await dialog.getByRole('button', { name: '保存人员账号', exact: true }).click();
+  await expect(dialog).toBeHidden();
+  const local = accounts.getByRole('row').filter({ hasText: 'new-project-worker' });
+  await expect(local).toContainText('现场王师傅');
+  await expect(config.getByLabel('现场王师傅的项目权限').locator('option[value=manager]')).toHaveCount(0);
+  await config.getByLabel('现场王师傅的项目权限').selectOption('member');
+  await config.getByRole('button', { name: '保存项目人员权限', exact: true }).click();
+  await expect(config.getByRole('button', { name: '保存项目人员权限', exact: true })).toBeEnabled();
+  await expect(config.getByLabel('现场王师傅的项目权限')).toHaveValue('member');
+  await config.getByLabel('现场王师傅的项目权限').selectOption('worker');
+  await config.getByRole('button', { name: '保存项目人员权限', exact: true }).click();
+  await expect(config.getByRole('button', { name: '保存项目人员权限', exact: true })).toBeEnabled();
+  await local.getByRole('button', { name: '编辑 / 重设密码', exact: true }).click();
+  dialog = page.getByRole('dialog');
+  await dialog.getByLabel('姓名', { exact: true }).fill('现场王师傅（已核对）');
+  await dialog.getByRole('button', { name: '保存人员账号', exact: true }).click();
+  await expect(local).toContainText('现场王师傅（已核对）');
+  await mkdir(out, { recursive: true });
+  await page.screenshot({ path: path.join(out, 'manager-personnel.png'), fullPage: true });
+  const popupPromise = page.waitForEvent('popup');
+  await page.getByRole('link', { name: '管理手机连接', exact: true }).click();
+  const camera = await popupPromise;
+  camera.on('pageerror', e => errors.push(e.message));
+  camera.on('response', r => { if (r.url().includes('/api/') && r.status() >= 400) failures.push(`${r.status()} ${r.url()}`); });
+  const rows = await (await page.request.get('/api/access/users')).json();
+  const worker = rows.find((u: { username: string }) => u.username === 'new-project-worker');
+  await camera.getByLabel('绑定人员', { exact: true }).selectOption(worker.id);
+  await camera.getByLabel('设备名称', { exact: true }).fill('王师傅现场手机');
+  await expect(camera.locator('#projects input')).toHaveCount(1);
+  await expect(camera.locator('#projects input')).toBeChecked();
+  await expect(camera.locator('#official-form')).toBeHidden();
+  await expect(camera.getByRole('button', { name: '刷新拍摄记录' })).toBeVisible();
+  await camera.getByRole('button', { name: '生成配对码', exact: true }).click();
+  await expect(camera.locator('#code')).toHaveText(/^[A-Z2-9]{10}$/);
+  const code = await camera.locator('#code').innerText();
+  const paired = await create('/api/camera/pair', { code });
+  expect(paired.user_id).toBe(worker.id);
+  const phoneCases = await request.get('/api/camera/cases', { headers: { Authorization: `Bearer ${paired.token}` } });
+  expect((await phoneCases.json()).items).toEqual([]);
+  await camera.reload();
+  await expect(camera.locator('#devices')).toContainText('王师傅现场手机');
+  await camera.screenshot({ path: path.join(out, 'manager-phone-connections.png'), fullPage: true });
+  await camera.locator('#devices .device').filter({ hasText: '王师傅现场手机' }).getByRole('button', { name: '停用连接', exact: true }).click();
+  await expect(camera.locator('#devices')).toContainText('已停用');
+  camera.once('dialog', d => d.accept());
+  await camera.locator('#devices .device').filter({ hasText: '王师傅现场手机' }).getByRole('button', { name: '删除', exact: true }).click();
+  await expect(camera.locator('#devices')).not.toContainText('王师傅现场手机');
+  await camera.close();
+  expect(errors).toEqual([]); expect(failures).toEqual([]);
+});

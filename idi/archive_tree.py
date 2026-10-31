@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 from .db import Database, dump, now, uid
 from .domain import DomainError
 from .storage import Storage, safe_name
+from .background import background_work
 
 log = logging.getLogger(__name__)
 TREE_STAGES = {"unknown": "待分类", "survey": "查勘", "work": "施工", "acceptance": "完工"}
@@ -74,6 +75,12 @@ class ArchiveTree:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
+        # Trigger source tables are watched because SQLite trigger bodies do not
+        # pass through the application's committed-write observer.
+        self._signal = db.runtime.watch('archive-tree', {**dict.fromkeys((
+            'projects', 'cases', 'photos', 'photo_sources', 'packages', 'package_events', 'platform_packages')),
+            'archive_tree_state': {'revision'}})
+        self._first, self._last_scan, self._retry_after = True, 0.0, 0.0
 
     def status(self):
         value = self.db.one("SELECT * FROM archive_tree_state WHERE id=1")
@@ -182,7 +189,7 @@ class ArchiveTree:
         with self.db.tx() as con:
             con.execute("INSERT OR IGNORE INTO archive_tree_entries(path,entry_key,kind,created_at) VALUES(?,?,'directory',?)", (relative, "directory:" + relative, now()))
 
-    def _file(self, relative, wanted, old, force):
+    def _file(self, relative, wanted, old, force, updates=None):
         target = self._path(relative)
         if target.exists() and (not old or old["kind"] != "file" or old["entry_key"] != wanted["entry_key"]):
             raise ValueError("目标位置已有非系统文件，已保留，请移开后重试")
@@ -226,9 +233,16 @@ class ArchiveTree:
                 stat = target.stat()
             finally:
                 temp.unlink(missing_ok=True)
-        with self.db.tx() as con:
-            con.execute("UPDATE archive_tree_entries SET hash=?,size_bytes=?,mtime_ns=? WHERE path=?", (wanted["hash"], stat.st_size, stat.st_mtime_ns, relative))
+        if old and (old['hash'], old['size_bytes'], old['mtime_ns']) == (wanted['hash'], stat.st_size, stat.st_mtime_ns):
+            return
+        values = (wanted['hash'], stat.st_size, stat.st_mtime_ns, relative)
+        if updates is not None:
+            updates.append(values)
+        else:
+            with self.db.tx() as con:
+                con.execute("UPDATE archive_tree_entries SET hash=?,size_bytes=?,mtime_ns=? WHERE path=?", values)
 
+    @background_work('archive.sync')
     def sync(self, force=False, progress=None):
         with self._lock:
             with self.db.tx() as con:
@@ -245,15 +259,20 @@ class ArchiveTree:
                         self._directory(directory, old_by_key.get(self._key(directory)))
                     except (OSError, ValueError) as error:
                         errors.append({"path": directory, "error": str(error)})
-                completed = set()
+                completed, updates = set(), []
                 for index, (relative, wanted) in enumerate(files.items(), 1):
                     try:
-                        self._file(relative, wanted, old_by_key.get(self._key(relative)), force)
+                        self._file(relative, wanted, old_by_key.get(self._key(relative)), force, updates)
                         completed.add(wanted["entry_key"])
                     except (OSError, ValueError) as error:
                         errors.append({"path": relative, "error": str(error)})
                     if progress:
                         progress(index, len(files))
+                # File ownership is still persisted before publication. Only
+                # verified stat metadata is batched, without a write lock over IO.
+                if updates:
+                    with self.db.tx() as con:
+                        con.executemany("UPDATE archive_tree_entries SET hash=?,size_bytes=?,mtime_ns=? WHERE path=?", updates)
                 expected_keys = {wanted["entry_key"] for wanted in files.values()}
                 # Never remove an old location until its replacement has been verified.
                 for relative, entry in sorted(old.items(), key=lambda item: -item[0].count("/")):
@@ -310,24 +329,46 @@ class ArchiveTree:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._first, self._last_scan, self._retry_after = True, 0.0, 0.0
         self._thread = threading.Thread(target=self._loop, name="idi-archive-tree", daemon=True)
         self._thread.start()
 
     def stop(self):
         self._stop.set()
+        self._signal.wake(False)
         if self._thread:
             self._thread.join(timeout=10)
 
+    def background_sync(self, force=False):
+        with self.db.runtime.slot('archive.sync') as acquired:
+            return self.sync(force=force) if acquired else None
+
+    @background_work('archive.poll')
+    def run_once(self):
+        current = time.monotonic()
+        if current < self._retry_after:
+            return min(15, self._retry_after - current)
+        due = self._first or current - self._last_scan >= 60
+        if not due:
+            row = self.db.one('SELECT revision,synced_revision FROM archive_tree_state WHERE id=1')
+            due = row['revision'] != row['synced_revision']
+        if due:
+            result = self.background_sync(force=self._first)
+            if result is None:
+                return 1
+            self._first, self._last_scan = False, time.monotonic()
+            self._retry_after = self._last_scan + (30 if result['error_count'] else 0)
+        else:
+            self.db.runtime.count('archive.poll', 'empty_polls')
+        return min(15, max(.05, self._last_scan + 60 - time.monotonic()))
+
     def _loop(self):
-        first, last_scan, retry_after = True, 0.0, 0.0
         while not self._stop.is_set():
+            observed = self._signal.token()
             try:
-                current = time.monotonic()
-                if current >= retry_after and (first or self.status()["pending"] or current - last_scan >= 60):
-                    result = self.sync(force=first)
-                    first, last_scan = False, time.monotonic()
-                    retry_after = last_scan + (30 if result["error_count"] else 0)
+                delay = self.run_once()
             except Exception:
                 log.exception("Archive directory background worker failed")
-                retry_after = time.monotonic() + 30
-            self._stop.wait(1)
+                self._retry_after = time.monotonic() + 30
+                delay = 15
+            self.db.runtime.wait('archive.poll', self._signal, observed, delay, self._stop)

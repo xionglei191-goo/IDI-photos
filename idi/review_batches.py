@@ -9,6 +9,7 @@ from .db import audit, dump, now, uid
 from .domain import DomainError
 from .platform_contract import VERSION
 from .platform_client import PlatformWriteError
+from .platform_photos import attachment_version_data
 from .stage_access import stage_access
 from .project_accounts import scoped_case, scoped_record
 
@@ -71,7 +72,7 @@ class ReviewBatches:
         identity = {k: case[k] for k in ('id', 'short_code', 'platform_report_code', 'report_number', 'policy_number', 'workflow_stage')}
         fingerprint_data = {'contract': VERSION, 'case': identity, 'stage': stage,
                             'business_fields': plan['business_fields'], 'files': selected,
-                            'existing_files': {f['key']: f['existing'] for f in plan['file_fields']},
+                            'existing_files': {f['key']: attachment_version_data(f['existing']) for f in plan['file_fields']},
                             'draft_revision': plan['draft']['revision'], 'target': plan['link']['report_receiving_id'],
                             'link_revision': plan['link']['revision']}
         if getattr(self.platform, 'project_accounts', None):
@@ -290,6 +291,9 @@ class ReviewBatches:
             fresh_plan, fresh_fingerprint = self.snapshot(record['case_id'], record['stage'], save_only=save_only)
             if fresh_fingerprint != fingerprint:
                 raise DomainError('官网最新资料发生变化，请重新审核后提交', 409)
+            # Keep the latest attachment metadata in the outgoing payload even
+            # when only updateTime changed and the approved content is identical.
+            plan = fresh_plan
             reused = self._verified_uploads(fresh_plan)
             uploaded = {**reused, **uploaded}
             for field in plan['file_fields']:

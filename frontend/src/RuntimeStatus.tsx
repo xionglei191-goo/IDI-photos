@@ -4,6 +4,7 @@ import { Activity, RefreshCw } from 'lucide-react';
 import { api, message, post, put } from './api';
 import { dateTime, ErrorBox, PHOTO_GROUPS, ROLES, STAGES } from './common';
 import type { Photo } from './types';
+import type { PlatformConnectionIssue } from './platformTypes';
 import './runtime-status.css';
 
 export const AI_STATES: Record<string, string> = { queued: 'AI 已排队', waiting: 'AI 暂缓', running: 'AI 分析中', completed: 'AI 分析完成', failed: 'AI 待人工处理', stale: '资料已变更', cancelled: 'AI 已停止' };
@@ -15,6 +16,7 @@ interface Runtime {
   policy: { rules_enabled: boolean; auto_drafts: boolean };
   ocr: { enabled: boolean; installed: boolean; latest: { state: string; error: string | null; created_at: string } | null; pending: number };
   platform: { connected: boolean }; sync: { schedule: { last_success: { completed_at?: string } | null } };
+  connection_issues?: PlatformConnectionIssue[];
   channels: { id: string; name: string; enabled: boolean; state: string; error: string | null; last_saved: string | null; counts: { pending: number; failed: number } }[];
   attachments_pending: number; ai_queue: Record<string, number>;
   ai_tasks: { id: string; photo_id: string; kind: string; state: string; attempts: number; error: string | null; short_code: string | null }[];
@@ -41,7 +43,7 @@ function AutomaticSaveStatus({ openDetails }: { openDetails?: () => void }) {
   return <button className={`runtime-save-state${error ? ' needs-attention' : ''}`} aria-label="查看自动保存状态" title={detail} onClick={openDetails}><span>自动保存：{label}</span></button>;
 }
 
-export default function RuntimeStatus({ login, settings, channels, mode = 'details', openDetails, openUploads }: { login: () => void; settings: () => void; channels: () => void; mode?: 'summary' | 'details' | 'policy'; openDetails?: () => void; openUploads?: () => void }) {
+export default function RuntimeStatus({ login, settings, channels, mode = 'details', openDetails, openUploads, openAccount }: { login: () => void; settings: () => void; channels: () => void; mode?: 'summary' | 'details' | 'policy'; openDetails?: () => void; openUploads?: () => void; openAccount?: (projectId: string | null) => void }) {
   const { isAdmin } = usePermissions();
   const [data, setData] = useState<Runtime | null>(null), [error, setError] = useState(''), [busy, setBusy] = useState(false), [notice, setNotice] = useState('');
   async function load() { const next = await api<Runtime>('/api/operations'); setData(next); setError(''); }
@@ -58,7 +60,18 @@ export default function RuntimeStatus({ login, settings, channels, mode = 'detai
   }
   const queue = data?.ai_queue || {}, waiting = (queue.queued || 0) + (queue.waiting || 0) + (queue.running || 0);
   const capture = data?.channels.filter(c => c.enabled) || [], failed = capture.filter(c => c.error).length;
-  const needsAttention = !!error || !!data && (data.storage.state !== 'available' || !data.worker_enabled || ['degraded', 'paused', 'configuration_error'].includes(data.model.state) || data.ocr.latest?.state === 'failed' || failed > 0 || data.attachments_pending > 0 || (queue.failed || 0) > 0);
+  const connectionIssues = data?.connection_issues || [];
+  const needsAttention = !!error || connectionIssues.length > 0 || !!data && (data.storage.state !== 'available' || !data.worker_enabled || ['degraded', 'paused', 'configuration_error'].includes(data.model.state) || data.ocr.latest?.state === 'failed' || failed > 0 || data.attachments_pending > 0 || (queue.failed || 0) > 0);
+  const connectionAlerts = connectionIssues.length > 0 && <div className="runtime-connection-alerts" role="status" aria-label="官网连接提醒">
+    <strong>官网连接有待处理事项 · {connectionIssues.length} 项</strong>
+    <ul>{connectionIssues.map(issue => <li key={issue.project_id || 'company'}>
+      <div><strong>{issue.name} · {issue.state === 'retry_wait' ? '等待自动重试' : '需要处理'}</strong><p>{issue.error}</p>
+        {issue.next_retry_at && <small>下次重试：{dateTime(issue.next_retry_at)}</small>}
+        {issue.blocked_at && <small>暂停于 {dateTime(issue.blocked_at)}</small>}
+      </div>
+      {isAdmin && openAccount ? <button aria-label={`处理连接 · ${issue.name}`} onClick={() => openAccount(issue.project_id)}>处理连接</button> : <small>请联系系统管理员处理</small>}
+    </li>)}</ul>
+  </div>;
   const overview = data ? <>
     <span>资料存储：{data.storage.state === 'available' ? '可用' : '需处理'}</span>
     <span>本地 OCR：{!data.ocr.enabled ? '已关闭' : !data.ocr.installed ? '未安装' : data.ocr.latest?.state === 'failed' ? '最近识别失败' : data.ocr.latest ? '最近识别成功' : '待首次识别'}</span>
@@ -69,11 +82,12 @@ export default function RuntimeStatus({ login, settings, channels, mode = 'detai
   if (mode === 'summary') return <section className="runtime-status runtime-status-strip" aria-label="运行状态"><div className="runtime-summary">
     <button className={`runtime-heading${needsAttention ? ' needs-attention' : ''}`} aria-label={needsAttention ? '查看运行状态，有待处理事项' : '查看运行状态'} title="查看运行详情" onClick={openDetails}><Activity size={16} aria-hidden="true" /><strong>运行状态</strong></button>
     <div className="runtime-overview">{overview}<AutomaticSaveStatus openDetails={openUploads || openDetails} /></div>
-  </div></section>;
+  </div>{connectionAlerts}</section>;
   if (mode === 'policy') return <section className="settings-card" aria-label="资料整理设置"><h3>照片归档后自动整理</h3><p>按已核实的编号、归属和照片用途处理，保留人工修改和排除记录。</p>{data ? <div className="runtime-switches"><label><input type="checkbox" checked={data.policy.rules_enabled} disabled={busy || !isAdmin} onChange={e => void act('/api/operations/policy', '规则整理开关已保存。', { rules_enabled: e.target.checked })} />自动规则整理</label><label><input type="checkbox" checked={data.policy.auto_drafts} disabled={busy || !isAdmin} onChange={e => void act('/api/operations/policy', '自动准备草稿开关已保存。', { auto_drafts: e.target.checked })} />明确资料自动准备草稿</label></div> : <p>正在读取设置…</p>}{notice && <p role="status">{notice}</p>}<ErrorBox error={error} /></section>;
   return <section className="runtime-status" aria-label="运行详情">
     <div className="runtime-summary"><Activity size={16} aria-hidden="true" /><strong>运行概况</strong><span className="runtime-overview">{overview}</span></div>
     <div className="runtime-content">
+      {connectionAlerts}
       {!data?.worker_enabled && data && <p className="notice">后台处理当前未启用，队列不会自动执行。</p>}
       {data && <><p>资料接收、规则整理与 AI 分析分别运行。附件待下载或失败 {data.attachments_pending} 项；分析记录已完成 {queue.completed || 0} 项、待人工处理 {queue.failed || 0} 项。</p>
         <div className="runtime-grid"><section><h3>模型与恢复</h3><p>{data.model.error || '未发出额外健康探测。有效响应表示结构检查通过，识别内容仍需核对。'}</p>

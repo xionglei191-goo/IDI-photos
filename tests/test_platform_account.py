@@ -397,3 +397,114 @@ def test_account_mutations_keep_existing_origin_boundary(account, client):
     data = {'username': USER, 'password': PASSWORD, 'auto_connect': False}
     response = client.put('/api/platform/account', json=data, headers={'Origin': 'https://untrusted.example'})
     assert response.status_code == 403 and not account.store.path.exists()
+
+
+@pytest.mark.parametrize('failure,status', [('token_missing', 504), ('browser_unavailable', 503),
+                                         ('login_response_error', 502), ('timeout', 504), ('rate_limited', 429)])
+def test_bounded_retry_budget_survives_restart_and_manual_retry_resets_it(account, monkeypatch, failure, status):
+    from idi.platform_account import MAX_ATTEMPTS, RETRY_DELAYS
+    restored = configured(account)
+    current = datetime(2026, 10, 30, 12, tzinfo=timezone.utc)
+    calls = fake_login(restored, monkeypatch, PlatformLoginError('upstream ' + PASSWORD, status,
+                       failure=failure, phase='token_response', http_status=200, business_code=500))
+    for index in range(MAX_ATTEMPTS):
+        restored = PlatformAccount(restored.platform, restored.store.path.parent.parent)
+        restored.clock = lambda: current
+        restored.tick()
+        value = restored.status()
+        assert len(calls) == index + 1 and value['failures'] == index + 1
+        assert value['diagnostics'] == {'failure': failure, 'phase': 'token_response', 'status': status,
+                                        'http_status': 200, 'business_code': 500}
+        assert PASSWORD not in json.dumps(value) and PASSWORD not in json.dumps(restored.db.setting(restored.state_key))
+        if index < len(RETRY_DELAYS):
+            assert datetime.fromisoformat(value['next_retry_at']) == current + timedelta(seconds=RETRY_DELAYS[index])
+            current += timedelta(seconds=RETRY_DELAYS[index] - 1)
+            restored.tick()
+            assert len(calls) == index + 1
+            current += timedelta(seconds=1)
+    assert value['state'] == 'needs_attention' and value['blocked_reason'] == 'retry_limit'
+    assert value['blocked_at'] and value['first_failure_at'] and value['next_retry_at'] is None
+    current += timedelta(days=3)
+    restarted = PlatformAccount(restored.platform, restored.store.path.parent.parent)
+    restarted.clock = lambda: current
+    restarted.tick()
+    assert len(calls) == MAX_ATTEMPTS
+    restarted.request_connect()
+    restarted._attempt_thread.join(2)
+    assert len(calls) == MAX_ATTEMPTS + 1 and restarted.status()['failures'] == 1
+    assert restarted.status()['state'] == 'retry_wait'
+    good = fake_login(restarted, monkeypatch)
+    current += timedelta(seconds=60)
+    restarted.tick()
+    value = restarted.status()
+    assert len(good) == 1 and value['state'] == 'connected' and value['failures'] == 0
+    assert value['diagnostics'] == {} and value['blocked_at'] is None and value['first_failure_at'] is None
+
+
+def test_old_unclassified_pause_is_visible_but_never_silently_unblocked(account, monkeypatch):
+    restored = configured(account)
+    restored._state = {'blocked': True, 'failures': 1, 'last_attempt_at': '2026-10-29T04:37:05+08:00',
+                       'error': 'old generic message'}
+    restored._persist()
+    restarted = PlatformAccount(restored.platform, restored.store.path.parent.parent)
+    calls = fake_login(restarted, monkeypatch)
+    restarted.tick()
+    value = restarted.status()
+    assert not calls and value['state'] == 'needs_attention'
+    assert value['blocked_reason'] == 'legacy_unknown' and '缺少具体原因' in value['error']
+    assert value['blocked_at'] == '2026-10-29T04:37:05+08:00'
+
+
+def test_shutdown_does_not_consume_a_retry_or_leave_a_false_pause(account, monkeypatch):
+    restored = configured(account)
+    def shutdown(username, password):
+        restored._stop.set()
+        raise PlatformLoginError('interrupted ' + PASSWORD, 503, failure='browser_unavailable')
+    monkeypatch.setattr(restored.client, 'login', shutdown)
+    restored.tick()
+    assert restored.status()['failures'] == 0 and not restored._gate.locked()
+    restarted = PlatformAccount(restored.platform, restored.store.path.parent.parent)
+    calls = fake_login(restarted, monkeypatch)
+    restarted.tick()
+    assert len(calls) == 1 and restarted.status()['state'] == 'connected'
+
+
+def test_disabled_auto_connect_never_schedules_a_retry(account, monkeypatch):
+    restored = configured(account, enabled=False)
+    calls = fake_login(restored, monkeypatch, PlatformLoginError('temporary', 504, failure='token_missing'))
+    restored.request_connect()
+    restored._attempt_thread.join(2)
+    assert len(calls) == 1 and restored.status()['next_retry_at'] is None
+    assert restored.db.setting(restored.state_key)['next_retry_at'] is None
+    restored.tick()
+    assert len(calls) == 1
+
+
+def test_connection_alerts_are_project_scoped_secret_free_and_clear_on_recovery(account, client, services, project):
+    from idi.identity import Principal, acting_as
+    accounts = services['project_accounts']
+    other = services['domain'].save_project({'name': '不可见项目'})
+    def failed(value):
+        value._config = dict(username='private-login-name', password=PASSWORD, auto_connect=True, revision='test')
+        value._state = {'blocked': True, 'failures': 1, 'last_attempt_at': '2026-10-29T20:37:05+00:00'}
+    failed(accounts.company)
+    for row in (project, other):
+        with services['db'].tx() as con:
+            con.execute('INSERT INTO project_website_accounts VALUES(?,?,?)', (row['id'], 1, '2026-10-30T00:00:00Z'))
+        failed(accounts.account(row['id']))
+    before = services['db'].all('SELECT * FROM settings')
+    result = client.get('/api/operations').json()['connection_issues']
+    assert {v['project_id'] for v in result} == {None, project['id'], other['id']}
+    assert PASSWORD not in json.dumps(result) and 'private-login-name' not in json.dumps(result)
+    assert all(v['blocked_reason'] == 'legacy_unknown' for v in result)
+    with acting_as(Principal('worker', 'worker', '员工', 'user', {project['id']: 'member'})):
+        assert [v['project_id'] for v in services['operations'].status()['connection_issues']] == [project['id']]
+    with acting_as(Principal('worker', 'worker', '员工', 'user', {})):
+        assert services['operations'].status()['connection_issues'] == []
+    assert services['db'].all('SELECT * FROM settings') == before
+    a = accounts.account(project['id'])
+    a._success()
+    a.client._token, a.client._account = 'isolated-token', 'private-login-name'
+    assert project['id'] not in [v['project_id'] for v in accounts.connection_issues()]
+    accounts.account(other['id'])._config['auto_connect'] = False
+    assert [v['project_id'] for v in accounts.connection_issues()] == [None]

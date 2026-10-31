@@ -14,13 +14,18 @@ function OnlineCount({ value, label }: { value?: OnlinePhotoCount; label: string
   </div>;
 }
 
-export default function WorkBoardTable({ items, openCase, showPhotos }: {
+import usePermissions from './usePermissions';
+import { WorkerNames } from './CaseWorkers';
+
+export default function WorkBoardTable({ items, openCase, showPhotos, selected = [], selectCase, assign }: {
+  selected?: string[]; selectCase?: (value: Case, checked: boolean) => void; assign?: (value: Case) => void;
   items: BoardCase[]; openCase: (value: Case) => void; showPhotos: (caseId: string, group?: string) => void;
 }) {
+  const { canManage } = usePermissions();
   return <table className="board-table work-board-table" aria-label="查勘维修官网与本地照片对照">
     <thead>
       <tr>
-        <th rowSpan={2} scope="col">案件编号 / 项目</th><th rowSpan={2} scope="col" className="report-date-cell">报修日期</th><th rowSpan={2} scope="col">报修问题</th><th rowSpan={2} scope="col">当前进度</th>
+        <th rowSpan={2} scope="col">选择</th><th rowSpan={2} scope="col">案件编号 / 项目</th><th rowSpan={2} scope="col">关联工人</th><th rowSpan={2} scope="col" className="report-date-cell">报修日期</th><th rowSpan={2} scope="col">报修问题</th><th rowSpan={2} scope="col">当前进度</th>
         <th rowSpan={2} scope="col" className="photo-source-heading">来源</th><th colSpan={5} scope="colgroup" className="photo-count-heading">照片数量</th>
         <th rowSpan={2} scope="col" title="本地草稿与官网已有资料的准备核对">平台准备</th><th rowSpan={2} scope="col">保司资料</th><th rowSpan={2} scope="col">下一步</th>
       </tr>
@@ -28,7 +33,9 @@ export default function WorkBoardTable({ items, openCase, showPhotos }: {
     </thead>
     {items.map(c => <tbody className="case-photo-group" key={c.id} data-case-id={c.id}>
       <tr data-photo-source="official">
+        <td rowSpan={2} className="worker-select-cell">{selectCase && canManage(c.project_id) && <input type="checkbox" aria-label={`选择案件 ${c.short_code || c.title}`} checked={selected.includes(c.id)} onChange={e => selectCase(c, e.target.checked)} />}</td>
         <td rowSpan={2}><button className="case-link case-main-code" title={c.platform_report_code || ''} onClick={() => openCase(c)}>{c.platform_report_code || '报修编号待关联'}</button><small className="short-code" title={`短编号：${c.short_code || '待补'}`}>{c.short_code || '短编号待补'}</small><small>{c.project_name} · {place(c)}</small></td>
+        <td rowSpan={2} className="worker-table-cell"><WorkerNames value={c} />{assign && canManage(c.project_id) && <button className="text-button" onClick={() => assign(c)}>分配工人</button>}</td>
         <td rowSpan={2} className="report-date-cell">{c.report_date || '—'}</td>
         <td rowSpan={2} className="issue-cell" title={c.title}>{c.title}{c.responsible && <small>负责人：{c.responsible}</small>}</td>
         <td rowSpan={2}><span className={`workflow-status workflow-${c.workflow_stage}`}>{c.stage_label}</span>{!!c.work_visit_count && <small>{c.work_visit_count} 次施工进场</small>}</td>

@@ -22,6 +22,7 @@ from .context_memory import bounded_tool_result, history_notice, tool_batch_erro
 from .feishu_topics import FeishuTopics, speaker_tag
 from .agent_capabilities import GUIDANCE
 from .agent_dates import parsed
+from .background import background_work
 
 log = logging.getLogger(__name__)
 CHINA = timezone(timedelta(hours=8))
@@ -93,7 +94,13 @@ class FeishuAgent:
         self.settings, self.db, self.domain, self.storage, self.recognizer = settings, db, domain, storage, recognizer
         self.connectors, self.followup, self.platform, self.workflow, self.reviews, self.case_agent = connectors, followup, platform, workflow, reviews, case_agent
         self.memory = AgentMemory(db, domain)
-        self._stop, self._wake = threading.Event(), threading.Event()
+        self._stop = threading.Event()
+        self._signal = db.runtime.watch('feishu-agent', {name: None for name in (
+            'feishu_inbox', 'messages', 'jobs', 'feishu_agent_tasks', 'feishu_agent_outbox',
+            'feishu_agent_bindings', 'followup_contacts', 'settings')} |
+            {'connectors': {'enabled', 'kind', 'config'}})
+        self._schedule_token, self._collect_at = None, 0.0
+        self._brief_config, self._brief_next = None, 0.0
         self._threads, self._send_lock, self._config_lock = [], threading.Lock(), threading.RLock()
 
     def binding(self, connector_id):
@@ -158,7 +165,7 @@ class FeishuAgent:
             con.execute("UPDATE feishu_agent_outbox SET state='cancelled',error='群助手设置已变更' WHERE state IN ('queued','failed') AND task_id IN (SELECT id FROM feishu_agent_tasks WHERE connector_id=?)", (connector_id,))
             audit(con, 'connector', connector_id, 'feishu_agent_config', old,
                   {**{k: value[k] for k in allowed}, 'submit_permission': False})
-        self._wake.set()
+        self._signal.wake(persist=False)
         return self.binding_status(connector)
 
     def binding_status(self, connector):
@@ -217,7 +224,7 @@ class FeishuAgent:
         person = current()
         if person is None or person.admin:
             return '1=1', []
-        ids = list(person.projects)
+        ids = [pid for pid in person.projects if person.allows(pid)]
         if not ids:
             return '0=1', []
         marks = ','.join('?' for _ in ids)
@@ -539,9 +546,14 @@ class FeishuAgent:
             answer = answer[:1700].rsplit('\n', 1)[0] + '\n证据尚未完全展示；请按案件或页码继续查询。'
         return answer
 
+    @background_work('feishu.task')
     def run_one(self):
+        query = "SELECT t.id FROM feishu_agent_tasks t WHERE t.state='queued' AND NOT EXISTS(SELECT 1 FROM feishu_agent_tasks busy WHERE busy.connector_id=t.connector_id AND busy.state='running') ORDER BY CASE t.kind WHEN 'brief' THEN 0 ELSE 1 END,t.created_at,t.id LIMIT 1"
+        if not self.db.one(query):
+            self.db.runtime.count('feishu.task', 'idle_skips')
+            return False
         with self.db.tx() as con:
-            row = con.execute("SELECT t.id FROM feishu_agent_tasks t WHERE t.state='queued' AND NOT EXISTS(SELECT 1 FROM feishu_agent_tasks busy WHERE busy.connector_id=t.connector_id AND busy.state='running') ORDER BY CASE t.kind WHEN 'brief' THEN 0 ELSE 1 END,t.created_at,t.id LIMIT 1").fetchone()
+            row = con.execute(query).fetchone()
             if not row:
                 return False
             con.execute("UPDATE feishu_agent_tasks SET state='running',started_at=?,error=NULL,model=? WHERE id=?", (now(), self.db.setting('recognition', {}).get('model', ''), row['id']))
@@ -721,7 +733,7 @@ class FeishuAgent:
             recipient = task['input']['contact']['open_id'] if task['kind'] == 'brief' else task['sender_id']
             con.execute('INSERT OR IGNORE INTO feishu_agent_outbox(id,task_id,recipient_id,content,created_at) VALUES(?,?,?,?,?)',
                 (uid(), task['id'], recipient, dump({'text': text}), now()))
-        self._wake.set()
+        self._signal.wake(persist=False)
 
     @staticmethod
     def draft_line(row):
@@ -793,7 +805,7 @@ class FeishuAgent:
             con.execute('UPDATE feishu_agent_outbox SET state=?,error=?,sent_at=? WHERE id=?',
                 ('sent' if received else 'queued', '人工核对已收到' if received else '人工核对未收到，按原消息编号重试', now() if received else None, row['id']))
             audit(con, 'feishu_agent_task', task_id, 'confirm_delivery', {'state': 'unknown'}, {'received': received})
-        self._wake.set()
+        self._signal.wake(persist=False)
         return self.get(task_id)
 
     def retry_delivery(self, task_id):
@@ -804,7 +816,7 @@ class FeishuAgent:
             if not row or row['state'] != 'failed':
                 raise DomainError('仅明确失败的消息可直接重试；结果未知须先核对群内送达', 409)
             con.execute("UPDATE feishu_agent_outbox SET state='queued',error=NULL WHERE id=?", (row['id'],))
-        self._wake.set()
+        self._signal.wake(persist=False)
         return self.get(task_id)
 
     def retry_task(self, task_id):
@@ -823,7 +835,7 @@ class FeishuAgent:
             new_id = self._insert_task(con, binding, previous['kind'], 'retry:' + uid(),
                 {**previous['input'], 'retry_of': task_id}, previous['source_message_id'], previous['sender_id'])
             audit(con, 'feishu_agent_task', new_id, 'manual_retry', None, {'previous_task': task_id})
-        self._wake.set()
+        self._signal.wake(persist=False)
         return self.get(new_id)
 
     def start(self):
@@ -840,27 +852,57 @@ class FeishuAgent:
 
     def stop(self):
         self._stop.set()
-        self._wake.set()
+        self._signal.wake(persist=False)
         for thread in self._threads:
             thread.join(timeout=3)
         self._threads = []
 
+    @background_work('feishu.schedule')
+    def schedule_once(self, instant=None):
+        instant = instant or datetime.now(timezone.utc)
+        observed, monotonic = self._signal.token(), time.monotonic()
+        if observed != self._schedule_token or monotonic - self._collect_at >= 15:
+            # Keep the token from before collection: a concurrent message or
+            # completed OCR job must be considered again on the next wake.
+            self.collect_messages()
+            self._schedule_token, self._collect_at = observed, monotonic
+        else:
+            self.db.runtime.count('feishu.schedule', 'idle_skips')
+        with self.db.read_snapshot():
+            bindings = self.db.all('SELECT * FROM feishu_agent_bindings ORDER BY connector_id')
+            config = [bindings, self.db.all('SELECT id,enabled,config FROM connectors ORDER BY id'),
+                      self.db.all('SELECT * FROM followup_contacts ORDER BY project_id')]
+        if config != self._brief_config or instant.timestamp() >= self._brief_next:
+            self.schedule_briefs(instant)
+            local = instant.astimezone(CHINA)
+            deadlines = []
+            for binding in bindings:
+                if binding['enabled'] and binding['daily_brief']:
+                    hour, minute = map(int, binding['brief_time'].split(':'))
+                    due = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    deadlines.append((due if due > instant else due + timedelta(days=1)).timestamp())
+            # Store only after a successful schedule; failures remain retryable.
+            self._brief_config = config
+            self._brief_next = min(deadlines, default=instant.timestamp() + 86400)
+            self.db.runtime.count('feishu.schedule', 'brief_checks')
+        sent = self.deliver_one()
+        return .1 if sent else max(.1, min(15, self._brief_next - instant.timestamp()))
+
     def _scheduler(self):
         while not self._stop.is_set():
+            observed, delay = self._signal.token(), 2
             try:
-                self.collect_messages()
-                self.schedule_briefs()
-                self.deliver_one()
+                delay = self.schedule_once()
             except Exception:
                 log.exception('Feishu Agent scheduler failed')
-            self._wake.wait(2)
-            self._wake.clear()
+            self._signal.wait(observed, delay, self._stop)
 
     def _worker(self):
         while not self._stop.is_set():
+            observed = self._signal.token()
             try:
                 if self.run_one():
                     continue
             except Exception:
                 log.exception('Feishu Agent worker failed')
-            self._stop.wait(2)
+            self._signal.wait(observed, 15, self._stop)

@@ -23,10 +23,12 @@ from .domain import DomainError
 from .feishu_card_demos import FeishuCardDemos
 from .identity import acting_as
 from .review_card_content import PAGE_SIZE, attachments, build_card, editable_fields
+from .background import background_work
 
 log = logging.getLogger(__name__)
 EXECUTED = {'submitting', 'submitted', 'verified', 'uncertain', 'saved', 'save_verified'}
 MANAGE = {'edit', 'preview', 'submit', 'readback'}
+CARD_RECHECK_SECONDS = 60
 
 
 class FeishuReviewCards:
@@ -36,6 +38,8 @@ class FeishuReviewCards:
         self.followup = notifications.followup
         self.demos = FeishuCardDemos(self.followup, identities)
         self._lock = threading.Lock()
+        self._sync_checks = {}
+        self._poll_token, self._poll_at, self._retry_at = None, 0.0, 0.0
 
     def delivery(self, notification_id):
         row = self.db.one('SELECT * FROM review_notifications WHERE id=?', (notification_id,))
@@ -192,8 +196,10 @@ class FeishuReviewCards:
             raise DomainError('卡片事件编号无效')
         operator, context, action = event['operator'], event['context'], event['action']
         value = action['value']
-        if operator.get('tenant_key') and operator['tenant_key'] != header.get('tenant_key'):
-            raise DomainError('卡片人员所属组织不匹配', 403)
+        # The application and operator tenant keys legitimately differ in an
+        # external group. The authenticated SDK connection identifies the app;
+        # authorization uses its Open ID binding, project role and original
+        # message below, with live group membership rechecked before execution.
         delivery = self.delivery(value['notification_id'])
         operation = value.get('action')
         # Multiple configured groups may share one application. Feishu can
@@ -348,7 +354,7 @@ class FeishuReviewCards:
                                     changed_fields=[key for key, value in payload['values'].items()
                                                     if str(record['snapshot']['values'].get(key, '') or '') != value],
                                     expires_at=time.time() + 1800,
-                                    notice='本次修改尚未保存。请核对下列内容后确认正式提交。')
+                                    notice='本次修改尚未保存。请核对下列字段及附件，确认后点击“保存修改并正式提交”。')
                         self._replace(delivery, view, client)
                     elif action == 'photos':
                         plan = view.get('plan') or record['snapshot']
@@ -418,21 +424,34 @@ class FeishuReviewCards:
                 con.execute('UPDATE review_notifications SET card_error=?,card_retry_at=? WHERE id=? AND card_token=?',
                             (message[:700], time.time() + 30, delivery['id'], delivery['card_token']))
 
-    def synchronize(self):
+    @background_work('cards.synchronize')
+    def synchronize(self, force=False):
         deliveries = self.db.all(
             "SELECT * FROM review_notifications WHERE message_type='interactive' AND state='sent' "
             "AND COALESCE(json_extract(card_view,'$.verified'),0)=0 AND json_extract(card_view,'$.mode')<>'stale' "
-            'AND pending_action_id IS NULL AND card_checked_at<? ORDER BY card_checked_at LIMIT 10', (time.time() - 15,))
+            'AND pending_action_id IS NULL AND (? OR card_checked_at<?) ORDER BY card_checked_at LIMIT 10',
+            (int(force), time.time() - CARD_RECHECK_SECONDS))
+        checked = []
         for delivery in deliveries:
             view = json.loads(delivery['card_view'])
+            completed_check = True
             try:
                 record = self.reviews.get(delivery['review_id'])
                 if record['state'] in EXECUTED:
                     if view.get('review_state') != record['state'] or view.get('result_key') != dump(record['result']):
                         self._replace(delivery, self._result_view(record))
                 elif view['mode'] != 'stale':
+                    observed = self.notifications._queue_observation(delivery['case_id'])
+                    stamp = time.monotonic()
+                    previous = self._sync_checks.get(delivery['id'])
+                    if (previous and previous[0] == observed and stamp - previous[1] < CARD_RECHECK_SECONDS
+                            and view.get('expires_at', time.time() + 1) > time.time()):
+                        self.db.runtime.count('cards.synchronize', 'idle_skips')
+                        completed_check = False
+                        continue
                     row, _ = self.notifications._matches(delivery)
                     self._scope(delivery)
+                    self._sync_checks[delivery['id']] = observed, stamp
                     if row['review_id'] != delivery['review_id']:
                         record = self.reviews.get(row['review_id'])
                         delivery['review_id'] = record['id']
@@ -445,13 +464,27 @@ class FeishuReviewCards:
                 if view['mode'] not in ('stale',) and not view.get('verified'):
                     self._replace(delivery, {'mode': 'stale', 'notice': '资料、办理状态或授权已变化，此卡片不能再提交。请使用最新拟提交记录。'})
             finally:
-                with self.db.tx() as con:
-                    con.execute('UPDATE review_notifications SET card_checked_at=? WHERE id=?', (time.time(), delivery['id']))
+                # A cache hit is not a new complete validation. Keep the last
+                # complete check time so repeated wakeups cannot extend its TTL.
+                if completed_check:
+                    checked.append((time.time(), delivery['id']))
+        if checked:
+            with self.db.tx() as con:
+                con.executemany('UPDATE review_notifications SET card_checked_at=? WHERE id=?', checked)
+        active = {row['id'] for row in self.db.all("SELECT id FROM review_notifications WHERE state='sent' AND message_type='interactive'")}
+        self._sync_checks = {key: value for key, value in self._sync_checks.items() if key in active}
 
+    def next_delay(self):
+        return max(.1, min(15, self._poll_at + CARD_RECHECK_SECONDS - time.monotonic(),
+                           self._retry_at - time.time() if self._retry_at else 15))
+
+    @background_work('cards.scan')
     def run_once(self):
         if not self._lock.acquire(blocking=False):
             return
         try:
+            observed = self.notifications._signal.token()
+            changed = observed != self._poll_token
             # One read-only snapshot on idle ticks; do not acquire a SQLite
             # writer or assemble a proposal when there is no pending card work.
             with self.db.read_snapshot():
@@ -459,7 +492,8 @@ class FeishuReviewCards:
                 due = self.db.one(
                     "SELECT id FROM review_notifications WHERE message_type='interactive' AND state='sent' "
                     "AND COALESCE(json_extract(card_view,'$.verified'),0)=0 AND json_extract(card_view,'$.mode')<>'stale' "
-                    'AND pending_action_id IS NULL AND card_checked_at<? LIMIT 1', (time.time() - 15,))
+                    'AND pending_action_id IS NULL AND (? OR card_checked_at<?) LIMIT 1',
+                    (int(changed), time.time() - CARD_RECHECK_SECONDS))
                 dirty = self.db.one("SELECT id FROM review_notifications WHERE message_type='interactive' AND state='sent' "
                                     'AND card_dirty=1 AND card_retry_at<=? LIMIT 1', (time.time(),))
             if pending:
@@ -467,7 +501,8 @@ class FeishuReviewCards:
                     if self.notifications._stop.is_set() or not self.process_one():
                         break
             if due:
-                self.synchronize()
+                self.synchronize(force=changed)
+            self._poll_token, self._poll_at = observed, time.monotonic()
             deliveries = self.db.all(
                     "SELECT * FROM review_notifications WHERE message_type='interactive' AND state='sent' "
                     'AND card_dirty=1 AND card_retry_at<=? ORDER BY created_at LIMIT 10', (time.time(),)) if pending or due or dirty else []
@@ -482,10 +517,13 @@ class FeishuReviewCards:
                 finally:
                     if client:
                         client.close()
+            self._retry_at = self.db.one("SELECT MIN(card_retry_at) due FROM review_notifications WHERE message_type='interactive' AND state='sent' AND card_dirty=1")['due'] or 0
         finally:
             self._lock.release()
 
     def recover(self):
+        self._sync_checks.clear()
+        self._poll_token = None
         # A running job may have reached the official website. Never replay it.
         jobs = self.db.all("SELECT * FROM feishu_review_actions WHERE state='running'")
         with self.db.tx() as con:

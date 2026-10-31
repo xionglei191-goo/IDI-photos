@@ -21,7 +21,14 @@ export interface PlatformAccountStatus {
   project_id?: string; enabled?: boolean; write_enabled?: boolean; automatic_paused?: boolean;
   configured: boolean; username: string; password_stored: boolean; auto_connect: boolean; state: string;
   last_attempt_at: string | null; last_success_at: string | null; next_retry_at: string | null; error: string;
+  failures?: number; max_attempts?: number; first_failure_at?: string | null; blocked_at?: string | null;
+  blocked_reason?: string | null;
   session: PlatformSession;
+}
+export interface PlatformConnectionIssue {
+  project_id: string | null; name: string; state: string; error: string;
+  failures: number; max_attempts: number; first_failure_at: string | null; blocked_at: string | null;
+  blocked_reason: string | null; last_attempt_at: string | null; next_retry_at: string | null;
 }
 export interface PlatformLink {
   case_id: string; report_receiving_id: string; platform_report_code: string; insurer_report_number: string;

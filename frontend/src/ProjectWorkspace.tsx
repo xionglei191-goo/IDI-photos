@@ -10,6 +10,7 @@ import { WebsiteOperations } from './AccessSettings';
 import type { Case, PhotoPage, Project } from './types';
 import type { PlatformStage } from './platformTypes';
 import './workflow.css';
+import { WorkerCasePreview } from './CaseWorkers';
 
 export default function ProjectWorkspace() {
   const { person } = useAuth();
@@ -20,18 +21,19 @@ export default function ProjectWorkspace() {
   const [importJob, setImportJob] = useState('');
   const [photoPage, setPhotoPage] = useState(1);
   const projects = useData<Project[]>('/api/projects', revision), cases = useData<Case[]>('/api/cases', revision);
-  const photos = useData<PhotoPage>(caseId ? `/api/photos?case_id=${encodeURIComponent(caseId)}&page=${photoPage}&page_size=60&sort=created_at&direction=desc` : null, revision);
+  const selected = cases.data?.find(c => c.id === caseId);
+  const worker = !!selected && person.projects[selected.project_id] === 'worker';
+  const photos = useData<PhotoPage>(caseId && !worker ? `/api/photos?case_id=${encodeURIComponent(caseId)}&page=${photoPage}&page_size=60&sort=created_at&direction=desc` : null, revision);
   useEffect(() => setPhotoPage(1), [caseId]);
   const leaveRef = useRef<(() => Promise<boolean>) | null>(null);
   const registerLeave = useCallback((value: (() => Promise<boolean>) | null) => { leaveRef.current = value; }, []);
   const refresh = useCallback(() => setRevision(v => v + 1), []);
   const notify = useCallback((value: string, failed = false) => { if (failed) setError(value); else setToast(value); }, []);
-  const selected = cases.data?.find(c => c.id === caseId);
   const manager = !!selected && person.projects[selected.project_id] === 'manager';
   const managedCases = (cases.data || []).filter(c => person.projects[c.project_id] === 'manager');
   const managedProjects = (projects.data || []).filter(p => person.projects[p.id] === 'manager');
   const stage: PlatformStage = ({ survey: 'survey', repair: 'repair', acceptance: 'acceptance', settlement: 'acceptance', closed: 'acceptance' } as Record<string, PlatformStage>)[selected?.workflow_stage || ''] || 'intake';
-  const visible = (cases.data || []).filter(c => (!projectId || c.project_id === projectId) && (!query || [c.title, c.short_code, c.platform_report_code, c.room, c.project_name].some(v => v?.includes(query))));
+  const visible = (cases.data || []).filter(c => (!projectId || c.project_id === projectId) && (!query || [c.title, c.short_code, c.platform_report_code, c.room, c.location_detail, c.project_name].some(v => v?.includes(query))));
   async function navigate(action: () => void) { if (!leaveRef.current || await leaveRef.current()) { setError(''); action(); } }
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(''), 6500); return () => window.clearTimeout(timer); }, [toast]);
   return <div className="project-workspace">
@@ -39,9 +41,9 @@ export default function ProjectWorkspace() {
     <main><div className="project-toolbar"><label>项目<select value={projectId} onChange={e => void navigate(() => { setProjectId(e.target.value); setCaseId(''); setTab('photos'); })}><option value="">我的全部项目</option>{projects.data?.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label><label>查找案件<input value={query} onChange={e => setQuery(e.target.value)} placeholder="编号、房号或案件内容" /></label><button onClick={refresh}><RefreshCw size={15} />刷新</button></div>
       <ErrorBox error={error || projects.error || cases.error} />{toast && <p className="notice" role="status">{toast}</p>}
       {importJob && <ImportProgress key={importJob} id={importJob} done={refresh} />}
-      {!selected ? <section className="settings-card"><h1>我的项目案件</h1><p className="muted">选择案件后上传照片。项目成员可以查看和上传；项目管理员可管理照片并核对正式提交。</p>{cases.loading ? <Loading /> : !visible.length ? <Empty>当前没有分配给你的项目案件，请联系系统管理员分配。</Empty> : <div className="table-wrap"><table><thead><tr><th>项目 / 案件号</th><th>位置 / 问题</th><th>办理阶段</th><th>本项目权限</th><th /></tr></thead><tbody>{visible.map(c => <tr key={c.id}>
-        <td>{c.project_name}<small>{c.platform_report_code || c.short_code || '待关联'}</small></td><td>{place(c)}<small>{c.title}</small></td><td>{WORKFLOW_STAGES[c.workflow_stage]}</td><td>{person.projects[c.project_id] === 'manager' ? '项目管理员' : '项目成员'}</td><td><button onClick={() => { setCaseId(c.id); setTab('photos'); }}>打开案件</button></td>
-      </tr>)}</tbody></table></div>}<WebsiteOperations projectId={projectId} revision={revision} /></section> : <>
+      {!selected ? <section className="settings-card"><h1>我的项目案件</h1><p className="muted">工人仅能查看关联案件并使用相机拍摄上传；项目成员可以查看和上传本项目资料。</p>{cases.loading ? <Loading /> : !visible.length ? <Empty>当前没有分配给你的项目案件，请联系系统管理员分配。</Empty> : <div className="table-wrap"><table><thead><tr><th>项目 / 案件号</th><th>位置 / 问题</th><th>办理阶段</th><th>本项目权限</th><th /></tr></thead><tbody>{visible.map(c => <tr key={c.id}>
+        <td>{c.project_name}<small>{c.platform_report_code || c.short_code || '待关联'}</small></td><td>{place(c)}<small>{c.title}</small></td><td>{WORKFLOW_STAGES[c.workflow_stage]}</td><td>{person.projects[c.project_id] === 'manager' ? '项目管理员' : person.projects[c.project_id] === 'worker' ? '工人 · 关联案件' : '项目成员'}</td><td><button onClick={() => { setCaseId(c.id); setTab('photos'); }}>打开案件</button></td>
+      </tr>)}</tbody></table></div>}{Object.values(person.projects).some(role => role !== 'worker') && (!projectId || person.projects[projectId] !== 'worker') && <WebsiteOperations projectId={projectId} revision={revision} />}</section> : worker ? <WorkerCasePreview value={selected} back={() => setCaseId('')} /> : <>
         <button className="text-button" onClick={() => void navigate(() => setCaseId(''))}><ArrowLeft size={15} />返回案件列表</button>
         <div className="page-heading"><div><h1>{selected.platform_report_code || selected.short_code || selected.title}</h1><p>{selected.project_name} · {place(selected)} · {selected.title}</p></div><div className="row"><button className="primary" onClick={() => setUpload(true)}><Upload size={15} />上传本案照片</button>{manager && <button onClick={() => setEditingCase(true)}>编辑案件</button>}</div></div>
         <p className="project-member-hint">照片收到后进入自动处理和官网保存队列；正式提交由项目管理员核对确认。</p>

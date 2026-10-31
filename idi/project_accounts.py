@@ -167,6 +167,31 @@ class ProjectAccounts:
         return {**account.status(), 'project_id': project_id, 'enabled': self.enabled(project_id),
                 'write_enabled': bool(self.write_enabled and self.enabled(project_id) and account._config)}
 
+    def connection_issues(self):
+        """Visible, credential-free alerts; no login or business request is performed here."""
+        from .identity import project_filter
+        person = current()
+        candidates = [(None, '公司官网读取账号', self.company)] if not person or person.admin else []
+        scope, params = project_filter('p.id')
+        rows = self.db.all('SELECT p.id,p.name FROM projects p JOIN project_website_accounts a ON a.project_id=p.id '
+                           'WHERE a.enabled=1 AND ' + scope + ' ORDER BY p.name,p.id', params)
+        with self.lock:
+            candidates.extend((row['id'], row['name'], self.accounts.get(row['id'])) for row in rows)
+        result = []
+        for project_id, name, account in candidates:
+            if account is None:
+                continue
+            value = account.status()
+            if value['state'] not in ('needs_attention', 'retry_wait'):
+                continue
+            if not value['auto_connect'] and value['configured']:
+                continue
+            result.append({'project_id': project_id, 'name': name,
+                           **{key: value[key] for key in ('state', 'error', 'failures', 'max_attempts',
+                                                         'first_failure_at', 'blocked_at', 'blocked_reason',
+                                                         'last_attempt_at', 'next_retry_at')}})
+        return result
+
     def configure(self, project_id, data):
         require_admin()
         with self.platform.material_lock:

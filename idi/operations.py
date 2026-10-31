@@ -35,7 +35,8 @@ class Operations:
                 'model': recognition['model_health'], 'policy': s['photo_workflow'].policy(),
                 'ocr': {'enabled': recognition.get('local_ocr', True), 'installed': recognition['local_ocr_available'],
                         'latest': local, 'pending': db.one("SELECT COUNT(*) n FROM photos p JOIN blobs b ON p.blob_hash=b.hash WHERE b.media_type='image' AND NOT EXISTS(SELECT 1 FROM recognitions r WHERE r.photo_id=p.id AND r.provider='local_ocr' AND r.state='completed')")['n']},
-                'platform': s['platform'].client.status(), 'sync': s['workflow'].synchronizer.status(), 'channels': channels,
+                'platform': s['platform'].client.status(), 'connection_issues': s['project_accounts'].connection_issues(),
+                'sync': s['workflow'].synchronizer.status(), 'channels': channels,
                 'attachments_pending': db.one("SELECT COUNT(*) n FROM messages WHERE media_state IN ('pending','failed')")['n'],
                 'rule_states': {r['state']: r['n'] for r in db.all('SELECT state,COUNT(*) n FROM photo_pipeline GROUP BY state')},
                 'ai_queue': queue, 'draft_states': {r['state']: r['n'] for r in db.all('SELECT state,COUNT(*) n FROM rule_draft_intents GROUP BY state')},
@@ -57,6 +58,7 @@ class Operations:
                 'policy': s['photo_workflow'].policy(),
                 'ocr': {'enabled': recognition.get('local_ocr', True), 'installed': recognition['local_ocr_available'], 'latest': local, 'pending': pending},
                 'platform': {'connected': s['platform'].client.status()['connected']},
+                'connection_issues': s['project_accounts'].connection_issues(),
                 'sync': s['workflow'].synchronizer.status(), 'channels': [], 'attachments_pending': 0,
                 'ai_queue': queue, 'ai_tasks': tasks, 'rule_states': {}, 'draft_states': {}, 'scope': 'assigned_projects'}
 

@@ -12,7 +12,7 @@ from tests.test_project_followup import followup, channel, bind
 @pytest.fixture
 def waiting_flow(services, platform, case, photo, monkeypatch):
     clock = SimpleNamespace(now=1000.0)
-    monkeypatch.setattr('idi.automatic_uploads.time', SimpleNamespace(time=lambda: clock.now))
+    monkeypatch.setattr('idi.automatic_uploads.time', SimpleNamespace(time=lambda: clock.now, monotonic=lambda: clock.now))
     auto, add, uploads, writes, _ = setup_flow(services, platform, case, photo, monkeypatch, quiet_seconds=300)
     assert auto.policy()['proposal_quiet_seconds'] == 300
     row = ready(services, platform, case, add, auto)

@@ -9,8 +9,8 @@ def workflow_routes(workflow, reviews):
 
     @router.get('/board')
     def board(board: str = 'intake', project_id: str = '', building: str = '', query: str = '', status: str = '',
-              archived: bool = False, page: int = 1, page_size: int = 30, source: str = 'auto'):
-        return workflow.board(board, project_id, building, query, status, archived, page, page_size, source)
+              archived: bool = False, page: int = 1, page_size: int = 30, source: str = 'auto', worker: str = ''):
+        return workflow.board(board, project_id, building, query, status, archived, page, page_size, source, worker)
 
     @router.get('/sync')
     def sync_status():

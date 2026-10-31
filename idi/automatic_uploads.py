@@ -14,12 +14,22 @@ from .domain import DomainError
 from .photo_ai import digest
 from .platform_prefill import PREFILL_RULES_VERSION, canonical_value
 from .review_requirements import pending_checkins
+from .background import background_work
 
 log = logging.getLogger(__name__)
 UNRESOLVED = ('submitting', 'saved', 'submitted', 'uncertain')
 PROPOSAL_QUIET_SECONDS = 300
 CHECKIN_RECHECK_SECONDS = 300
-REVIEW_RULES_VERSION = 2
+# Rebuild pending proposals when the attachment/version comparison changes.
+REVIEW_RULES_VERSION = 3
+IDLE_SCAN_SECONDS = 15
+UPLOAD_INPUTS = {name: None for name in (
+    'cases', 'projects', 'photos', 'blobs', 'photo_sources', 'photo_pipeline', 'recognitions',
+    'platform_links', 'platform_drafts', 'platform_manual_file_selections', 'visit_shared_checkins',
+    'settings', 'automatic_upload_cases', 'feishu_agent_bindings', 'connectors',
+    'project_website_accounts', 'project_members', 'idi_users', 'case_worker_assignments', 'camera_devices')}
+UPLOAD_INPUTS['connectors'] = {'enabled', 'kind', 'config'}
+UPLOAD_INPUTS['camera_devices'] = {'user_id', 'project_ids', 'revoked_at'}
 
 
 class AutomaticUploads:
@@ -28,6 +38,10 @@ class AutomaticUploads:
         self.db, self.platform, self.domain = workflow.db, workflow.platform, workflow.domain
         self._stop, self._lock, self._thread = threading.Event(), threading.Lock(), None
         self.notifications = None
+        self._signal = self.db.runtime.watch('automatic', UPLOAD_INPUTS)
+        self._scan_token, self._scan_session, self._scan_at = None, None, 0.0
+        self._retry_at, self._deferred = 0.0, False
+        self._projects = set()
 
     def policy(self):
         return {'enabled': False, 'activated_at': '', 'notify_review_ready': False,
@@ -104,6 +118,10 @@ class AutomaticUploads:
                 'can_configure_project_accounts': person is None or person.admin}
 
     def signature(self, case_id, *, proposal=False, draft_override=None):
+        with self.db.read_snapshot():
+            return self._scoped_signature(case_id, proposal=proposal, draft_override=draft_override)
+
+    def _scoped_signature(self, case_id, *, proposal=False, draft_override=None):
         from .project_accounts import case_context
         with case_context(self.platform, case_id):
             return self._signature(case_id, proposal=proposal, draft_override=draft_override)
@@ -117,6 +135,21 @@ class AutomaticUploads:
         data = [PREFILL_RULES_VERSION, REVIEW_RULES_VERSION, self.rules.case_signature(case), photos, self.platform.prefill_defaults(), drafts,
                 self.db.all('SELECT stage,field,photo_id,photo_revision,blob_hash,target_report_id FROM platform_manual_file_selections WHERE case_id=? ORDER BY stage,field,photo_id', (case_id,)),
                 self.platform.link(case_id)['revision']]
+        # Keep pre-upgrade signatures stable for cases without any worker scope.
+        # A role/assignment change still invalidates affected queued proposals.
+        worker_scope = case.get('worker_assignment_revision', 0) or self.db.one('''SELECT 1 FROM photos p
+            JOIN project_members m ON m.user_id=p.uploaded_by AND m.project_id=p.project_id
+            WHERE p.case_id=? AND m.role='worker' LIMIT 1''', (case_id,))
+        if worker_scope:
+            data.append(case.get('worker_assignment_revision', 0))
+            data.append(self.db.all('''SELECT DISTINCT p.uploaded_by,u.enabled,u.system_role,m.role
+                FROM photos p LEFT JOIN idi_users u ON u.id=p.uploaded_by
+                LEFT JOIN project_members m ON m.user_id=p.uploaded_by AND m.project_id=p.project_id
+                WHERE p.case_id=? AND p.uploaded_by IS NOT NULL ORDER BY p.uploaded_by''', (case_id,)))
+            data.append(self.db.all('''SELECT d.id,d.user_id,d.project_ids,d.revoked_at FROM camera_devices d
+                WHERE d.user_id IN (SELECT DISTINCT p.uploaded_by FROM photos p
+                  JOIN project_members m ON m.user_id=p.uploaded_by AND m.project_id=p.project_id
+                  WHERE p.case_id=? AND m.role='worker') ORDER BY d.id''', (case_id,)))
         if getattr(self.platform, 'project_accounts', None):
             data.append(self.platform.project_accounts.binding(case['project_id']))
         if not proposal:
@@ -173,11 +206,8 @@ class AutomaticUploads:
             photo = self.domain.photo(photo_id)
             if photo.get('uploaded_by') and getattr(self.platform, 'project_accounts', None):
                 # Reload enabled state and membership for queued uploads too.
-                user = self.db.one('SELECT enabled,system_role FROM idi_users WHERE id=?', (photo['uploaded_by'],))
-                member = self.db.one('SELECT role FROM project_members WHERE project_id=? AND user_id=?',
-                                     (case['project_id'], photo['uploaded_by']))
-                if not user or not user['enabled'] or user['system_role'] != 'admin' and not member:
-                    raise DomainError('上传人员的项目权限已失效，照片保留，请管理员核对', 403)
+                from .case_assignments import require_uploader_case
+                require_uploader_case(self.db, photo, case)
             pipeline = self.db.one('SELECT * FROM photo_pipeline WHERE photo_id=?', (photo_id,))
             if photo['case_id'] != case_id or not pipeline or pipeline['dirty'] or pipeline['photo_revision'] != photo['revision'] or pipeline['identity'] == 'unverified':
                 raise DomainError('选材含未核对或已变化的照片，请先核对归属与用途', 409)
@@ -207,6 +237,11 @@ class AutomaticUploads:
             if row['id'] in excluded:
                 continue
             photo = self.domain.photo(row['id'])
+            from .case_assignments import require_uploader_case
+            try:
+                require_uploader_case(self.db, photo, case)
+            except DomainError:
+                continue
             if photo['blob_hash'] in blocked:
                 continue
             if not self.platform.storage.verify(photo):
@@ -261,20 +296,54 @@ class AutomaticUploads:
         for row in self.db.all('SELECT DISTINCT p.case_id FROM photos p JOIN platform_links l ON l.case_id=p.case_id WHERE (p.created_at>=? OR p.uploaded_by IS NOT NULL) AND l.report_receiving_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM automatic_upload_cases u WHERE u.case_id=p.case_id) LIMIT 200', (self.policy().get('activated_at') or now(),)):
             self.enroll(row['case_id'])
 
+    def _session_observation(self):
+        accounts = getattr(self.platform, 'project_accounts', None)
+        if accounts:
+            observed = []
+            for project in sorted(self._projects):
+                status = accounts.account(project).client.status()
+                observed.append((project, {k: status.get(k) for k in ('connected', 'account')}, accounts.write_enabled))
+            return observed
+        status = self.platform.client.status()
+        return {k: status.get(k) for k in ('connected', 'account')}, self.platform.client.write_enabled
+
+    def next_delay(self):
+        if self._deferred:
+            return 1
+        return max(.1, min(IDLE_SCAN_SECONDS, self._scan_at + IDLE_SCAN_SECONDS - time.monotonic(),
+                           self._retry_at - time.time() if self._retry_at else IDLE_SCAN_SECONDS))
+
+    @background_work('automatic.scan')
     def run_once(self):
-        if self._stop.is_set() or not self.policy().get('enabled') or not self._lock.acquire(blocking=False):
+        if self._stop.is_set():
+            return 0
+        if not self.policy().get('enabled'):
+            self._scan_at, self._retry_at, self._deferred = time.monotonic(), 0.0, False
+            return 0
+        if not self._lock.acquire(blocking=False):
             return 0
         processed = 0
         try:
+            observed, session = self._signal.token(), self._session_observation()
+            if (observed == self._scan_token and session == self._scan_session
+                    and time.monotonic() - self._scan_at < IDLE_SCAN_SECONDS
+                    and not self._deferred and not (self._retry_at and self._retry_at <= time.time())):
+                self.db.runtime.count('automatic.scan', 'idle_skips')
+                return 0
+            self._deferred = False
+            # Capture before any work so edits made during processing remain due.
+            self._scan_token, self._scan_session, self._scan_at = observed, session, time.monotonic()
             self._discover()
             # Signature checks are read-only. Reuse one consistent connection
             # per scan without holding a transaction over uploads or writes.
             candidates = []
             with self.db.read_snapshot():
-                for row in self.db.all("SELECT u.* FROM automatic_upload_cases u WHERE u.enabled=1 ORDER BY EXISTS(SELECT 1 FROM photos p WHERE p.case_id=u.case_id AND p.photo_group IN ('survey_checkin','work_checkin') AND p.updated_at>=u.updated_at) DESC,u.updated_at"):
+                rows = self.db.all("SELECT u.*,c.project_id FROM automatic_upload_cases u JOIN cases c ON c.id=u.case_id WHERE u.enabled=1 ORDER BY EXISTS(SELECT 1 FROM photos p WHERE p.case_id=u.case_id AND p.photo_group IN ('survey_checkin','work_checkin') AND p.updated_at>=u.updated_at) DESC,u.updated_at")
+                self._projects = {row['project_id'] for row in rows}
+                for row in rows:
                     if self._stop.is_set():
                         break
-                    changed = row['signature'] != self.signature(row['case_id'])
+                    changed = row['signature'] != self._scoped_signature(row['case_id'])
                     if changed or row['retry_at'] and row['retry_at'] <= time.time():
                         candidates.append(row['case_id'])
                     if len(candidates) >= 10:
@@ -286,7 +355,11 @@ class AutomaticUploads:
                 if not row or not row['enabled']:
                     continue
                 try:
-                    self.process(row)
+                    with self.db.runtime.slot('automatic.case') as acquired:
+                        if not acquired:
+                            self._deferred = True
+                            continue
+                        self.process(row)
                 except Exception as exc:
                     current = self.get(row['case_id'])
                     attempts = current['attempts'] + 1
@@ -301,10 +374,12 @@ class AutomaticUploads:
                 processed += 1
                 if processed >= 10:
                     break
+            self._retry_at = self.db.one('SELECT MIN(retry_at) due FROM automatic_upload_cases WHERE enabled=1 AND retry_at>0')['due'] or 0
             return processed
         finally:
             self._lock.release()
 
+    @background_work('automatic.case', case_arg=0)
     def process(self, row):
         case_id = row['case_id']
         self.platform.removals.require_clear(case_id, self.domain.case(case_id)['workflow_stage'])
@@ -316,9 +391,15 @@ class AutomaticUploads:
             return self._record(case_id, 'complete' if case['workflow_stage'] == 'closed' else 'waiting_stage',
                 {'reason': '修复成果已提交；业主验收仍需实际验收日期和签字 PDF' if case['workflow_stage'] == 'acceptance' else '等待进入查勘或修复成果环节'})
         self._photo_quiet_remaining(case_id)
-        # Revisit only enrolled cases, including next-stage photos received earlier.
-        for p in self.db.all("SELECT p.id FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE p.case_id=? AND b.media_type='image' ORDER BY p.created_at,p.id", (case_id,)):
-            self.rules.process(p['id'], revisit=True)
+        # A scheduled check-in readback/quiet deadline does not change local
+        # photo evidence. Keep the full path for changed inputs and failed work.
+        unchanged = (row['state'] in ('awaiting_confirmation', 'collecting_photos')
+                     and row['signature'] == self.signature(case_id))
+        for p in self.db.all("SELECT p.id,b.hash,b.stored_path FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE p.case_id=? AND b.media_type='image' ORDER BY p.created_at,p.id", (case_id,)):
+            # Retain the periodic original-file integrity check even when the
+            # database inputs are unchanged; damaged sources must re-enter rules.
+            if not unchanged or not self.platform.storage.verify(p):
+                self.rules.process(p['id'], revisit=True)
         from .project_accounts import case_context
         with self.platform.material_lock, case_context(self.platform, case_id):
             self.platform.removals.require_clear(case_id, case['workflow_stage'])
@@ -392,17 +473,19 @@ class AutomaticUploads:
 
     def stop(self):
         self._stop.set()
+        self._signal.wake(persist=False)
         if self._thread:
             self._thread.join(timeout=1)
         self._thread = None
 
     def _loop(self):
         while not self._stop.is_set():
+            observed = self._signal.token()
             try:
                 self.run_once()
             except Exception:
                 log.exception('Automatic upload queue failed')
-            self._stop.wait(2)
+            self._signal.wait(observed, self.next_delay(), self._stop)
 
 
 def automatic_upload_routes(service):

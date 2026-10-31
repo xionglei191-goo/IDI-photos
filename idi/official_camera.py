@@ -148,6 +148,7 @@ class OfficialCamera:
 
     def _ingest(self, device, metadata, image, timing):
         with timing.measure('validate'):
+            device = self.camera.effective_device(device)
             try:
                 model = OfficialMetadata.model_validate_json(metadata)
             except ValidationError as error:
@@ -163,8 +164,7 @@ class OfficialCamera:
             elif model.role and model.role != role:
                 raise DomainError('拍摄环节与照片用途不一致')
             case = self.domain.case(model.case_id)
-            if case['project_id'] not in device['project_ids']:
-                raise DomainError('设备无此项目权限', 403)
+            self.camera.require_case_access(device, case)
             ensure_not_deleted(self.db, device['id'], model.capture_id)
             video = model.media_type == 'video'
             if video and model.source != 'xhey_sdk':
@@ -202,6 +202,7 @@ class OfficialCamera:
             requested = not video and config.get('auto_verify') is True
             state = ('queued' if self.settings.verification_ready(config) else 'unconfigured') if requested else 'not_requested'
             with self.db.tx() as con:
+                self.camera.require_case_access(device, case, connection=con)
                 ensure_not_deleted(self.db, device['id'], model.capture_id, connection=con)
                 existing = con.execute('SELECT * FROM camera_official_captures WHERE device_id=? AND capture_id=?', (device['id'], model.capture_id)).fetchone()
                 if existing:
@@ -221,10 +222,8 @@ class OfficialCamera:
                 audit(con, 'camera_official', model.capture_id, 'receive', after={'device_id': device['id'], 'sha256': image_hash, 'state': state})
             return self.get(device, model.capture_id)
 
-    @staticmethod
-    def check_case(case, device, number):
-        if case['project_id'] not in device['project_ids']:
-            raise DomainError('设备无此项目权限', 403)
+    def check_case(self, case, device, number):
+        self.camera.require_case_access(device, case)
         if case_number(case) != number or not number:
             raise DomainError('案件号与台账不一致，未归档', 409)
         if not case['followup_eligible'] or case['workflow_stage'] == 'closed':
@@ -257,14 +256,12 @@ class OfficialCamera:
         deleted = deletion_record(self.db, device['id'], capture_id)
         if deleted:
             case = self.domain.case(deleted['case_id'])
-            if case['project_id'] not in device['project_ids']:
-                raise DomainError('设备无此项目权限', 403)
+            self.camera.require_case_access(device, case)
             raise DomainError('资料已删除，不会重新归档', 410)
         row = self.row(device['id'], capture_id)
         meta = json.loads(row['metadata'])
         case = self.domain.case(meta['case_id'])
-        if case['project_id'] not in device['project_ids']:
-            raise DomainError('设备无此项目权限', 403)
+        self.camera.require_case_access(device, case)
         return self.receipt(row)
 
     def update(self, row, **fields):
@@ -280,6 +277,9 @@ class OfficialCamera:
         with self.lock:
             ensure_not_deleted(self.db, device_id, capture_id)
             row = self.row(device_id, capture_id)
+            device = self.db.one('SELECT * FROM camera_devices WHERE id=?', (device_id,))
+            meta = json.loads(row['metadata'])
+            self.camera.require_case_access(device, self.domain.case(meta['case_id']))
             self.receipt(row)  # Honor deletion tombstones.
             if row['state'] not in ('error', 'unconfigured', 'cancelled'):
                 raise DomainError('当前状态无需重试；未通过的原片请重新拍摄', 409)
@@ -387,6 +387,7 @@ class OfficialCamera:
                 raise DomainError('归档时设备权限或案件状态已改变，未归档')
             # Followup eligibility is computed by Domain, not just the stage column.
             current_scope = self.camera.effective_device(current_device)
+            self.camera.require_case_access(current_scope, dict(current_case), connection=con)
             self.check_case(self.domain.case(meta['case_id']), current_scope, meta['case_number'])
             identity = {'code': normalize_watermark_code(
                 (result or {}).get('antiFakeCode') or meta.get('sdk_anti_fake_code')),
@@ -515,13 +516,19 @@ def official_camera_routes(service):
 
     @router.get('/api/camera/admin/official')
     def admin(request: Request):
-        camera_admin()
+        camera_admin(project_scope=True)
+        from .identity import project_filter
+        scope, args = project_filter('ledger.project_id', manage=True)
+        # Filter by the current ledger before LIMIT; metadata is a historical snapshot.
         rows = service.db.all('''SELECT c.*,d.name AS device_name,v.state AS video_time_state,v.result AS video_time_result
             FROM camera_official_captures c
             LEFT JOIN camera_devices d ON d.id=c.device_id
+            LEFT JOIN cases ledger ON ledger.id=json_extract(c.metadata,'$.case_id')
+            LEFT JOIN photos photo ON photo.id=c.photo_id
             LEFT JOIN camera_video_times v ON v.device_id=c.device_id AND v.capture_id=c.capture_id
             WHERE c.state<>'deleted' AND (c.archived_at IS NULL OR c.photo_id IS NOT NULL)
-            ORDER BY c.created_at DESC,c.device_id,c.capture_id DESC LIMIT 100''')
+            AND (''' + scope + ''') AND (''' + ('1=1' if scope == '1=1' else 'photo.id IS NULL OR photo.project_id=ledger.project_id') + ''')
+            ORDER BY c.created_at DESC,c.device_id,c.capture_id DESC LIMIT 100''', args)
         captures = []
         for row in rows:
             meta = json.loads(row['metadata'])
@@ -551,7 +558,12 @@ def official_camera_routes(service):
                              'time_state': time_state,
                              'case_number': meta['case_number'], 'photo_group': meta.get('photo_group', ''),
                              'stage_label': GROUP_LABELS.get(meta.get('photo_group'), '未知阶段')})
-        return {'config': service.settings.status(), 'captures': captures}
+        from .identity import current
+        can_configure = current().admin
+        config = service.settings.status()
+        if not can_configure:
+            config = {key: config[key] for key in ('enabled', 'auto_verify', 'ready')}
+        return {'config': config, 'captures': captures, 'can_configure': can_configure}
 
     @router.put('/api/camera/admin/official/config')
     def configure(request: Request, data: dict = Body(...)):

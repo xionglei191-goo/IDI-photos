@@ -15,17 +15,22 @@ import java.util.concurrent.TimeUnit;
 import org.json.JSONObject;
 
 public final class UploadWorker extends Worker {
+  private static final java.util.Set<String> active = java.util.concurrent.ConcurrentHashMap.newKeySet();
+  private volatile CameraApi.Transfer transfer;
+  private volatile UploadStatus status;
   public UploadWorker(@NonNull Context context, @NonNull WorkerParameters parameters) {
     super(context, parameters);
   }
 
   static void enqueue(Context context, String id, boolean manual) {
+    CaptureStore.Item item = CaptureStore.get(context).item(id);
+    if (item == null || item.deleting()) return;
     OneTimeWorkRequest work =
         new OneTimeWorkRequest.Builder(UploadWorker.class)
             .setInputData(new Data.Builder().putString("capture_id", id).build())
             .setConstraints(
                 new Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .setBackoffCriteria(BackoffPolicy.LINEAR, 15, TimeUnit.SECONDS)
             .addTag("idi-upload")
             .build();
     WorkManager.getInstance(context)
@@ -33,7 +38,27 @@ public final class UploadWorker extends Worker {
             "capture-" + id, manual ? ExistingWorkPolicy.REPLACE : ExistingWorkPolicy.KEEP, work);
   }
 
+  static boolean active(String id) { return active.contains(id); }
+
+  static void cancel(Context context, String id) {
+    CaptureDeletion.cancelTransfers(id);
+    WorkManager.getInstance(context).cancelUniqueWork("capture-" + id);
+  }
+
+  static void networkRecovered(Context context) {
+    CaptureDeletion.pending(context);
+    CaptureStore store = CaptureStore.get(context);
+    for (CaptureStore.Item item : store.items()) {
+      if (item.demo() || !item.official() || active(item.id)) continue;
+      if (item.state.equals("retry") && !"HTTP_429".equals(item.upload.optString("error_code")))
+        enqueue(context, item.id, true);
+      else if (item.state.equals("queued") || item.state.equals("uploading") || item.state.equals("verifying"))
+        enqueue(context, item.id, false);
+    }
+  }
+
   static void pending(Context context) {
+    CaptureDeletion.pending(context);
     CaptureStore store = CaptureStore.get(context);
     for (CaptureStore.Item item : store.items())
       if (!item.demo()
@@ -51,6 +76,7 @@ public final class UploadWorker extends Worker {
     String id = getInputData().getString("capture_id");
     CaptureStore.Item item = store.item(id);
     if (item == null
+        || item.deleting()
         || item.demo()
         || item.state.equals("uploaded")
         || item.state.equals("cancelled")
@@ -60,59 +86,66 @@ public final class UploadWorker extends Worker {
       store.state(id, "failed", "自绘水印不具备官方验真，请使用今日 SDK 重新拍摄");
       return Result.failure();
     }
-    if (isStopped()) return Result.retry();
-    store.state(id, "uploading", "");
+    if (isStopped() || !active.add(id)) return Result.retry();
+    String owner = getId().toString();
     try {
-      JSONObject receipt =
-          item.receipt.isEmpty()
-              ? CameraApi.upload(store, item)
-              : CameraApi.request(
-                  item.server,
-                  "/api/camera/official-captures/" + id,
-                  store.token(item.device),
-                  null);
-      if (!id.equals(receipt.optString("capture_id"))
-          || item.video() && !"video".equals(receipt.optString("media_type"))
-          || !OfficialPhotoWriter.sha256(store.original(id))
-              .equals(receipt.optString("original_hash")))
-        throw new java.io.IOException("官方原片回执编号或哈希不匹配，未确认归档");
+      if (!store.claimUpload(id, owner)) return Result.success();
+      status = new UploadStatus(store, item, owner);
+      transfer = new CameraApi.Transfer(item.video());
+      if (isStopped()) transfer.cancel();
+      UploadNotification notification = new UploadNotification(getApplicationContext(), id);
+      try {
+        setForegroundAsync(notification.foreground(status.info)).get(5, TimeUnit.SECONDS);
+        status.foreground(true);
+        status.changed = () -> notification.update(status.info);
+      } catch (Exception foregroundUnavailable) {
+        // Background-start restrictions or denied notifications must not discard a photo.
+        status.foreground(false);
+      }
+      JSONObject receipt = UploadEngine.transfer(store, item, transfer, status);
       String verification = receipt.optString("verification_state");
       if (("verified".equals(verification) || "not_requested".equals(verification))
           && "uploaded".equals(receipt.optString("state"))
           && receipt.opt("photo_id") instanceof String
           && !receipt.optString("photo_id").isEmpty()) {
-        store.uploaded(id, receipt);
+        status.finish("uploaded", "", "", receipt, 0);
         return Result.success();
       }
       if (verification.equals("rejected")) {
-        store.receipt(id, "rejected", receipt);
+        status.finish("rejected", "VERIFICATION_REJECTED", receipt.optString("error"), receipt, 0);
         return Result.failure();
       }
       if (verification.equals("error")
           || verification.equals("cancelled")
           || verification.equals("unconfigured")) {
         if (receipt.optString("error").isEmpty()) receipt.put("error", "电脑端官方验真尚未启用，请配置后重试");
-        store.receipt(id, "verification_error", receipt);
+        status.finish("verification_error", "VERIFICATION_ERROR", receipt.optString("error"), receipt, 0);
         return Result.failure();
       }
       if (!verification.equals("queued")
           && !verification.equals("submitting")
-          && !verification.equals("processing")) throw new java.io.IOException("官方验真回执状态未知，未确认归档");
-      store.receipt(id, "verifying", receipt);
-      if (getRunAttemptCount() >= 8) {
-        store.state(id, "failed", "仍在等待官方结果，可稍后继续查询");
-        return Result.failure();
-      }
+          && !verification.equals("processing")) throw new UploadEngine.ReceiptError("官方验真回执状态未知");
+      status.finish("verifying", "", "", receipt, retryDelay());
       return Result.retry();
-    } catch (CameraApi.Failure error) {
-      boolean retry = error.retryable() && getRunAttemptCount() < 5;
-      store.state(id, retry ? "retry" : "failed", error.getMessage());
-      return retry ? Result.retry() : Result.failure();
     } catch (Exception error) {
-      boolean retry = getRunAttemptCount() < 5;
-      store.state(id, retry ? "retry" : "failed", "连接中断，原片仍在手机：" + safeMessage(error));
+      boolean retry = isStopped() || UploadStatus.retryable(error);
+      if (status != null) try {
+        status.finish(retry ? "retry" : "failed", isStopped() ? "TASK_PAUSED" : UploadStatus.code(error),
+            isStopped() ? "后台任务已暂停，网络可用时自动继续" : UploadStatus.explain(error), null, retry ? retryDelay() : 0);
+      } catch (Exception ignored) { }
       return retry ? Result.retry() : Result.failure();
+    } finally {
+      if (transfer != null) transfer.close();
+      active.remove(id);
     }
+  }
+
+  private long retryDelay() { return Math.min(18000000L, 15000L * (getRunAttemptCount() + 1)); }
+
+  @Override public void onStopped() {
+    if (transfer != null) transfer.cancel();
+    // The IO call observes cancellation and records retry. WorkManager persists rescheduling.
+    super.onStopped();
   }
 
   static String safeMessage(Throwable error) {

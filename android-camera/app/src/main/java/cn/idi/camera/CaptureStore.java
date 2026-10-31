@@ -28,7 +28,7 @@ final class CaptureStore extends SQLiteOpenHelper {
   }
 
   private CaptureStore(Context context) {
-    super(context, "camera.sqlite", null, 1);
+    super(context, "camera.sqlite", null, 2);
     this.context = context;
     prefs = context.getSharedPreferences("camera", Context.MODE_PRIVATE);
     setWriteAheadLoggingEnabled(true);
@@ -41,11 +41,71 @@ final class CaptureStore extends SQLiteOpenHelper {
         "CREATE TABLE captures(id TEXT PRIMARY KEY, metadata TEXT NOT NULL, server TEXT NOT"
             + " NULL, device TEXT NOT NULL, state TEXT NOT NULL, error TEXT NOT NULL"
             + " DEFAULT '', receipt TEXT NOT NULL DEFAULT '', created_at INTEGER NOT"
-            + " NULL)");
+            + " NULL, upload_info TEXT NOT NULL DEFAULT '{}', upload_owner TEXT NOT NULL DEFAULT '')");
   }
 
   @Override
-  public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {}
+  public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
+    if (oldVersion < 2) {
+      db.execSQL("ALTER TABLE captures ADD COLUMN upload_info TEXT NOT NULL DEFAULT '{}'");
+      db.execSQL("ALTER TABLE captures ADD COLUMN upload_owner TEXT NOT NULL DEFAULT ''");
+    }
+  }
+
+  boolean claimUpload(String id, String owner) {
+    ContentValues values = new ContentValues();
+    values.put("upload_owner", owner);
+    values.put("state", "uploading");
+    values.put("error", "");
+    return getWritableDatabase().update("captures", values,
+        "id=? AND state IN ('queued','retry','uploading','verifying','failed')", new String[] {id}) == 1;
+  }
+
+  // A cancelled worker must never replace a newer attempt's progress or receipt.
+  boolean uploadUpdate(String id, String owner, JSONObject info, String state, String error, JSONObject receipt) {
+    ContentValues values = new ContentValues();
+    values.put("upload_info", info.toString());
+    if (state != null) values.put("state", state);
+    if (error != null) values.put("error", error);
+    if (receipt != null) values.put("receipt", receipt.toString());
+    return getWritableDatabase().update("captures", values,
+        "id=? AND upload_owner=? AND state NOT IN ('delete_pending','delete_failed','deleted')",
+        new String[] {id, owner}) == 1;
+  }
+
+  boolean beginDeletion(String id) {
+    ContentValues values = new ContentValues();
+    values.put("state", "delete_pending");
+    values.put("error", "");
+    values.put("upload_owner", "");
+    return getWritableDatabase().update("captures", values,
+        "id=? AND state NOT IN ('delete_pending','deleted')", new String[] {id}) == 1;
+  }
+
+  boolean claimDeletion(String id, String owner) {
+    ContentValues values = new ContentValues();
+    values.put("upload_owner", owner);
+    return getWritableDatabase().update("captures", values,
+        "id=? AND state='delete_pending'", new String[] {id}) == 1;
+  }
+
+  boolean deletionUpdate(String id, String owner, String state, String error, JSONObject receipt) {
+    if (!java.util.Arrays.asList("delete_pending", "delete_failed", "deleted").contains(state))
+      throw new IllegalArgumentException("Invalid deletion state");
+    ContentValues values = new ContentValues();
+    values.put("state", state);
+    values.put("error", error == null ? "" : error);
+    if (receipt != null) values.put("receipt", receipt.toString());
+    return getWritableDatabase().update("captures", values,
+        "id=? AND upload_owner=? AND state='delete_pending'", new String[] {id, owner}) == 1;
+  }
+
+  boolean deletionOwned(String id, String owner) {
+    try (Cursor cursor = getReadableDatabase().rawQuery(
+        "SELECT 1 FROM captures WHERE id=? AND upload_owner=? AND state='delete_pending'", new String[] {id, owner})) {
+      return cursor.moveToFirst();
+    }
+  }
 
   File directory(String id) {
     return new File(context.getFilesDir(), "captures/" + id);
@@ -86,7 +146,7 @@ final class CaptureStore extends SQLiteOpenHelper {
   // destination even if pairing changes, and never copy the SDK's photo identity.
   synchronized String nextOfficialPhoto(String previousId, String sessionId) throws Exception {
     Item previous = item(previousId);
-    if (previous == null || previous.video() || !"xhey_sdk".equals(previous.meta.optString("source"))
+    if (previous == null || previous.deleting() || previous.video() || !"xhey_sdk".equals(previous.meta.optString("source"))
         || !original(previousId).isFile() || !stamped(previousId).isFile())
       throw new Exception("当前原片尚未保存，不能开始下一张");
     String key = "next_official_photo_" + previousId;
@@ -94,6 +154,8 @@ final class CaptureStore extends SQLiteOpenHelper {
     SQLiteDatabase db = getWritableDatabase();
     db.beginTransaction();
     try {
+      previous = item(previousId);
+      if (previous == null || previous.deleting()) throw new Exception("这份资料正在删除，不能继续连拍");
       if (nextId.isEmpty() || item(nextId) == null) {
         JSONObject old = previous.meta;
         JSONObject selected = new JSONObject().put("id", old.getString("case_id"))
@@ -117,7 +179,8 @@ final class CaptureStore extends SQLiteOpenHelper {
     ContentValues values = new ContentValues();
     values.put("state", state);
     values.put("error", error == null ? "" : error);
-    getWritableDatabase().update("captures", values, "id=?", new String[] {id});
+    getWritableDatabase().update("captures", values,
+        "id=? AND state NOT IN ('delete_pending','delete_failed','deleted')", new String[] {id});
   }
 
   void uploaded(String id, JSONObject receipt) {
@@ -193,7 +256,7 @@ final class CaptureStore extends SQLiteOpenHelper {
 
   List<Item> recordItems() {
     List<Item> result = new ArrayList<>();
-    for (Item item : items()) if (!emptyOfficialAttempt(item)) result.add(item);
+    for (Item item : items()) if (!item.state.equals("deleted") && !emptyOfficialAttempt(item)) result.add(item);
     return result;
   }
 
@@ -211,7 +274,32 @@ final class CaptureStore extends SQLiteOpenHelper {
     if (!code.isEmpty() && code.length() <= 256) item.meta.put("sdk_anti_fake_code", code);
     ContentValues values = new ContentValues();
     values.put("metadata", item.meta.toString());
-    getWritableDatabase().update("captures", values, "id=?", new String[] {id});
+    getWritableDatabase().update("captures", values,
+        "id=? AND state NOT IN ('delete_pending','delete_failed','deleted')", new String[] {id});
+  }
+
+  synchronized void resetEmptyVideoTime(String id) {
+    Item item = item(id);
+    if (item == null || !item.video() || !emptyOfficialAttempt(item)) return;
+    try { videoCaptureTime(id, null); }
+    catch (JSONException ignored) { /* No new value is encoded when clearing. */ }
+  }
+
+  synchronized void videoCaptureTime(String id, JSONObject timing) throws JSONException {
+    SQLiteDatabase db = getWritableDatabase();
+    db.beginTransaction();
+    try {
+      Item item = item(id);
+      if (item == null || !item.video() || !"xhey_sdk".equals(item.meta.optString("source"))
+          || !("awaiting_sdk".equals(item.state) || "capturing".equals(item.state))
+          || !item.receipt.isEmpty()) return;
+      if (timing == null) item.meta.remove("video_capture_time");
+      else item.meta.put("video_capture_time", timing);
+      ContentValues values = new ContentValues();
+      values.put("metadata", item.meta.toString());
+      db.update("captures", values, "id=?", new String[] {id});
+      db.setTransactionSuccessful();
+    } finally { db.endTransaction(); }
   }
 
   void receipt(String id, String state, JSONObject receipt) {
@@ -219,7 +307,8 @@ final class CaptureStore extends SQLiteOpenHelper {
     values.put("state", state);
     values.put("error", receipt.optString("error"));
     values.put("receipt", receipt.toString());
-    getWritableDatabase().update("captures", values, "id=?", new String[] {id});
+    getWritableDatabase().update("captures", values,
+        "id=? AND state NOT IN ('delete_pending','delete_failed','deleted')", new String[] {id});
   }
 
   List<Item> items() {
@@ -287,6 +376,7 @@ final class CaptureStore extends SQLiteOpenHelper {
         .putBoolean("demo", false)
         .commit();
     getWritableDatabase().delete("case_cache", null, null);
+    CaptureDeletion.scopeChanged(context);
   }
 
   String server() {
@@ -307,7 +397,7 @@ final class CaptureStore extends SQLiteOpenHelper {
 
   static final class Item {
     final String id, server, device, state, error, receipt;
-    final JSONObject meta;
+    final JSONObject meta, upload;
     final long createdAt;
 
     Item(Cursor c) {
@@ -320,6 +410,7 @@ final class CaptureStore extends SQLiteOpenHelper {
       createdAt = c.getLong(c.getColumnIndexOrThrow("created_at"));
       try {
         meta = new JSONObject(value(c, "metadata"));
+        upload = new JSONObject(value(c, "upload_info"));
       } catch (JSONException e) {
         throw new IllegalStateException(e);
       }
@@ -327,6 +418,10 @@ final class CaptureStore extends SQLiteOpenHelper {
 
     boolean demo() {
       return "demo".equals(device);
+    }
+
+    boolean deleting() {
+      return state.equals("delete_pending") || state.equals("delete_failed") || state.equals("deleted");
     }
 
     boolean official() {

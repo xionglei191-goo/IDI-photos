@@ -140,6 +140,9 @@ public class ContinuousCaptureDeviceTest {
     JSONObject pair = CameraApi.request(server, "/api/camera/pair", "", new JSONObject().put("code", code));
     store.connect(server, pair);
     store.replaceCases(CameraApi.request(server, "/api/camera/cases", store.token(store.device()), null).getJSONArray("items"));
+    NativeAuthorization.save(store, NativeAuthorization.scope(store),
+        CameraApi.request(server, "/api/camera/native-authorization", store.token(store.device()), null));
+    assertNotNull(NativeAuthorization.cached(store));
     JSONObject meta = CameraData.metadata(store.cases().get(0), "construction", "测试部位", "连续拍摄验收，非业务照片", "")
         .put("source", "xhey_sdk");
     store.create(meta, false);

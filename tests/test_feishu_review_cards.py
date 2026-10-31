@@ -101,10 +101,13 @@ def test_human_submit_is_durable_at_most_once_and_updates_original_card(bound_ca
     assert not current['card_dirty']
 
 
-@pytest.mark.parametrize('change', ['app', 'chat', 'message', 'token', 'tenant', 'unbound', 'no_acknowledgement', 'host'])
-def test_callback_rejects_forged_context_and_unbound_people(bound_cards, change):
+@pytest.mark.parametrize('external', [False, True])
+@pytest.mark.parametrize('change', ['app', 'chat', 'message', 'token', 'unbound', 'no_acknowledgement', 'host'])
+def test_callback_rejects_forged_context_and_unbound_people(bound_cards, change, external):
     cards, delivery, _, writes = bound_cards
     payload = event(delivery)
+    if external:
+        payload['event']['operator']['tenant_key'] = 'external-tenant'
     if change == 'app':
         payload['header']['app_id'] = 'cli_other'
     elif change == 'chat':
@@ -113,8 +116,6 @@ def test_callback_rejects_forged_context_and_unbound_people(bound_cards, change)
         payload['event']['context']['open_message_id'] = 'om_forwarded'
     elif change == 'token':
         payload['event']['action']['value']['card_token'] = 'stale'
-    elif change == 'tenant':
-        payload['event']['operator']['tenant_key'] = 'other'
     elif change == 'unbound':
         payload['event']['operator']['open_id'] = 'ou_stranger'
     elif change == 'no_acknowledgement':
@@ -125,10 +126,89 @@ def test_callback_rejects_forged_context_and_unbound_people(bound_cards, change)
     assert not actions(cards) and not business_submits(writes)
 
 
-@pytest.mark.parametrize('change', ['unbind', 'disabled', 'member_left', 'policy', 'material', 'binding_revision'])
-def test_queued_submission_rechecks_permission_and_materials(bound_cards, services, platform, change):
+@pytest.mark.parametrize('header_tenant', ['app-tenant', None, 'missing'])
+def test_external_project_manager_submits_once_after_attachment_timestamp_refresh(
+        bound_cards, services, platform, project, header_tenant):
+    from tests.test_project_access import make_person
+
+    cards, delivery, _, writes = bound_cards
+    manager = make_person(services, project['id'], role='manager', name='external-manager')
+    services['feishu_identities'].save({'connector_id': delivery['connector_id'], 'open_id': 'ou_lead',
+                                        'user_id': manager['id']})
+    payload = event(delivery)
+    payload['event']['operator']['tenant_key'] = 'external-tenant'
+    if header_tenant == 'missing':
+        payload['header'].pop('tenant_key')
+    else:
+        payload['header']['tenant_key'] = header_tenant
+    for value in platform.test_survey.values():
+        if isinstance(value, list):
+            for item in value:
+                item['updateTime'] = '2026-10-31T10:00:01'
+    platform.test_survey['updateTime'] = '2026-10-31T10:00:11'
+    assert receive(cards, delivery, payload)['toast']['type'] == 'info'
+    assert receive(cards, delivery, payload)['toast']['type'] == 'info'
+    assert len(actions(cards)) == 1 and not business_submits(writes)
+    cards.run_once()
+    assert actions(cards)[0]['state'] == 'done', actions(cards)
+    assert actions(cards)[0]['user_id'] == manager['id']
+    assert len(business_submits(writes)) == 1
+    assert json.loads(cards.delivery(delivery['id'])['card_view'])['verified']
+    assert receive(cards, delivery, payload)['toast']['type'] == 'info'
+    cards.run_once()
+    assert len(business_submits(writes)) == 1
+
+
+def test_upgrade_rebuilds_old_review_and_reuses_original_card_without_submitting(
+        bound_cards, services, platform, monkeypatch):
+    from idi import automatic_uploads, review_batches
+
     cards, delivery, feedback, writes = bound_cards
-    assert receive(cards, delivery, event(delivery))['toast']['type'] == 'info'
+    notifier, auto = cards.notifications, cards.notifications.automatic
+    for value in platform.test_survey.values():
+        if isinstance(value, list):
+            for item in value:
+                item['updateTime'] = '2026-10-31T09:36:25'
+    platform.test_survey['updateTime'] = '2026-10-31T09:36:25'
+    services['workflow'].refresh_case(delivery['case_id'])
+    # Reproduce an already-sent review made by the previous comparison rules.
+    with monkeypatch.context() as old:
+        old.setattr(automatic_uploads, 'REVIEW_RULES_VERSION', 2)
+        old.setattr(review_batches, 'attachment_version_data', lambda items: items)
+        auto.process(auto.get(delivery['case_id']))
+        notifier.run_once()
+        cards.synchronize(force=True)
+        old_delivery = cards.delivery(delivery['id'])
+        old_review = cards.reviews.get(old_delivery['review_id'])
+        assert old_review['state'] == 'prepared'
+        assert json.loads(old_delivery['card_view'])['mode'] == 'ready'
+    assert auto.run_once() >= 1
+    notifier.run_once()
+    cards.run_once()
+    updated = cards.delivery(delivery['id'])
+    view = json.loads(updated['card_view'])
+    assert updated['review_id'] != old_review['id'] and view['mode'] == 'ready'
+    assert cards.reviews.get(old_review['id'])['state'] == 'stale'
+    assert view['fingerprint'] == cards.reviews.get(updated['review_id'])['fingerprint']
+    assert updated['remote_message_id'] == old_delivery['remote_message_id']
+    assert len(feedback.cards) == 1 and not actions(cards) and not business_submits(writes)
+    # The new proposal still needs a fresh, explicit human confirmation.
+    payload = event(updated)
+    payload['event']['operator']['tenant_key'] = 'external-tenant'
+    assert receive(cards, updated, payload)['toast']['type'] == 'info'
+    cards.run_once()
+    assert actions(cards)[0]['state'] == 'done', actions(cards)
+    assert len(business_submits(writes)) == 1
+
+
+@pytest.mark.parametrize('external', [False, True])
+@pytest.mark.parametrize('change', ['unbind', 'disabled', 'member_left', 'policy', 'material', 'binding_revision'])
+def test_queued_submission_rechecks_permission_and_materials(bound_cards, services, platform, change, external):
+    cards, delivery, feedback, writes = bound_cards
+    payload = event(delivery)
+    if external:
+        payload['event']['operator']['tenant_key'] = 'external-tenant'
+    assert receive(cards, delivery, payload)['toast']['type'] == 'info'
     binding = services['db'].one('SELECT * FROM feishu_identity_bindings')
     if change == 'unbind':
         services['feishu_identities'].remove(binding['id'])
@@ -151,17 +231,21 @@ def test_queued_submission_rechecks_permission_and_materials(bound_cards, servic
     assert not business_submits(writes)
 
 
-def test_member_can_view_but_cannot_submit_and_other_project_manager_is_denied(bound_cards, services, project):
+@pytest.mark.parametrize('external', [False, True])
+def test_member_can_view_but_cannot_submit_and_other_project_manager_is_denied(bound_cards, services, project, external):
     cards, delivery, _, writes = bound_cards
     user = services['access'].save_user({'username': 'member-card', 'display_name': '项目成员',
                                        'password': 'isolated-member-password', 'system_role': 'user'})
     services['access'].save_members(project['id'], {'members': [{'user_id': user['id'], 'role': 'member'}]})
     services['feishu_identities'].save({'connector_id': delivery['connector_id'], 'open_id': 'ou_lead', 'user_id': user['id']})
-    assert receive(cards, delivery, event(delivery))['toast']['type'] == 'error'
+    payload = event(delivery)
+    if external:
+        payload['event']['operator']['tenant_key'] = 'external-tenant'
+    assert receive(cards, delivery, payload)['toast']['type'] == 'error'
     other = services['domain'].save_project({'name': '另一个项目'})
     services['access'].save_members(project['id'], {'members': []})
     services['access'].save_members(other['id'], {'members': [{'user_id': user['id'], 'role': 'manager'}]})
-    assert receive(cards, delivery, event(delivery))['toast']['type'] == 'error'
+    assert receive(cards, delivery, payload)['toast']['type'] == 'error'
     assert not actions(cards) and not business_submits(writes)
 
 
@@ -175,7 +259,8 @@ def test_native_edit_then_preview_then_submit_preserves_the_confirmed_values(bou
     delivery = cards.delivery(delivery['id'])
     assert json.loads(delivery['card_view'])['mode'] == 'edit'
     form = next(n for n in walk(json.loads(delivery['content'])) if n.get('tag') == 'form')
-    assert any(n.get('form_action_type') == 'submit' for n in walk(form))
+    next_step = next(n for n in walk(form) if n.get('form_action_type') == 'submit')
+    assert next_step['text']['content'] == '下一步：提交前核对'
     edited = json.loads(delivery['content'])
     assert [n['element_id'] for n in walk(edited) if n.get('element_id', '').startswith('review_field_')] == original_fields
     assert [n['img_key'] for n in walk(edited) if n.get('tag') == 'img'] == original_images
@@ -189,12 +274,59 @@ def test_native_edit_then_preview_then_submit_preserves_the_confirmed_values(bou
     delivery = cards.delivery(delivery['id'])
     view = json.loads(delivery['card_view'])
     assert view['mode'] == 'preview' and view['plan']['values']['defectDesc'] == '人工核对：墙面局部起皮'
+    preview = json.loads(delivery['content'])
+    assert '2/2 核对并提交' in preview['header']['title']['content']
+    elements = preview['body']['elements']
+    submit = next(n for n in elements if n.get('text', {}).get('content') == '保存修改并正式提交')
+    assert not submit.get('disabled') and submit['confirm']
+    assert elements.index(submit) < next(i for i, n in enumerate(elements) if n.get('tag') == 'img')
     assert not business_submits(writes)
     assert services['platform'].draft(delivery['case_id'], 'survey')['values']['defectDesc'] != '人工核对：墙面局部起皮'
     assert receive(cards, delivery, event(delivery))['toast']['type'] == 'info'
     cards.run_once()
     assert actions(cards)[-1]['state'] == 'done', actions(cards)[-1]
     assert business_submits(writes)[0]['defectDesc'] == '人工核对：墙面局部起皮'
+
+
+def test_missing_division_is_explained_and_filling_it_reenables_submission(bound_cards, services):
+    cards, delivery, _, writes = bound_cards
+    original_draft = services['platform'].draft(delivery['case_id'], 'survey')
+
+    def act(action, **kwargs):
+        current = cards.delivery(delivery['id'])
+        assert receive(cards, current, event(current, action, **kwargs))['toast']['type'] == 'info'
+        cards.run_once()
+        assert actions(cards)[-1]['state'] == 'done', actions(cards)[-1]
+        return cards.delivery(delivery['id'])
+
+    act('edit')
+    current = act('preview', form={'divisionWorksCode': '__empty__', 'defectDesc': '用户修改后待核对的说明'})
+    view = json.loads(current['card_view'])
+    assert view['mode'] == 'preview' and not view['direct_allowed']
+    elements = json.loads(current['content'])['body']['elements']
+    submit = next(n for n in elements if n.get('text', {}).get('content') == '保存修改并正式提交')
+    issue = next(n for n in elements if '暂不能正式提交：缺少分部工程' in n.get('text', {}).get('content', ''))
+    assert submit['disabled'] and '缺少分部工程' in submit['disabled_tips']['content']
+    assert elements.index(issue) < elements.index(submit) < next(i for i, n in enumerate(elements) if n.get('tag') == 'img')
+    assert receive(cards, current, event(current))['toast']['type'] == 'error'
+    assert services['platform'].draft(delivery['case_id'], 'survey') == original_draft
+    assert not business_submits(writes)
+
+    current = act('edit')
+    form = next(n for n in walk(json.loads(current['content'])) if n.get('tag') == 'form')
+    assert '提交前请补齐：缺少分部工程' in dump(form)
+    assert next(n for n in walk(form) if n.get('name') == 'defectDesc')['default_value'] == '用户修改后待核对的说明'
+    current = act('preview', form={'divisionWorksCode': 'part_engineering_03'})
+    view = json.loads(current['card_view'])
+    assert view['direct_allowed'] and not view['plan']['error_count']
+    submit = next(n for n in walk(json.loads(current['content'])) if n.get('text', {}).get('content') == '保存修改并正式提交')
+    assert not submit.get('disabled')
+    assert not business_submits(writes)
+    act('submit')
+    submitted = business_submits(writes)
+    assert len(submitted) == 1
+    assert submitted[0]['divisionWorksCode'] == 'part_engineering_03'
+    assert submitted[0]['defectDesc'] == '用户修改后待核对的说明'
 
 
 def test_reopen_preview_retains_changes_and_cancel_restores_original(bound_cards, services):

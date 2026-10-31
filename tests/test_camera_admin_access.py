@@ -78,8 +78,8 @@ def test_remote_admin_can_open_pair_and_revoke_without_localhost(remote_camera_a
             assert phone.get('/api/camera/cases', headers=headers).status_code == 401
 
 
-@pytest.mark.parametrize('role', ['anonymous', 'member', 'manager'])
-def test_remote_camera_management_requires_system_admin(remote_camera_app, role):
+@pytest.mark.parametrize('role', ['anonymous', 'member', 'worker'])
+def test_remote_camera_management_requires_administrator(remote_camera_app, role):
     app = remote_camera_app
     _, worker, project = seed_people(app, role if role != 'anonymous' else 'member')
     with remote_client(app) as client:

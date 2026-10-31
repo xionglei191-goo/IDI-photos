@@ -10,10 +10,30 @@ from datetime import datetime, timedelta, timezone
 from .connectors.secret_store import protect
 from .db import uid
 from .domain import DomainError
+from .platform_client import PlatformLoginError
 from .storage import Storage
 
 
 log = logging.getLogger(__name__)
+
+RETRY_DELAYS = (60, 120, 300)
+MAX_ATTEMPTS = len(RETRY_DELAYS) + 1
+FAILURE_MESSAGES = {
+    'credentials_rejected': '官网明确拒绝账号或密码，请核对保存的账号信息。',
+    'verification_required': '官网要求验证或账号处理，请先在官网完成处理。',
+    'login_rejected': '官网拒绝登录，请核对账号状态或官网验证要求。',
+    'http_rejected': '官网拒绝了登录请求，请核对账号状态或官网验证要求。',
+    'dependency_missing': '官网登录依赖缺失，请检查服务端 Node.js 和浏览器组件。',
+    'ambiguous_login_control': '官网登录页面控件已变化，请检查登录程序。',
+    'token_missing': '官网已响应，但暂未取得有效登录令牌。',
+    'browser_unavailable': '官网登录浏览器暂时未能启动。',
+    'timeout': '官网登录等待超时。',
+    'rate_limited': '官网暂时限制登录请求。',
+    'http_failure': '官网登录接口暂时异常。',
+    'invalid_receipt': '官网登录程序未返回有效结果。',
+    'login_response_error': '官网返回登录异常，未明确说明账号或密码错误。',
+    'login_failed': '官网登录暂未完成。',
+}
 
 
 class PlatformAccountStore:
@@ -101,13 +121,26 @@ class PlatformAccount:
                 state = 'retry_wait'
             else:
                 state = 'pending'
+            legacy_block = self._state.get('blocked') and not self._state.get('diagnostics')
+            error = ('旧版登录失败记录缺少具体原因，自动重试已暂停；请手动重试确认。' if legacy_block
+                     else self._state.get('error', ''))
             return {'configured': configured, 'username': self._config.get('username', ''),
                     'password_stored': configured, 'auto_connect': enabled, 'state': state,
                     'automatic_paused': self._temporary_override and enabled,
                     'last_attempt_at': self._state.get('last_attempt_at'),
                     'last_success_at': self._state.get('last_success_at'),
                     'next_retry_at': self._state.get('next_retry_at') if enabled and not self._temporary_override else None,
-                    'error': self._load_error or self._state.get('error', ''), 'session': session}
+                    'error': self._load_error or error, 'session': session,
+                    'failures': self._state.get('failures', 0), 'max_attempts': MAX_ATTEMPTS,
+                    'diagnostics': self._state.get('diagnostics', {}),
+                    'first_failure_at': self._state.get('first_failure_at'),
+                    'blocked_at': self._state.get('blocked_at') or (self._state.get('last_attempt_at') if legacy_block else None),
+                    'blocked_reason': 'legacy_unknown' if legacy_block else self._state.get('blocked_reason')}
+
+    def _success(self):
+        self._state.update(last_success_at=self.clock().isoformat(), failures=0, blocked=False, error='',
+                           next_retry_at=None, diagnostics={}, first_failure_at=None, blocked_at=None,
+                           blocked_reason=None)
 
     @contextmanager
     def _editing(self):
@@ -180,8 +213,7 @@ class PlatformAccount:
                     self._temporary_override = bool(self._config) and (username.strip(), password) != (
                         self._config['username'], self._config['password'])
                     if self._config and not self._temporary_override:
-                        self._state.update(last_success_at=self.clock().isoformat(), failures=0,
-                                           blocked=False, error='', next_retry_at=None)
+                        self._success()
                         self._persist()
                 return session
             finally:
@@ -212,6 +244,10 @@ class PlatformAccount:
                 previous_state, previous_override = dict(self._state), self._temporary_override
                 self._temporary_override = False
                 self._connecting = True
+                if force:
+                    # An explicit retry starts a new bounded attempt window. Restart never does.
+                    self._state.update(failures=0, blocked=False, blocked_at=None, blocked_reason=None,
+                                       first_failure_at=None, diagnostics={})
                 self._state.update(last_attempt_at=self.clock().isoformat(), next_retry_at=None, error='')
                 try:
                     self._persist()
@@ -248,20 +284,35 @@ class PlatformAccount:
                     self.validate(self._config['username'])
                 self.client.login(self._config['username'], self._config['password'])
             with self._meta:
-                self._state.update(last_success_at=self.clock().isoformat(), failures=0,
-                                   blocked=False, error='', next_retry_at=None)
+                self._success()
                 self._persist()
         except Exception as error:
             with self._meta:
+                if self._stop.is_set():
+                    # Shutdown cancellation is not an account failure and must not consume retries.
+                    return
                 failures = self._state.get('failures', 0) + 1
-                blocked = isinstance(error, DomainError) and (error.status in (400, 401, 403) or getattr(error, 'retryable', True) is False)
-                # Only fixed messages are persisted: no upstream body, password, or token.
-                detail = ('官网登录未完成，请核对账号密码、官网验证或本机浏览器后手动重试。' if blocked
-                          else '官网暂时无法连接，将按重试时间再次尝试。' if self._config['auto_connect']
-                          else '官网暂时无法连接，请稍后手动重试。')
-                retry = (self.clock() + timedelta(seconds=min(1800, 60 * 2 ** min(failures - 1, 5)))).isoformat()
+                permanent = isinstance(error, DomainError) and (error.status in (400, 401, 403) or getattr(error, 'retryable', True) is False)
+                blocked = permanent or failures >= MAX_ATTEMPTS
+                at = self.clock()
+                diagnostic = (error.diagnostics if isinstance(error, PlatformLoginError) else
+                              PlatformLoginError('', getattr(error, 'status', 502),
+                                                 failure='http_rejected' if permanent else 'login_failed').diagnostics)
+                reason = 'manual_required' if permanent else 'retry_limit' if blocked else None
+                detail = FAILURE_MESSAGES[diagnostic['failure']]
+                if blocked:
+                    detail += (' 自动重试已暂停，请处理后点击“立即连接”。' if permanent else
+                               f' 连续 {failures} 次未成功，已暂停自动重试；请检查官网后点击“立即连接”。')
+                elif self._config['auto_connect']:
+                    detail += f' 将按计划重试（本轮已尝试 {failures}/{MAX_ATTEMPTS} 次）。'
+                else:
+                    detail += ' 自动连接未开启，请稍后手动重试。'
+                retry = (at + timedelta(seconds=RETRY_DELAYS[min(failures - 1, len(RETRY_DELAYS) - 1)])).isoformat()
                 self._state.update(failures=failures, blocked=blocked, error=detail,
-                                   next_retry_at=None if blocked else retry)
+                                   next_retry_at=retry if not blocked and self._config['auto_connect'] else None,
+                                   diagnostics=diagnostic, blocked_reason=reason,
+                                   blocked_at=at.isoformat() if blocked else None,
+                                   first_failure_at=self._state.get('first_failure_at') or at.isoformat())
                 self._persist()
         finally:
             with self._meta:

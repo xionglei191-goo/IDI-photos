@@ -3,27 +3,40 @@ package cn.idi.camera;
 import android.app.AlertDialog;
 import android.graphics.Color;
 import android.text.Editable;
+import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.view.View;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import org.json.JSONObject;
 
 final class CaseScreen {
+  static final String[] STAGES = {"", "survey", "repair", "acceptance"};
+  static final String[] STAGE_LABELS = {"全部状态", "查勘", "施工", "验收"};
   final MainActivity a;
   final Ui u;
+  final String filterKey;
   LinearLayout list;
-  String query = "", project = "";
-  TextView projectButton;
+  String query, project, projectName, stage;
+  TextView projectButton, stageButton;
 
   CaseScreen(MainActivity a) {
     this.a = a;
     u = a.ui;
+    // Screens are rebuilt on navigation and sync. Keep filters with the paired
+    // device, separately from demo mode and any later connection.
+    filterKey = "case_filters_" + (a.demo ? "demo" : a.store.server() + "|" + a.store.device()) + "_";
+    query = a.store.prefs.getString(filterKey + "query", "");
+    project = a.store.prefs.getString(filterKey + "project", "");
+    projectName = a.store.prefs.getString(filterKey + "project_name", "");
+    stage = a.store.prefs.getString(filterKey + "stage", "");
+    if (!Arrays.asList(STAGES).contains(stage)) stage = "";
   }
 
   View view() {
@@ -43,11 +56,22 @@ final class CaseScreen {
       page.addView(banner);
       u.gap(page, 12);
     }
+    LinearLayout filters = u.row();
     projectButton = u.button("全部项目  ▾", false, this::chooseProject);
     projectButton.setGravity(android.view.Gravity.START | android.view.Gravity.CENTER_VERTICAL);
-    page.addView(projectButton);
+    projectButton.setSingleLine(true);
+    projectButton.setMinHeight(u.dp(50));
+    projectButton.setEllipsize(TextUtils.TruncateAt.END);
+    u.weight(filters, projectButton);
+    stageButton = u.button("全部状态  ▾", false, this::chooseStage);
+    stageButton.setSingleLine(true);
+    stageButton.setMinHeight(u.dp(50));
+    LinearLayout.LayoutParams stageParams = new LinearLayout.LayoutParams(-2, -2);
+    stageParams.leftMargin = u.dp(10);
+    filters.addView(stageButton, stageParams);
+    page.addView(filters);
     u.gap(page, 12);
-    EditText search = u.input("", "搜索楼栋、房号、案件号", 80);
+    EditText search = u.input(query, "搜索楼栋、房号、案件号", 80);
     search.setSingleLine(true);
     page.addView(search);
     u.gap(page, 12);
@@ -65,7 +89,8 @@ final class CaseScreen {
           public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
 
           public void onTextChanged(CharSequence s, int start, int before, int count) {
-            query = s.toString().trim().toLowerCase(Locale.ROOT);
+            query = s.toString();
+            saveFilters();
             refresh();
           }
 
@@ -78,6 +103,8 @@ final class CaseScreen {
   void refresh() {
     list.removeAllViews();
     List<JSONObject> cases = new ArrayList<>(a.cases());
+    updateFilterButtons(cases);
+    String search = query.trim().toLowerCase(Locale.ROOT);
     cases.sort(
         (x, y) ->
             Long.compare(
@@ -94,9 +121,10 @@ final class CaseScreen {
                   + " "
                   + c.optString("case_number"))
               .toLowerCase(Locale.ROOT);
-      if (!project.isEmpty() && !project.equals(c.optString("project_id"))
-          || !query.isEmpty() && !text.contains(query)) continue;
-      boolean prominent = count == 0 && query.isEmpty();
+      if ((!project.isEmpty() && !project.equals(c.optString("project_id")))
+          || (!stage.isEmpty() && !stage.equals(c.optString("workflow_stage")))
+          || (!search.isEmpty() && !text.contains(search))) continue;
+      boolean prominent = count == 0 && search.isEmpty();
       LinearLayout card = u.column();
       u.pad(card, 16);
       u.surface(card, prominent ? Ui.PALE : Color.WHITE, prominent ? Ui.ORANGE : Ui.BORDER, 12);
@@ -148,7 +176,7 @@ final class CaseScreen {
       u.gap(list, 12);
       list.addView(
           u.text(
-              cases.isEmpty() ? "案件可离线查看；官方拍摄需联网，已拍原片会保留并在联网后补传。" : "试试房号或完整案件号，或切换项目。",
+              cases.isEmpty() ? "案件可离线查看；官方拍摄需联网，已拍原片会保留并在联网后补传。" : "调整搜索条件，或切换项目、状态。",
               15,
               Ui.MUTED,
               false));
@@ -168,19 +196,74 @@ final class CaseScreen {
   void chooseProject() {
     LinkedHashMap<String, String> projects = new LinkedHashMap<>();
     projects.put("", "全部项目");
-    for (JSONObject c : a.cases())
-      projects.put(c.optString("project_id"), c.optString("project_name"));
+    for (JSONObject c : a.cases()) {
+      String id = c.optString("project_id");
+      if (!id.isEmpty()) projects.put(id, c.optString("project_name"));
+    }
     String[] ids = projects.keySet().toArray(new String[0]),
         labels = projects.values().toArray(new String[0]);
     new AlertDialog.Builder(a)
         .setTitle("选择项目")
-        .setItems(
+        .setSingleChoiceItems(
             labels,
+            Arrays.asList(ids).indexOf(project),
             (d, index) -> {
               project = ids[index];
-              projectButton.setText(labels[index] + "  ▾");
+              projectName = project.isEmpty() ? "" : labels[index];
+              saveFilters();
               refresh();
+              d.dismiss();
             })
+        .setNegativeButton("取消", null)
         .show();
+  }
+
+  void chooseStage() {
+    new AlertDialog.Builder(a)
+        .setTitle("选择状态")
+        .setSingleChoiceItems(
+            STAGE_LABELS,
+            Arrays.asList(STAGES).indexOf(stage),
+            (d, index) -> {
+              stage = STAGES[index];
+              saveFilters();
+              refresh();
+              d.dismiss();
+            })
+        .setNegativeButton("取消", null)
+        .show();
+  }
+
+  void saveFilters() {
+    a.store.prefs.edit()
+        .putString(filterKey + "query", query)
+        .putString(filterKey + "project", project)
+        .putString(filterKey + "project_name", projectName)
+        .putString(filterKey + "stage", stage)
+        .apply();
+  }
+
+  private void updateFilterButtons(List<JSONObject> cases) {
+    for (JSONObject c : cases) {
+      if (!project.isEmpty() && project.equals(c.optString("project_id"))) {
+        String name = c.optString("project_name");
+        if (!name.isEmpty()) projectName = name;
+        break;
+      }
+    }
+    String projectLabel = project.isEmpty() ? "全部项目" : projectName.isEmpty() ? "已选项目" : projectName;
+    String stageLabel = STAGE_LABELS[Arrays.asList(STAGES).indexOf(stage)];
+    projectButton.setText(a.getString(R.string.case_filter_value, projectLabel));
+    projectButton.setContentDescription("项目筛选：" + projectLabel);
+    stageButton.setText(a.getString(R.string.case_filter_value, stageLabel));
+    stageButton.setContentDescription("状态筛选：" + stageLabel);
+    projectButton.setSelected(!project.isEmpty());
+    stageButton.setSelected(!stage.isEmpty());
+    projectButton.setTextColor(project.isEmpty() ? Ui.INK : Ui.ORANGE);
+    stageButton.setTextColor(stage.isEmpty() ? Ui.INK : Ui.ORANGE);
+    u.ripple(projectButton, project.isEmpty() ? Color.WHITE : Ui.PALE,
+        project.isEmpty() ? Ui.BORDER : Ui.ORANGE, 10);
+    u.ripple(stageButton, stage.isEmpty() ? Color.WHITE : Ui.PALE,
+        stage.isEmpty() ? Ui.BORDER : Ui.ORANGE, 10);
   }
 }

@@ -61,8 +61,7 @@ class CameraCaptureDeletion:
         case = con.execute('SELECT * FROM cases WHERE id=?', (case_id,)).fetchone()
         if not case:
             raise DomainError('案件不存在，请联系管理员核对', 404)
-        if case['project_id'] not in device['project_ids']:
-            raise DomainError('设备无此项目权限', 403)
+        self.camera.require_case_access(device, dict(case), connection=con)
         if supplied_case != case_id:
             raise DomainError('拍摄记录与案件不一致，未删除', 409)
         if previous:

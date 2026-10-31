@@ -7,6 +7,7 @@ import io
 import json
 import re
 import threading
+from .background import background_work
 import time
 
 import httpx
@@ -91,7 +92,8 @@ class CaseAgent:
     def __init__(self, settings, db, domain, storage, recognizer, followup):
         self.settings, self.db, self.domain, self.storage = settings, db, domain, storage
         self.recognizer, self.followup = recognizer, followup
-        self._stop, self._wake = threading.Event(), threading.Event()
+        self._stop = threading.Event()
+        self._signal = db.runtime.watch('case-agent', {'case_agent_runs': {'state'}})
         self._lock, self._thread = threading.Lock(), None
 
     def snapshot(self, case_id):
@@ -207,7 +209,6 @@ class CaseAgent:
                     con.execute('INSERT INTO case_agent_runs(id,case_id,signature,snapshot,model,created_at,user_id) VALUES(?,?,?,?,?,?,?)',
                                 (run_id, case_id, signature, dump(snapshot), config['model'], now(), current().id if current() else None))
                     audit(con, 'case_agent', run_id, 'request', after={'case_id': case_id, 'signature': signature, 'model': config['model']})
-        self._wake.set()
         return {**self.get(run_id), 'cached': cached}
 
     def cancel(self, run_id):
@@ -405,16 +406,21 @@ class CaseAgent:
                 'scope': '本机已关联本案的资料；审阅建议不代表施工质量或验收结论',
                 'state': 'partial' if unseen else 'completed'}
 
+    @background_work('case_agent.run')
     def run_one(self):
         if not self._lock.acquire(blocking=False):
             return False
         try:
+            if not self.db.one("SELECT id FROM case_agent_runs WHERE state='queued' LIMIT 1"):
+                self.db.runtime.count('case_agent.run', 'empty_polls')
+                return False
             with self.db.tx() as con:
                 row = con.execute("SELECT * FROM case_agent_runs WHERE state='queued' ORDER BY created_at,id LIMIT 1").fetchone()
                 if not row:
                     return False
                 run = dict(row)
                 con.execute("UPDATE case_agent_runs SET state='running',started_at=? WHERE id=?", (now(), run['id']))
+            self.db.runtime.queue_delay('case_agent.run', run['created_at'])
             self._execute(run)
             return True
         finally:
@@ -582,16 +588,16 @@ class CaseAgent:
 
     def stop(self):
         self._stop.set()
-        self._wake.set()
+        self._signal.wake(False)
         if self._thread:
             self._thread.join(timeout=2)
 
     def _loop(self):
         while not self._stop.is_set():
+            observed = self._signal.token()
             try:
                 if self.run_one():
                     continue
             except Exception:
                 pass  # run state and error are persisted; keep the worker available.
-            self._wake.wait(2)
-            self._wake.clear()
+            self.db.runtime.wait('case_agent.run', self._signal, observed, 15, self._stop)

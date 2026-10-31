@@ -55,7 +55,7 @@ function AutomaticSettings(props: Props) {
 }
 
 export default function SettingsCenter(props: Props) {
-  const { isAdmin } = usePermissions();
+  const { isAdmin, isManager, canManage } = usePermissions();
   const { target, navigate, system, projects, cases, jobs, revision, refresh, notify, login, editProject, newProject, registerLeave } = props;
   const accountLeave = useRef<(() => Promise<boolean>) | null>(null), workspaceLeave = useRef<(() => Promise<boolean>) | null>(null);
   const registerAccountLeave = useCallback((callback: (() => Promise<boolean>) | null) => { accountLeave.current = callback; }, []);
@@ -76,8 +76,8 @@ export default function SettingsCenter(props: Props) {
       <nav className="settings-nav" aria-label="设置分类">{SECTIONS.map(item => <button key={item.key} aria-label={item.label} className={target.section === item.key ? 'active' : ''} aria-current={target.section === item.key ? 'page' : undefined} onClick={() => navigate({ section: item.key })}><item.icon size={18} aria-hidden="true" /><span><strong>{item.label}</strong><small>{item.hint}</small></span></button>)}</nav>
       <div className="settings-content">
         <div className="settings-section-heading"><h2>{section.label}</h2><p>{section.hint}</p></div>
-        {!isAdmin && !['automation', 'tasks'].includes(target.section) && <ProjectSettingsContent key={target.section} target={target} projects={projects} system={system} revision={revision} />}
-        {isAdmin && target.section === 'access' && <AccessSettings projects={projects} notify={notify} initialProjectId={target.projectId} focusProjectAccount={!!target.projectId} />}
+        {!isAdmin && !['access', 'automation', 'tasks'].includes(target.section) && <ProjectSettingsContent key={target.section} target={target} projects={projects} system={system} revision={revision} />}
+        {isManager && target.section === 'access' && <AccessSettings projects={projects.filter(p => canManage(p.id))} notify={notify} initialProjectId={target.projectId} focusProjectAccount={!!target.projectId} />}
         {isAdmin && target.section === 'connections' && <PlatformAccountSettings refresh={refresh} notify={notify} registerLeave={registerAccountLeave} />}
         {isAdmin && target.section === 'connections' && <><section className="settings-card" aria-label="IDI 水印相机"><h3>IDI 水印相机</h3><p>安卓相机通过今日官方 Android 原生 SDK 拍摄，原片上传到电脑归档，不自动提交保司。本地验真为可选项，默认关闭；拍摄前需联网并允许相机和精确定位。</p><div className="row wrap"><a className="button" href="/camera/download">下载安卓安装包</a><a className="button" href="/camera-setup" target="_blank" rel="noreferrer">管理手机连接</a></div><p className="muted">系统管理员登录后可在此管理手机连接，选择人员和项目并生成配对码。</p></section><Connections embedded projects={projects} cases={cases} revision={revision} refresh={refresh} notify={notify} /></>}
         {target.section === 'automation' && <AutomaticSettings {...props} />}
@@ -85,7 +85,7 @@ export default function SettingsCenter(props: Props) {
         {target.section === 'materials' && <div className="settings-subnav" role="group" aria-label="资料管理分类">{[['projects', '项目管理'], ['templates', '资料要求'], ['archive', '资料目录']].map(([tab, label]) => <button key={tab} aria-pressed={materialTab === tab} onClick={() => navigate({ section: 'materials', tab })}>{label}</button>)}</div>}
         {target.section === 'tasks' && <><div className="settings-subnav" role="group" aria-label="后台任务分类">{[['uploads', '保存进度'], ['runtime', '运行详情'], ['jobs', '任务记录']].map(([tab, label]) => <button key={tab} aria-pressed={taskTab === tab} onClick={() => navigate({ section: 'tasks', tab })}>{label}</button>)}</div>
           {taskTab === 'uploads' && <AutomaticUploads view="progress" currentCase={props.currentCase} openCase={props.openCase} leave={props.leave} refresh={refresh} notify={notify} login={login} openProjectAccount={projectId => navigate({ section: 'access', projectId })} />}
-          {taskTab === 'runtime' && <RuntimeStatus login={login} settings={() => navigate({ section: 'recognition' })} channels={() => navigate({ section: 'connections' })} />}
+          {taskTab === 'runtime' && <RuntimeStatus login={login} settings={() => navigate({ section: 'recognition' })} channels={() => navigate({ section: 'connections' })} openAccount={projectId => navigate(projectId ? { section: 'access', projectId } : { section: 'connections' })} />}
           {taskTab === 'jobs' && <JobsWorkspace embedded revision={revision} refresh={refresh} notify={notify} />}
         </>}
         {isAdmin && hasExistingPanel && <SettingsWorkspace embedded initialTab={existingTab} system={system} projects={projects} revision={revision} refresh={refresh} notify={notify} editProject={editProject} newProject={newProject} registerLeave={registerWorkspaceLeave} />}

@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import threading
+from .background import background_work
 import time
 from collections import Counter
 from copy import deepcopy
@@ -165,7 +166,8 @@ class WorkspaceChat:
         self.project_service = project_service
         for attr in ('db', 'domain', 'storage', 'platform', 'reviews', 'workflow', 'case_agent', 'recognizer', 'memory', 'followup', 'photo_ai'):
             setattr(self, attr, getattr(project_service, attr))
-        self._stop, self._wake = threading.Event(), threading.Event()
+        self._stop = threading.Event()
+        self._signal = self.db.runtime.watch('workspace-chat', {'workspace_chat_turns': {'state'}})
         self._thread = None
 
     def project_snapshot(self, project_id, followup_only=False):
@@ -284,7 +286,6 @@ class WorkspaceChat:
             con.execute('INSERT INTO workspace_chat_turns(id,thread_id,owner_hash,request_id,question,created_at) VALUES(?,?,?,?,?,?)',
                 (turn_id, thread_id, owner, request_id, question, now()))
             con.execute('UPDATE workspace_chat_threads SET updated_at=? WHERE id=?', (now(), thread_id))
-        self._wake.set()
         return {'thread_id': thread_id, 'turn_id': turn_id}
 
     def cancel(self, key, turn_id):
@@ -312,7 +313,11 @@ class WorkspaceChat:
             raise DomainError('对话中的项目已变更，请新建对话', 409)
         return {'project_ids': task['project_ids'], 'save_drafts': False}
 
+    @background_work('workspace_chat.run')
     def run_one(self):
+        if not self.db.one("SELECT id FROM workspace_chat_turns WHERE state='queued' LIMIT 1"):
+            self.db.runtime.count('workspace_chat.run', 'empty_polls')
+            return False
         with self.db.tx() as con:
             row = con.execute("SELECT * FROM workspace_chat_turns WHERE state='queued' ORDER BY created_at,id LIMIT 1").fetchone()
             if not row:
@@ -323,6 +328,7 @@ class WorkspaceChat:
                 user_id=thread['user_id'], scope_mode='all_authorized' if all_project_scope(dict(thread)) else 'selected',
                 kind='chat', input={'text': task['question']}, source_message_id='', chat_id='')
             con.execute("UPDATE workspace_chat_turns SET state='running',progress='正在理解问题',started_at=?,model=? WHERE id=?", (now(), self.db.setting('recognition', {}).get('model', ''), task['id']))
+        self.db.runtime.queue_delay('workspace_chat.run', task['created_at'])
         self._execute(task)
         return True
 
@@ -460,17 +466,17 @@ class WorkspaceChat:
 
     def stop(self):
         self._stop.set()
-        self._wake.set()
+        self._signal.wake(False)
         if self._thread:
             self._thread.join(timeout=2)
         self._thread = None
 
     def _worker(self):
         while not self._stop.is_set():
+            observed = self._signal.token()
             try:
                 if self.run_one():
                     continue
             except Exception:
                 log.exception('Workspace chat worker failed')
-            self._wake.wait(1)
-            self._wake.clear()
+            self.db.runtime.wait('workspace_chat.run', self._signal, observed, 15, self._stop)

@@ -36,6 +36,42 @@ def parent_guard(pid):
     return alive
 
 
+def run_capture_queue(capture, alive, stop):
+    """Wake after durable enqueue; bounded deadlines also cover external writers."""
+    class ParentStop:
+        def is_set(self):
+            return stop.is_set() or not alive()
+
+    guard = ParentStop()
+    service, runtime = capture.service, capture.db.runtime
+    next_history, next_config, config_token = 0, 0, None
+    while not guard.is_set():
+        observed = capture._signal.token()
+        with runtime.measure('capture.cycle'), capture.db.connection_scope():
+            token, current = service._config_signal.token(), time.monotonic()
+            if token != config_token or current >= next_config:
+                latest = service.config(capture.connector_id)
+                if not latest['enabled']:
+                    return
+                capture.connector = latest
+                config_token, next_config = token, current + 15
+            capture.heartbeat()
+            if current >= next_history:
+                capture.catch_up()
+                next_history = time.monotonic() + 30
+            processed = 0
+            for _ in range(4):
+                if guard.is_set() or not capture.process_one():
+                    break
+                processed += 1
+                capture.heartbeat()
+            current = time.monotonic()
+            delay = max(0, min(capture.next_delay(), next_history - current,
+                               next_config - current, capture._heartbeat_at + 15 - current))
+        if processed < 4:
+            runtime.wait('capture.cycle', capture._signal, observed, delay, guard)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--connector-id', required=True)
@@ -44,7 +80,7 @@ def main():
     args = parser.parse_args()
     services = create_app(Settings(Path(args.data_dir).resolve(), worker_enabled=False)).state.services
     service = services['connectors']
-    connector = service.get(args.connector_id)
+    connector = service.config(args.connector_id)
     if connector['kind'] != 'feishu' or not connector['enabled']:
         return
     secret = SecretStore(service.settings.data_dir).load(connector['id'])
@@ -52,31 +88,20 @@ def main():
     capture = FeishuCapture(service, connector['id'], client)
     capture.recover()
     alive = parent_guard(args.parent_pid)
+    stop = threading.Event()
+    service.db.runtime.start(role='feishu-' + connector['id'])
 
     def work():
+        code = 0
         try:
-            run_queue()
+            run_capture_queue(capture, alive, stop)
         except Exception:
             capture.state(phase='error', error='接收队列暂时停止，服务将自动重启接收进程')
-            os._exit(1)
-
-    def run_queue():
-        next_history = 0
-        while alive():
-            latest = service.get(connector['id'])
-            if not latest['enabled']:
-                break
-            capture.state(heartbeat_at=now())
-            if time.monotonic() >= next_history:
-                capture.catch_up()
-                next_history = time.monotonic() + 30
-            # Bound each pass so heartbeats and history keep making progress.
-            for _ in range(4):
-                if not alive() or not capture.process_one():
-                    break
-                capture.state(heartbeat_at=now())
-            time.sleep(1)
-        os._exit(0)
+            code = 1
+        finally:
+            stop.set()
+            service.db.runtime.stop()
+            os._exit(code)
 
     thread = threading.Thread(target=work, name='feishu-download', daemon=True)
     thread.start()
@@ -86,6 +111,9 @@ def main():
     except Exception:
         capture.state(phase='error', error='飞书长连接启动失败，请检查凭据、应用发布及事件订阅配置')
     finally:
+        stop.set()
+        capture._signal.wake(False)
+        service.db.runtime.stop()
         client.close()
 
 

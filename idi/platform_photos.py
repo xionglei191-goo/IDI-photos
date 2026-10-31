@@ -10,6 +10,30 @@ def active_attachment(item):
             and str(item.get('invalid', '')).lower() not in ('1', 'true'))
 
 
+def attachment_version_data(items):
+    """Ignore only a stored attachment's mutable update time, without editing it."""
+    if not isinstance(items, list):
+        return items
+    return [{key: value for key, value in item.items() if key != 'updateTime'}
+            if isinstance(item, dict) and item.get('id') and item.get('fileUrl') else item
+            for item in items]
+
+
+def snapshot_version_data(snapshot):
+    """Keep business/attachment changes significant when comparing readbacks."""
+    result = {key: value for key, value in snapshot.items()
+              if key not in ('fetched_at', 'list_verified_at', 'account')}
+    keys = {field['key'] for stage in STAGES.values() for field in stage['fields'] if field['kind'] == 'files'}
+    for section in ('row', 'claim', 'survey', 'repair'):
+        if isinstance(result.get(section), dict):
+            result[section] = {key: attachment_version_data(value) if key in keys else value
+                               for key, value in result[section].items()
+                               # Detail updateTime is website bookkeeping, not
+                               # a business date such as siteSurveyDate.
+                               if key != 'updateTime' or section == 'row'}
+    return result
+
+
 def attachment_removal_history(previous, snapshot, read_at):
     """Record disappearance only from successfully read, explicit file lists."""
     from copy import deepcopy

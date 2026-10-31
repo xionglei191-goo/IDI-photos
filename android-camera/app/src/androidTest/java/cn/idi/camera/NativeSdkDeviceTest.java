@@ -335,6 +335,9 @@ public class NativeSdkDeviceTest {
     store.connect(server, pair);
     JSONObject cases = CameraApi.request(server, "/api/camera/cases", store.token(store.device()), null);
     store.replaceCases(cases.getJSONArray("items"));
+    NativeAuthorization.save(store, NativeAuthorization.scope(store),
+        CameraApi.request(server, "/api/camera/native-authorization", store.token(store.device()), null));
+    assertNotNull(NativeAuthorization.cached(store));
     JSONObject meta = CameraData.metadata(store.cases().get(0), "construction", "测试部位", "原生 SDK 联调，非业务照片", "").put("source", "xhey_sdk");
     store.create(meta, false);
     String id = meta.getString("capture_id"); store.state(id, "awaiting_sdk", "");

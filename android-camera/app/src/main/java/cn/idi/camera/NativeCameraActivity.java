@@ -4,6 +4,8 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.os.Bundle;
 import android.view.View;
+import android.view.Gravity;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -25,13 +27,18 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import org.json.JSONObject;
 
-/** Saves each SDK photo before opening the next capture in the same field session. */
+/** Saves each SDK photo before resuming the same preview with a new capture identity. */
 public final class NativeCameraActivity extends ComponentActivity {
   CaptureStore store;
   String captureId, sessionId;
   TextView status, retry;
+  FrameLayout root;
+  android.graphics.Bitmap transitionFrame;
+  FrameLayout transitionCover;
+  LinearLayout feedback;
   boolean launched, saving, ended, requesting, pendingPhotoContinuation, showEditor = true;
   final android.os.Handler launchHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+  final Runnable slowPreparation = () -> { if (!launched && !ended && !isDestroyed()) feedback.setVisibility(View.VISIBLE); };
   ActivityResultLauncher<Intent> camera;
   final EventBus.EventBusDelegate listener = (name, payload) -> {
     if (payload instanceof EventBus.EventData.CameraActivityWillDismiss event
@@ -77,22 +84,30 @@ public final class NativeCameraActivity extends ComponentActivity {
       else cancel();
     });
     Ui ui = new Ui(this);
-    LinearLayout root = ui.column();
-    root.setBackgroundColor(Color.rgb(23, 28, 34));
+    root = new FrameLayout(this);
+    root.setBackgroundColor(Color.TRANSPARENT);
+    feedback = ui.column();
+    ui.pad(feedback, 16);
+    ui.surface(feedback, Color.WHITE, Ui.BORDER, 16);
+    feedback.setVisibility(View.GONE);
     LinearLayout header = ui.row();
-    header.addView(ui.icon("back", "返回案件", Color.WHITE, this::cancel));
-    ui.weight(header, ui.text("今日原生相机", 20, Color.WHITE, true));
-    root.addView(header);
-    status = ui.text("正在准备官方拍摄…", 16, Color.WHITE, false);
-    ui.pad(status, 20);
-    root.addView(status);
+    header.addView(ui.icon("back", "返回案件", Ui.MUTED, this::cancel));
+    ui.weight(header, ui.text("拍摄", 20, Color.BLACK, true));
+    feedback.addView(header);
+    status = ui.text("正在准备相机…", 16, Ui.MUTED, false);
+    ui.pad(status, 12);
+    feedback.addView(status);
     retry = ui.button("重新打开官方相机", true, this::open);
     retry.setVisibility(View.GONE);
-    root.addView(retry);
+    feedback.addView(retry);
+    FrameLayout.LayoutParams panel = new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM);
+    panel.setMargins(ui.dp(16), ui.dp(16), ui.dp(16), ui.dp(24));
+    root.addView(feedback, panel);
     setContentView(root);
+    CameraPreviewTransition.attach(this);
     ViewCompat.setOnApplyWindowInsetsListener(root, (view, insets) -> {
       androidx.core.graphics.Insets bars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
-      view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+      if (transitionFrame == null) view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
       return insets;
     });
     getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
@@ -111,24 +126,29 @@ public final class NativeCameraActivity extends ComponentActivity {
     if (!problem.isEmpty()) { fail(problem); return; }
     requesting = true;
     retry.setVisibility(View.GONE);
-    status.setText("正在获取本次拍摄授权…");
+    status.setText("正在准备相机…");
+    prepareFeedback();
     store.state(captureId, "awaiting_sdk", "");
     store.activeCaptures.add(captureId);
     CaptureStore.Item item = store.item(captureId);
     final String id = captureId;
     final boolean edit = showEditor;
-    CaptureStore.io.execute(() -> {
+    CameraLaunch.io.execute(() -> {
       try {
-        JSONObject session = CameraApi.request(item.server, "/api/camera/native-session", store.token(item.device), item.meta);
+        JSONObject session = NativeAuthorization.session(store, item);
         if (item.video() && !"video".equals(session.optString("media_type")))
           throw new Exception("电脑端尚未支持录像，请更新工作台后重试");
         Intent intent = ConfiguredXheyAdapter.intent(this, session, id, getIntent().getBooleanExtra("emulator_test", false));
         intent.putExtra(EditableCameraActivity.SHOW_EDITOR, edit);
-        runOnUiThread(() -> launchAfterRelease(intent, android.os.SystemClock.uptimeMillis() + 10000));
+        runOnUiThread(() -> {
+          if (ended || isDestroyed() || !id.equals(captureId)) return;
+          launchAfterRelease(intent, android.os.SystemClock.uptimeMillis() + 10000);
+        });
       } catch (Exception | LinkageError error) {
         runOnUiThread(() -> {
+          if (!id.equals(captureId)) return;
           requesting = false;
-          if (!ended && !isDestroyed()) fail("拍摄授权获取失败：" + UploadWorker.safeMessage(error));
+          if (!ended && !isDestroyed()) fail("相机准备失败：" + UploadWorker.safeMessage(error));
         });
       }
     });
@@ -151,8 +171,9 @@ public final class NativeCameraActivity extends ComponentActivity {
     requesting = false;
     try {
       launched = true;
-      status.setText("请在官方相机中核对水印并拍摄");
-      camera.launch(intent);
+      launchHandler.removeCallbacks(slowPreparation);
+      feedback.setVisibility(View.GONE);
+      camera.launch(intent, androidx.core.app.ActivityOptionsCompat.makeCustomAnimation(this, 0, 0));
     } catch (RuntimeException | LinkageError error) {
       launched = false;
       fail("官方相机启动失败，请更新安装包后重试");
@@ -161,6 +182,10 @@ public final class NativeCameraActivity extends ComponentActivity {
 
   void accept(CameraActivity.Result result, CameraActivity vendor) {
     if (saving || ended || isDestroyed()) return;
+    if (vendor instanceof EditableCameraActivity editable && editable.continuingPhoto) return;
+    // The SDK reuses its Result object. Ignore an already consumed notification.
+    if (vendor != null && result != null && !result.success && result.error == null
+        && result.capturedImages == null) return;
     final CapturedImage image;
     try { image = ConfiguredXheyAdapter.photo(result); }
     catch (Exception error) {
@@ -169,6 +194,7 @@ public final class NativeCameraActivity extends ComponentActivity {
       return;
     }
     saving = true;
+    if (vendor instanceof EditableCameraActivity editable) editable.beginPhotoSave();
     final String id = captureId;
     store.activeCaptures.add(captureId);
     store.state(captureId, "capturing", "");
@@ -179,7 +205,10 @@ public final class NativeCameraActivity extends ComponentActivity {
         store.state(id, "queued", "");
         UploadWorker.enqueue(getApplicationContext(), id, false);
         runOnUiThread(() -> {
-          if (vendor != null && !vendor.isDestroyed() && launched) {
+          if (vendor instanceof EditableCameraActivity editable
+              && !editable.isFinishing() && !editable.isDestroyed() && launched) {
+            continuePhotosInPlace(id, result, editable);
+          } else if (vendor != null && !vendor.isDestroyed() && launched) {
             // Consume this SDK result before another capture can reuse its static slot.
             CameraActivity.getResult();
             pendingPhotoContinuation = true;
@@ -216,6 +245,7 @@ public final class NativeCameraActivity extends ComponentActivity {
     store.activeCaptures.add(captureId);
     store.state(captureId, "capturing", "");
     status.setText("正在保存视频原片…");
+    prepareFeedback();
     CaptureStore.io.execute(() -> {
       try {
         OfficialVideoWriter.save(store, id, video);
@@ -230,6 +260,7 @@ public final class NativeCameraActivity extends ComponentActivity {
           retry.setText("重试保存视频");
           retry.setOnClickListener(view -> recover());
           retry.setVisibility(View.VISIBLE);
+          showProblem();
         });
       } finally { store.activeCaptures.remove(id); }
     });
@@ -251,6 +282,8 @@ public final class NativeCameraActivity extends ComponentActivity {
   private void recover() {
     if (saving || ended) return;
     saving = true;
+    status.setText("正在恢复已保存原片…");
+    prepareFeedback();
     final String id = captureId;
     store.activeCaptures.add(captureId);
     CaptureStore.io.execute(() -> {
@@ -287,6 +320,34 @@ public final class NativeCameraActivity extends ComponentActivity {
     }
   }
 
+  private void continuePhotosInPlace(String savedId, CameraActivity.Result result, EditableCameraActivity preview) {
+    if (ended || isDestroyed() || preview.isFinishing() || preview.isDestroyed()) { saving = false; return; }
+    try {
+      if (savedId.equals(captureId)) {
+        captureId = store.nextOfficialPhoto(savedId, sessionId);
+        store.activeCaptures.remove(savedId);
+        store.activeCaptures.add(captureId);
+      }
+      // Keep the same validity checks as opening a new SDK session, without
+      // closing its camera or replacing its already loaded watermark page.
+      NativeAuthorization.session(store, store.item(captureId));
+      showEditor = false;
+      preview.continuePhoto(savedId, captureId);
+      // Do not call getResult(): it nulls the static holder that the next SDK
+      // callback writes into. Release only this photo's bytes after durable save.
+      result.capturedImages = null;
+      result.success = false;
+      saving = false;
+    } catch (Exception error) {
+      saving = false;
+      new android.app.AlertDialog.Builder(preview).setTitle("照片已保存")
+          .setMessage("下一张准备失败：" + UploadWorker.safeMessage(error))
+          .setPositiveButton("重试", (dialog, which) -> continuePhotosInPlace(savedId, result, preview))
+          .setNegativeButton("返回案件", (dialog, which) -> { preview.finish(); cancel(); })
+          .setCancelable(false).show();
+    }
+  }
+
   private void fail(String message) {
     if (ended || isDestroyed()) return;
     if (!store.original(captureId).isFile()) {
@@ -299,6 +360,40 @@ public final class NativeCameraActivity extends ComponentActivity {
     status.setText(message);
     retry.setText(store.original(captureId).isFile() ? "恢复已保存原片" : "重新打开官方相机");
     retry.setVisibility(View.VISIBLE);
+    showProblem();
+  }
+
+  private void prepareFeedback() {
+    if (transitionFrame == null) root.setBackgroundColor(Color.TRANSPARENT);
+    feedback.setVisibility(View.GONE);
+    launchHandler.removeCallbacks(slowPreparation);
+    launchHandler.postDelayed(slowPreparation, transitionFrame == null ? 800 : 8000);
+  }
+
+  void showTransition(android.graphics.Bitmap frame) {
+    clearTransition();
+    transitionFrame = frame;
+    root.setPadding(0, 0, 0, 0);
+    root.setBackgroundColor(Color.BLACK);
+    transitionCover = CameraPreviewTransition.cover(this, frame, "正在切换相机…");
+    root.addView(transitionCover, 0, new FrameLayout.LayoutParams(-1, -1));
+    feedback.setVisibility(View.GONE);
+  }
+
+  void clearTransition() {
+    if (transitionCover != null) root.removeView(transitionCover);
+    transitionCover = null;
+    transitionFrame = null;
+    if (root != null) {
+      root.setBackgroundColor(Color.TRANSPARENT);
+      ViewCompat.requestApplyInsets(root);
+    }
+  }
+
+  private void showProblem() {
+    launchHandler.removeCallbacks(slowPreparation);
+    root.setBackgroundColor(0x66000000);
+    feedback.setVisibility(View.VISIBLE);
   }
 
   private void complete() {
@@ -330,6 +425,8 @@ public final class NativeCameraActivity extends ComponentActivity {
   }
 
   @Override protected void onDestroy() {
+    CameraPreviewTransition.detach(this);
+    clearTransition();
     launchHandler.removeCallbacksAndMessages(null);
     EventBus.unregisterEvent(EventBus.EventName.kCameraActivityWillDismiss, listener);
     if (store != null && captureId != null && !saving) store.activeCaptures.remove(captureId);

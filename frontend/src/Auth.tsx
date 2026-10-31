@@ -5,7 +5,7 @@ import './access.css';
 
 export interface Person {
   id: string; username: string; display_name: string; system_role: 'admin' | 'user';
-  projects: Record<string, 'manager' | 'member'>;
+  projects: Record<string, 'manager' | 'member' | 'worker'>;
 }
 const AuthContext = createContext<{ person: Person; logout: () => Promise<void> } | null>(null);
 export function useAuth() {

@@ -20,7 +20,13 @@ function rejected(message, password) {
   if (password) detail = detail.split(password).join('[已隐藏]');
   detail = detail.replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[已隐藏]')
     .replace(/\b[A-Za-z0-9_-]{48,}\b/g, '[已隐藏]').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim().slice(0, 240);
-  return new WebsiteLoginError('官网登录未通过' + (detail ? '：' + detail : '，请核对账号密码或先在官网确认登录要求。'), 401, 'login_rejected');
+  const credentialsRejected = /(?:账号|帐号|账户|用户名|用户|密码).{0,12}(?:错误|不正确|不匹配|不存在|无效)|(?:invalid|incorrect|wrong).{0,15}(?:password|credentials|username)/i.test(detail);
+  const verificationRequired = /验证码|人机验证|身份验证|二次验证|双重验证|(?:账号|帐号|账户|用户).{0,12}(?:停用|禁用|锁定|冻结|过期)|密码.{0,12}(?:过期|重置)|captcha|verification required|account.{0,12}(?:locked|disabled)/i.test(detail);
+  const failure = verificationRequired ? 'verification_required' : credentialsRejected ? 'credentials_rejected' : 'login_response_error';
+  // Business code 500 is also used for temporary server errors. Only an explicit
+  // credential/verification refusal is treated as a permanent authentication failure.
+  return new WebsiteLoginError('官网登录未通过' + (detail ? '：' + detail : '，官网未返回具体原因。'),
+    verificationRequired || credentialsRejected ? 401 : 502, failure);
 }
 
 async function readReceipt(response, timeout) {

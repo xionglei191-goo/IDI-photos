@@ -11,6 +11,7 @@ from .draft_materials import check_material_scope, prepare_materials
 from .photo_ai import digest
 from .recognition import extract_fields
 from .project_accounts import case_context
+from .background import background_work
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +21,16 @@ class PhotoWorkflow:
         self.db, self.domain, self.storage, self.recognizer = db, domain, storage, recognizer
         self.platform, self.feishu = platform, feishu
         self._stop, self._lock, self._threads = threading.Event(), threading.RLock(), []
+        self._signals = {
+            False: db.runtime.watch('photo-rules', {'photo_pipeline': {'dirty'},
+                'photos': {'blob_hash', 'case_id', 'project_id', 'stage', 'role', 'photo_group', 'part',
+                           'process', 'watermark_time', 'recognition_state', 'confirmed_fields'},
+                'photo_sources': None, 'cases': {'platform_report_code', 'short_code', 'workflow_stage'},
+                'case_code_aliases': None, 'recognitions': None, 'visit_shared_checkins': None, 'settings': None}),
+            True: db.runtime.watch('photo-rule-save', {'rule_draft_intents': {'state'},
+                'feishu_agent_tasks': {'state'}, 'feishu_agent_bindings': None,
+                'connectors': {'enabled', 'config'}, 'settings': None}),
+        }
 
     def policy(self):
         return self.db.setting('workflow_policy', {})
@@ -87,6 +98,12 @@ class PhotoWorkflow:
                 return self.finish(photo, 'not_applicable', '非图片资料保留原件，按原流程人工选材')
             if photo.get('watermark_dedup_reason'):
                 return self.finish(photo, 'needs_check', photo['watermark_dedup_reason'])
+            if photo.get('uploaded_by') and photo.get('case_id'):
+                from .case_assignments import require_uploader_case
+                try:
+                    require_uploader_case(self.db, photo, self.domain.case(photo['case_id']))
+                except DomainError as exc:
+                    return self.finish(photo, 'needs_check', str(exc))
             task = task or self.source_task(photo_id)
             if task:
                 try:
@@ -194,6 +211,7 @@ class PhotoWorkflow:
     def case_signature(case):
         return digest({k: case[k] for k in ('id','project_id','platform_report_code','short_code','workflow_stage')})
 
+    @background_work('photo_rules.save')
     def save_one(self, task_id=None):
         if self.db.setting('automatic_upload_policy', {}).get('enabled'):
             return False
@@ -202,6 +220,7 @@ class PhotoWorkflow:
         sql = "SELECT * FROM rule_draft_intents WHERE state IN ('queued','awaiting_login','read_only')"
         row = self.db.one(sql + (' AND task_id=?' if task_id else " AND task_id NOT IN (SELECT id FROM feishu_agent_tasks WHERE state IN ('queued','running'))") + ' ORDER BY created_at LIMIT 1', (task_id,) if task_id else ())
         if not row:
+            self.db.runtime.count('photo_rules.save', 'empty_polls')
             return False
         with self.platform.material_lock, case_context(self.platform, row['case_id']):
             # Single shared lock with Agent saves; persisted claim prevents replay.
@@ -252,6 +271,7 @@ class PhotoWorkflow:
                     return True
                 record = self.feishu.reviews.prepare(case['id'], row['stage'], plan['draft']['revision'])
                 self.save_result(row, 'running', {}, record['id'])
+                self.db.runtime.queue_delay('photo_rules.save', row['created_at'])
                 record = self.feishu.reviews.save_for_agent(record['id'], record['fingerprint'], check_permission=permitted)
                 self.save_result(row, record['state'], record['result'], record['id'])
             except Exception as exc:
@@ -264,14 +284,18 @@ class PhotoWorkflow:
     def save_result(self, row, state, result, review_id=None):
         result = {**result, 'state': state, 'business_submitted': False, 'human_review_required': True}
         with self.db.tx() as con:
-            con.execute('UPDATE rule_draft_intents SET state=?,result_json=?,review_id=COALESCE(?,review_id),updated_at=? WHERE id=?', (state, dump(result), review_id, now(), row['id']))
-            con.execute('INSERT INTO feishu_agent_drafts VALUES(?,?,?,?,?,?) ON CONFLICT(task_id,case_id) DO UPDATE SET stage=excluded.stage,review_id=COALESCE(excluded.review_id,feishu_agent_drafts.review_id),result=excluded.result,updated_at=excluded.updated_at',
+            con.execute('UPDATE rule_draft_intents SET state=?,result_json=?,review_id=COALESCE(?,review_id),updated_at=? WHERE id=? AND (state<>? OR result_json<>? OR (? IS NOT NULL AND review_id IS NOT ?))',
+                (state, dump(result), review_id, now(), row['id'], state, dump(result), review_id, review_id))
+            con.execute('INSERT INTO feishu_agent_drafts VALUES(?,?,?,?,?,?) ON CONFLICT(task_id,case_id) DO UPDATE SET stage=excluded.stage,review_id=COALESCE(excluded.review_id,feishu_agent_drafts.review_id),result=excluded.result,updated_at=excluded.updated_at WHERE feishu_agent_drafts.stage<>excluded.stage OR feishu_agent_drafts.result<>excluded.result OR (excluded.review_id IS NOT NULL AND feishu_agent_drafts.review_id IS NOT excluded.review_id)',
                 (row['task_id'], row['case_id'], row['stage'], review_id, dump(result), now()))
 
+    @background_work('photo_rules.scan')
     def run_once(self):
         if not self.policy().get('rules_enabled'):
             return 0
         rows = self.db.all('SELECT photo_id FROM photo_pipeline WHERE dirty=1 ORDER BY updated_at LIMIT 20')
+        if not rows:
+            self.db.runtime.count('photo_rules.scan', 'empty_polls')
         for row in rows:
             try:
                 self.process(row['photo_id'])
@@ -292,14 +316,19 @@ class PhotoWorkflow:
 
     def stop(self):
         self._stop.set()
+        for signal in self._signals.values():
+            signal.wake(False)
         for thread in self._threads:
             thread.join(timeout=1)
         self._threads.clear()
 
     def _loop(self, saving):
+        signal = self._signals[saving]
+        name = 'photo_rules.save' if saving else 'photo_rules.scan'
         while not self._stop.is_set():
+            observed = signal.token()
             try:
                 self.save_one() if saving else self.run_once()
             except Exception:
                 log.exception('Photo workflow iteration failed')
-            self._stop.wait(5 if saving else 2)
+            self.db.runtime.wait(name, signal, observed, 15, self._stop)

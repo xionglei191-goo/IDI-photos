@@ -154,7 +154,10 @@ def field_rows(plan, view, dictionaries, *, editing=False):
 
 def form_elements(delivery, plan, dictionaries, view=None):
     result = field_rows(plan, view or {}, dictionaries, editing=True)
-    submit = button(delivery, '预览修改后的信息', 'preview', primary=True)
+    errors = [i['message'] for i in plan['issues'] if i['severity'] == 'error']
+    if errors:
+        result.append(paragraph('提交前请补齐：' + '；'.join(errors) + '。填写后点“下一步”重新检查。'))
+    submit = button(delivery, '下一步：提交前核对', 'preview', primary=True)
     submit.update(name='preview_changes', form_action_type='submit')
     result.append(submit)
     return result
@@ -165,11 +168,27 @@ def attachments(plan):
             for source in ('existing', 'selected') for item in field[source]]
 
 
+def submission_actions(delivery, plan, view, images):
+    preview = view.get('mode') == 'preview'
+    errors = [i['message'] for i in plan['issues'] if i['severity'] == 'error']
+    allowed = not errors and not any(i.get('error') for i in images) and view.get('direct_allowed', True)
+    submit = button(delivery, '保存修改并正式提交' if preview else '确认正式提交', 'submit',
+                    primary=True, disabled=not allowed, acknowledged=True)
+    if not allowed:
+        submit['disabled_tips'] = text('暂不能正式提交：' + ('；'.join(errors) if errors else '请核对完整附件或打开完整资料处理'))
+    case = plan['case']
+    submit['confirm'] = {'title': text('保存修改并正式提交官网' if preview else '确认正式提交官网'),
+                         'text': text(f'确认已核对 {case.get("short_code") or case.get("platform_report_code")} 的全部字段、实际业务时间和全部附件，并提交“{plan["label"]}”？')}
+    edit = button(delivery, '继续修改' if preview else '补充修改信息', 'edit')
+    refresh = button(delivery, '放弃修改，返回原资料' if preview else '刷新卡片', 'refresh')
+    return [submit, edit, refresh] if preview else [edit, submit, refresh]
+
+
 def build_card(delivery, plan, view, dictionaries, images=(), *, url=''):
     mode = view.get('mode', 'ready')
     checkins = pending_checkins(plan)
-    titles = {'ready': plan['label'] + ('资料待补齐' if checkins else '资料待核对'), 'edit': plan['label'] + ' · 补充修改信息',
-              'preview': '修改后的提交预览', 'processing': '正在办理，请勿重复点击',
+    titles = {'ready': plan['label'] + ('资料待补齐' if checkins else '资料待核对'), 'edit': plan['label'] + ' · 1/2 修改信息',
+              'preview': plan['label'] + ' · 2/2 核对并提交', 'processing': '正在办理，请勿重复点击',
               'result': view.get('status', '办理结果'), 'stale': '资料已变化，请重新核对'}
     template = 'green' if view.get('verified') else 'orange' if checkins or mode in ('edit', 'stale') else 'blue'
     elements = []
@@ -196,16 +215,19 @@ def build_card(delivery, plan, view, dictionaries, images=(), *, url=''):
     if mode not in ('stale', 'processing'):
         elements.append({'tag': 'markdown', 'content': '**业务信息**'})
         if mode == 'edit':
-            elements += [paragraph('直接修改下方信息，填写后先预览。日期按北京时间填写，确认前不会保存或正式提交。'),
+            elements += [paragraph('修改下方信息后，点击“下一步：提交前核对”进入确认页。日期按北京时间填写，确认前不会保存或正式提交。'),
                          {'tag': 'form', 'name': 'review_fields',
                           'elements': form_elements(delivery, plan, dictionaries, view)}]
             elements.append(button(delivery, '放弃修改，返回原资料', 'refresh'))
         else:
             elements.extend(field_rows(plan, view, dictionaries))
         errors = [i['message'] for i in plan['issues'] if i['severity'] == 'error']
-        if errors and not checkins and mode not in ('result', 'edit'):
-            elements.append(paragraph('待管理员确认：' + '；'.join(errors)))
-            elements.append(paragraph('本环节已收照片已合并。请补齐业务字段并确认照片是否传齐。'))
+        if errors and mode not in ('result', 'edit'):
+            elements.append(paragraph('暂不能正式提交：' + '；'.join(errors)))
+            elements.append(paragraph('请点击“继续修改”补齐后重新核对。' if mode == 'preview'
+                                      else '请点击“补充修改信息”补齐业务字段，并确认照片是否传齐。'))
+        if mode == 'preview':
+            elements.extend(submission_actions(delivery, plan, view, images))
         elements.append({'tag': 'hr'})
         for field in plan['file_fields']:
             elements.append(paragraph(f'{field["label"]} {len(field["existing"]) + len(field["selected"])} 项'
@@ -225,20 +247,14 @@ def build_card(delivery, plan, view, dictionaries, images=(), *, url=''):
         if total:
             elements.append(paragraph(f'附件预览 {page + 1}/{pages} 页 · 共 {total} 项。点击图片可放大；原件、视频和 PDF 在完整资料中查看。'))
         if mode == 'edit' and pages > 1:
-            elements.append(paragraph('预览修改后的信息后，可继续翻页核对照片。'))
+            elements.append(paragraph('进入提交前核对页后，可继续翻页核对照片。'))
         if mode in ('ready', 'preview'):
             if page > 0:
                 elements.append(button(delivery, '上一页照片', 'photos', page=page - 1))
             if page + 1 < pages:
                 elements.append(button(delivery, '下一页照片', 'photos', page=page + 1))
-        if mode in ('ready', 'preview'):
-            elements.append(button(delivery, '补充修改信息', 'edit'))
-            allowed = not errors and not any(i.get('error') for i in images) and view.get('direct_allowed', True)
-            submit = button(delivery, '确认正式提交', 'submit', primary=True, disabled=not allowed, acknowledged=True)
-            submit['confirm'] = {'title': text('确认正式提交官网'),
-                                 'text': text(f'确认已核对 {case.get("short_code") or case.get("platform_report_code")} 的全部字段、实际业务时间和全部附件，并提交“{plan["label"]}”？')}
-            elements.append(submit)
-            elements.append(button(delivery, '刷新卡片', 'refresh'))
+        if mode == 'ready':
+            elements.extend(submission_actions(delivery, plan, view, images))
         if mode == 'result' and view.get('can_readback'):
             elements.append(button(delivery, '回读官网结果', 'readback', primary=True))
         if mode == 'result' and view.get('can_refresh'):

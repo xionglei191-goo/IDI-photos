@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import sqlite3
 import threading
 import uuid
@@ -37,17 +39,144 @@ def is_database_busy(error: BaseException) -> bool:
                                  'database schema is locked')
 
 
+_MUTATION = re.compile(r'^\s*(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|REPLACE\s+INTO|DELETE\s+FROM|UPDATE(?:\s+OR\s+\w+)?)\s+["`\[]?(\w+)', re.I)
+
+
+class _ObservedConnection(sqlite3.Connection):
+    """Publish only successful committed changes, with no SQL values in signals."""
+    def _record(self, sql, changed):
+        command = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ''
+        if command in ('COMMIT', 'END') or command == 'RELEASE' and not self.in_transaction:
+            self._publish()
+        elif command == 'ROLLBACK' and not self.in_transaction:
+            self._pending = {}
+        elif changed:
+            match = _MUTATION.match(sql)
+            table = match[1].lower() if match else '*'
+            columns = None
+            if command == 'UPDATE' and re.search(r'\bSET\b', sql, re.I):
+                assignments = re.split(r'\bSET\b', sql, maxsplit=1, flags=re.I)[1]
+                assignments = re.split(r'\bWHERE\b', assignments, maxsplit=1, flags=re.I)[0]
+                columns = {name.lower() for name in re.findall(r'\b(\w+)\s*=', assignments)} or None
+            if table not in self._pending:
+                self._pending[table] = columns
+            elif columns is None or self._pending[table] is None:
+                self._pending[table] = None
+            else:
+                self._pending[table].update(columns)
+            if not self.in_transaction:
+                self._publish()
+
+    def _publish(self):
+        changes, self._pending = self._pending, {}
+        if changes and self._on_change:
+            self._on_change(changes)
+
+    def execute(self, sql, parameters=(), /):
+        before = self.total_changes
+        result = super().execute(sql, parameters)
+        self._record(sql, self.total_changes != before)
+        return result
+
+    def executemany(self, sql, parameters, /):
+        before = self.total_changes
+        try:
+            return super().executemany(sql, parameters)
+        finally:
+            self._record(sql, self.total_changes != before)
+
+    def executescript(self, sql, /):
+        # executescript can commit a preceding transaction before its own SQL.
+        if self.in_transaction:
+            self.commit()
+        before = self.total_changes
+        try:
+            return super().executescript(sql)
+        finally:
+            if self.total_changes != before:
+                self._pending['*'] = None
+                if not self.in_transaction:
+                    self._publish()
+
+    def commit(self):
+        super().commit()
+        self._publish()
+
+    def rollback(self):
+        super().rollback()
+        self._pending = {}
+
+
 class Database:
     def __init__(self, path: Path):
         self.path = path
         self._reads = threading.local()
+        self._subscribers = []
+        from .background import BackgroundRuntime
+        self.runtime = BackgroundRuntime(self)
+
+    def subscribe(self, tables, callback):
+        self._subscribers.append((tables, callback))
+
+    def _publish(self, changes):
+        for tables, callback in tuple(self._subscribers):
+            if '*' in changes or any(table in changes and (
+                    columns is None or changes[table] is None or set(columns) & changes[table])
+                    for table, columns in tables.items()):
+                try:
+                    callback()
+                except Exception:
+                    logging.getLogger(__name__).exception('Background change notification failed')
+
+    def connection_count(self):
+        return getattr(self._reads, 'opened', 0)
 
     def connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        con = sqlite3.connect(self.path, timeout=30, isolation_level=None, factory=_ObservedConnection)
+        con._pending, con._on_change = {}, self._publish
+        self._reads.opened = self.connection_count() + 1
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
         con.execute("PRAGMA busy_timeout=30000")
         return con
+
+    @contextmanager
+    def connection_scope(self):
+        """Thread-local leases for one unit of work; no connection crosses threads."""
+        if getattr(self._reads, 'pool', None) is not None:
+            yield
+            return
+        pool = {'idle': [], 'closed': False}
+        self._reads.pool = pool
+        try:
+            yield
+        finally:
+            self._reads.pool = None
+            pool['closed'] = True
+            for con in pool['idle']:
+                con.close()
+
+    @contextmanager
+    def _lease(self):
+        pool = getattr(self._reads, 'pool', None)
+        con = pool['idle'].pop() if pool and pool['idle'] else self.connect()
+        discard = False
+        try:
+            yield con
+        except BaseException:
+            discard = True
+            raise
+        finally:
+            try:
+                if con.in_transaction:
+                    con.rollback()
+            except BaseException:
+                con.close()
+                raise
+            if not discard and pool is not None and not pool['closed'] and len(pool['idle']) < 3:
+                pool['idle'].append(con)
+            else:
+                con.close()
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
@@ -55,11 +184,8 @@ class Database:
         if snapshot is not None:
             yield snapshot
             return
-        con = self.connect()
-        try:
+        with self._lease() as con:
             yield con
-        finally:
-            con.close()
 
     @contextmanager
     def read_snapshot(self) -> Iterator[sqlite3.Connection]:
@@ -68,15 +194,16 @@ class Database:
         if snapshot is not None:
             yield snapshot
             return
-        con = self.connect()
-        try:
-            con.execute("PRAGMA query_only=ON")
-            con.execute("BEGIN")
-            self._reads.snapshot = con
-            yield con
-        finally:
-            self._reads.snapshot = None
-            con.close()
+        with self._lease() as con:
+            try:
+                con.execute("PRAGMA query_only=ON")
+                con.execute("BEGIN")
+                self._reads.snapshot = con
+                yield con
+            finally:
+                self._reads.snapshot = None
+                con.rollback()
+                con.execute("PRAGMA query_only=OFF")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:

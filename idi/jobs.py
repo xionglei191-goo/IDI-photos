@@ -8,6 +8,7 @@ from typing import Callable
 from .db import Database, dump, now, uid
 from .domain import DomainError
 from .identity import acting_as, current
+from .background import background_work
 
 log = logging.getLogger(__name__)
 
@@ -17,7 +18,7 @@ class JobRunner:
         self.db = db
         self.handlers: dict[str, Callable] = {}
         self._stop = threading.Event()
-        self._wake = threading.Event()
+        self._signal = db.runtime.watch('jobs', {'jobs': {'state', 'kind', 'payload'}})
         self._thread = None
         self._network_thread = None
         self.access = None
@@ -35,8 +36,6 @@ class JobRunner:
                         (job_id, kind, dump(payload), now(), person.id if person else None,
                          'completed' if result is not None else 'queued', dump(result) if result is not None else None,
                          now() if result is not None else None))
-        if result is None:
-            self._wake.set()
         return self.get(job_id)
 
     def get(self, job_id):
@@ -99,7 +98,6 @@ class JobRunner:
             if row["state"] not in ("failed", "partial"):
                 raise DomainError("只有失败或部分完成的任务可以重试", 409)
             con.execute("UPDATE jobs SET state='queued',error=NULL,finished_at=NULL WHERE id=?", (job_id,))
-        self._wake.set()
         return self.get(job_id)
 
     def list_page(self, page=1, page_size=20):
@@ -142,21 +140,27 @@ class JobRunner:
 
     def stop(self):
         self._stop.set()
-        self._wake.set()
+        self._signal.wake(False)
         if self._thread:
             self._thread.join(timeout=10)
         if self._network_thread:
             self._network_thread.join(timeout=10)
 
+    @background_work('jobs.run')
     def run_one(self, lane=None):
+        network = "(kind='platform_sync' OR (kind='export' AND COALESCE(json_extract(payload,'$.check_official_media'),0)=1))"
+        restriction = ' AND ' + network if lane == 'network' else ' AND NOT ' + network if lane == 'local' else ''
+        sql = "SELECT * FROM jobs WHERE state='queued'" + restriction + " ORDER BY created_at LIMIT 1"
+        if not self.db.one(sql):
+            self.db.runtime.count('jobs.run', 'empty_polls')
+            return False
         with self.db.tx() as con:
-            network = "(kind='platform_sync' OR (kind='export' AND COALESCE(json_extract(payload,'$.check_official_media'),0)=1))"
-            restriction = ' AND ' + network if lane == 'network' else ' AND NOT ' + network if lane == 'local' else ''
-            row = con.execute("SELECT * FROM jobs WHERE state='queued'" + restriction + " ORDER BY created_at LIMIT 1").fetchone()
+            row = con.execute(sql).fetchone()
             if not row:
                 return False
             row = dict(row)
             con.execute("UPDATE jobs SET state='running',started_at=?,attempts=attempts+1,error=NULL WHERE id=?", (now(), row["id"]))
+        self.db.runtime.queue_delay('jobs.run', row['created_at'])
         def progress(done, total):
             with self.db.tx() as con:
                 con.execute("UPDATE jobs SET progress=?,total=? WHERE id=?", (done, total, row["id"]))
@@ -180,10 +184,10 @@ class JobRunner:
 
     def _loop(self, lane):
         while not self._stop.is_set():
+            observed = self._signal.token()
             try:
                 if not self.run_one(lane):
-                    self._wake.wait(1)
-                    self._wake.clear()
+                    self.db.runtime.wait('jobs.' + lane, self._signal, observed, 15, self._stop)
             except Exception:
                 log.exception("Worker loop error")
                 self._stop.wait(2)

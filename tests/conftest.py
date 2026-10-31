@@ -65,6 +65,12 @@ def image_bytes(color="navy"):
 
 def rewind_additive_test_schema(con, version):
     """Reconstruct old schemas only inside an isolated migration-test database."""
+    if version < 45:
+        con.execute('ALTER TABLE camera_pairings DROP COLUMN issued_by')
+    if version < 44:
+        con.execute('DROP TRIGGER case_workers_project_changed')
+        con.execute('DROP TABLE case_worker_assignments')
+        con.execute('ALTER TABLE cases DROP COLUMN worker_assignment_revision')
     if version < 43:
         con.execute('DROP INDEX review_notifications_followup')
         for column in ('purpose', 'official_checked_at', 'retry_at'):

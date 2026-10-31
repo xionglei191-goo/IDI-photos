@@ -103,8 +103,8 @@ def test_complete_photos_notify_pending_fields_once_then_require_fresh_review(se
     assert [f['field'] for f in row['detail']['pending_fields']] == ['repairMethod']
     notifier, feedback = services['review_notifications'], channel[1]
     assert notifier.run_once() == 1
-    assert '待管理员确认：' in card_text(feedback.sent[0][1]) and '维修方式' in card_text(feedback.sent[0][1])
-    assert '已收照片已合并' in card_text(feedback.sent[0][1])
+    assert '暂不能正式提交：缺少维修方式' in card_text(feedback.sent[0][1])
+    assert '确认照片是否传齐' in card_text(feedback.sent[0][1])
     tick(auto, case['id'])
     notifier.recover()
     assert notifier.run_once() == 0 and len(feedback.sent) == 1
@@ -115,7 +115,7 @@ def test_complete_photos_notify_pending_fields_once_then_require_fresh_review(se
     complete = services['reviews'].get(row['review_id'])
     assert not complete['snapshot'].get('review_only')
     assert notifier.run_once() == 1 and len(feedback.sent) == 2
-    assert '待管理员确认：' not in card_text(feedback.sent[-1][1])
+    assert '暂不能正式提交：' not in card_text(feedback.sent[-1][1])
     assert services['reviews'].confirm(complete['id'], complete['fingerprint'])['state'] == 'verified'
     assert [payload['state'] for _, payload in writes].count(1) == 1
 

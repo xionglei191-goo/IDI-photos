@@ -44,11 +44,17 @@ public final class EditableCameraActivity extends CameraActivity {
   CaptureStore store;
   String captureId;
   WebView renderer;
+  VideoCaptureTime videoTime;
   FrameLayout overlay;
   View watermarkTarget;
   LinearLayout modes;
+  TextView preparation;
   Dialog editor;
-  boolean resumed, initialEditorShown;
+  View photoSaveBlocker;
+  FrameLayout transitionCover;
+  boolean resumed, initialEditorShown, savingPhoto, continuingPhoto, changingConfiguration, checkingPreviewFrame;
+  android.window.OnBackInvokedCallback gestureBack;
+  final Runnable continuationTimeout = () -> continuationFailed();
   final Runnable probe = this::probeWatermark;
 
   @Override public void onCreate(Bundle state) {
@@ -57,9 +63,15 @@ public final class EditableCameraActivity extends CameraActivity {
     store = CaptureStore.get(this);
     captureId = getIntent().getStringExtra(ConfiguredXheyAdapter.CAPTURE_ID);
     if (captureId == null || store.item(captureId) == null) { finish(); return; }
+    if (android.os.Build.VERSION.SDK_INT >= 33) {
+      gestureBack = this::handleCameraBack;
+      getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+          android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, gestureBack);
+    }
     initialEditorShown = state != null ? state.getBoolean("editor_shown")
         : !getIntent().getBooleanExtra(SHOW_EDITOR, true);
     renderer = findRenderer(getWindow().getDecorView());
+    if (store.item(captureId).video()) videoTime = new VideoCaptureTime(store, captureId);
     overlay = new FrameLayout(this);
     overlay.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
     watermarkTarget = new View(this);
@@ -70,6 +82,12 @@ public final class EditableCameraActivity extends CameraActivity {
     watermarkTarget.setVisibility(View.GONE);
     overlay.addView(watermarkTarget, new FrameLayout.LayoutParams(1, 1));
     Ui ui = new Ui(this);
+    preparation = ui.text("正在准备水印…", 14, Ui.MUTED, false);
+    ui.pad(preparation, 12);
+    ui.surface(preparation, Color.WHITE, Ui.BORDER, 12);
+    FrameLayout.LayoutParams preparationParams = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+    preparationParams.topMargin = ui.dp(12);
+    overlay.addView(preparation, preparationParams);
     modes = ui.row();
     ui.surface(modes, Color.WHITE, Ui.BORDER, 12);
     boolean video = store.item(captureId).video();
@@ -84,11 +102,25 @@ public final class EditableCameraActivity extends CameraActivity {
     modeParams.topMargin = ui.dp(12);
     modes.setVisibility(View.GONE);
     overlay.addView(modes, modeParams);
+    photoSaveBlocker = new View(this);
+    photoSaveBlocker.setClickable(true);
+    photoSaveBlocker.setContentDescription("正在保存照片");
+    photoSaveBlocker.setVisibility(View.GONE);
+    overlay.addView(photoSaveBlocker, new FrameLayout.LayoutParams(-1, -1));
+    android.graphics.Bitmap previousFrame = CameraPreviewTransition.frame(captureId);
+    if (previousFrame != null) {
+      transitionCover = CameraPreviewTransition.cover(this, previousFrame,
+          video ? "正在切换到录像…" : "正在准备拍照预览…");
+      overlay.addView(transitionCover, new FrameLayout.LayoutParams(-1, -1));
+    }
     addContentView(overlay, new ViewGroup.LayoutParams(-1, -1));
     ViewCompat.setOnApplyWindowInsetsListener(overlay, (view, insets) -> {
       FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) modes.getLayoutParams();
       params.topMargin = insets.getInsets(WindowInsetsCompat.Type.statusBars()).top + ui.dp(8);
       modes.setLayoutParams(params);
+      FrameLayout.LayoutParams progressParams = (FrameLayout.LayoutParams) preparation.getLayoutParams();
+      progressParams.topMargin = params.topMargin;
+      preparation.setLayoutParams(progressParams);
       return insets;
     });
     ViewCompat.requestApplyInsets(overlay);
@@ -106,11 +138,13 @@ public final class EditableCameraActivity extends CameraActivity {
 
   private void probeWatermark() {
     if (!resumed || isFinishing() || isDestroyed() || overlay == null) return;
+    if (savingPhoto) { handler.postDelayed(probe, 250); return; }
     if (renderer == null) renderer = findRenderer(getWindow().getDecorView());
     String url = renderer == null ? null : renderer.getUrl();
-    if (renderer != null && url != null && url.startsWith("file:///android_asset/XheyCameraSDKAssets/index.html")) {
+    if (renderer != null && VideoCaptureTime.sdkPage(url)) {
+      if (videoTime != null) videoTime.probe(renderer);
       renderer.evaluateJavascript(WATERMARK_BOUNDS, result -> {
-        if (!resumed || isFinishing() || isDestroyed()) return;
+        if (!resumed || savingPhoto || isFinishing() || isDestroyed()) return;
         try {
           JSONObject bounds = new JSONObject(result);
           float scale = renderer.getWidth() / (float) bounds.getDouble("viewport");
@@ -123,7 +157,14 @@ public final class EditableCameraActivity extends CameraActivity {
           params.topMargin = web[1] - layer[1] + (int) (bounds.getDouble("y") * scale);
           watermarkTarget.setLayoutParams(params);
           watermarkTarget.setVisibility(View.VISIBLE);
+          preparation.setVisibility(View.GONE);
           modes.setVisibility(View.VISIBLE);
+          revealPreview();
+          if (continuingPhoto) {
+            continuingPhoto = false;
+            handler.removeCallbacks(continuationTimeout);
+            photoSaveBlocker.setVisibility(View.GONE);
+          }
           if (!initialEditorShown) {
             initialEditorShown = true;
             editWatermark();
@@ -138,7 +179,7 @@ public final class EditableCameraActivity extends CameraActivity {
   }
 
   void editWatermark() {
-    if (renderer == null) return;
+    if (renderer == null || savingPhoto || continuingPhoto || changingConfiguration) return;
     renderer.evaluateJavascript("Boolean(document.querySelector('.recording-time'))", active -> {
       if ("false".equals(active) && resumed && !isFinishing() && !isDestroyed()) showWatermarkEditor();
     });
@@ -159,16 +200,14 @@ public final class EditableCameraActivity extends CameraActivity {
           caseInfo.put("parts", cached.optJSONArray("parts"));
       editor = WatermarkEditor.show(this, caseInfo, WatermarkEditor.Draft.from(item.meta),
           draft -> {
-            store.updateWatermark(captureId, draft);
             boolean changed = !draft.group.equals(item.meta.optString("photo_group"))
                 || !draft.content.equals(item.meta.optString("content"))
                 || !CameraData.role(draft.group, draft.role).equals(item.meta.optString("role"));
             if (changed) {
               // Reopen through the public signed-session contract so pixels and metadata agree.
               // Keep this capture ID; editing never creates another photo record.
-              setResult(WATERMARK_EDITED, new Intent().putExtra("capture_id", captureId));
-              finish();
-            }
+              changeConfiguration(() -> store.updateWatermark(captureId, draft));
+            } else store.updateWatermark(captureId, draft);
           }, () -> editor = null);
     } catch (Exception error) {
       Toast.makeText(this, "水印设置暂时无法打开，请返回后重试", Toast.LENGTH_LONG).show();
@@ -176,7 +215,7 @@ public final class EditableCameraActivity extends CameraActivity {
   }
 
   private void changeMode(boolean video) {
-    if (renderer == null) return;
+    if (renderer == null || savingPhoto || continuingPhoto || changingConfiguration) return;
     renderer.evaluateJavascript("Boolean(document.querySelector('.recording-time'))", active -> {
       if ("false".equals(active) && resumed && !isFinishing() && !isDestroyed()) changeIdleMode(video);
     });
@@ -193,14 +232,49 @@ public final class EditableCameraActivity extends CameraActivity {
       requestPermissions(new String[] {Manifest.permission.RECORD_AUDIO}, AUDIO_REQUEST);
       return;
     }
-    try {
-      store.updateMediaType(captureId, video);
-      if (video) Toast.makeText(this, "每段最长60秒，点击红色按钮开始或结束录像", Toast.LENGTH_LONG).show();
-      setResult(WATERMARK_EDITED, new Intent().putExtra("capture_id", captureId));
-      finish();
-    } catch (Exception error) {
-      Toast.makeText(this, error.getMessage(), Toast.LENGTH_LONG).show();
-    }
+    changeConfiguration(() -> store.updateMediaType(captureId, video));
+  }
+
+  private interface ConfigurationChange { void apply() throws Exception; }
+
+  private void changeConfiguration(ConfigurationChange change) {
+    if (changingConfiguration || savingPhoto || continuingPhoto) return;
+    changingConfiguration = true;
+    photoSaveBlocker.setVisibility(View.VISIBLE);
+    // Defer one turn so the watermark dialog has closed before taking the cover.
+    handler.post(() -> CameraPreviewTransition.capture(this, () -> {
+      if (isFinishing() || isDestroyed()) return;
+      try {
+        change.apply();
+        setResult(WATERMARK_EDITED, new Intent().putExtra("capture_id", captureId));
+        finish();
+        overridePendingTransition(0, 0);
+      } catch (Exception error) { configurationFailed(error.getMessage()); }
+    }, () -> configurationFailed("当前预览尚未就绪，请稍候重试")));
+  }
+
+  private void configurationFailed(String message) {
+    if (isFinishing() || isDestroyed()) return;
+    changingConfiguration = false;
+    photoSaveBlocker.setVisibility(View.GONE);
+    CameraPreviewTransition.clear(captureId);
+    Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+  }
+
+  private void revealPreview() {
+    if (transitionCover == null || checkingPreviewFrame || !resumed) return;
+    android.view.SurfaceView surface = CameraPreviewTransition.surface(getWindow().getDecorView());
+    if (surface == null || !surface.getHolder().getSurface().isValid()) return;
+    checkingPreviewFrame = true;
+    android.graphics.Bitmap sample = android.graphics.Bitmap.createBitmap(8, 8, android.graphics.Bitmap.Config.ARGB_8888);
+    android.view.PixelCopy.request(surface, sample, code -> {
+      sample.recycle(); checkingPreviewFrame = false;
+      if (code == android.view.PixelCopy.SUCCESS && resumed && !isFinishing() && !isDestroyed()) {
+        overlay.removeView(transitionCover);
+        transitionCover = null;
+        CameraPreviewTransition.clear(captureId);
+      }
+    }, handler);
   }
 
   @Override public void onRequestPermissionsResult(int code, String[] permissions, int[] results) {
@@ -209,6 +283,68 @@ public final class EditableCameraActivity extends CameraActivity {
       if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) changeMode(true);
       else Toast.makeText(this, "录像需要麦克风权限；拍照仍可正常使用", Toast.LENGTH_LONG).show();
     }
+  }
+
+  void beginPhotoSave() {
+    savingPhoto = true;
+    photoSaveBlocker.setVisibility(View.VISIBLE);
+    watermarkTarget.setVisibility(View.GONE);
+    modes.setVisibility(View.GONE);
+    preparation.setText("正在保存照片…");
+    preparation.setVisibility(View.VISIBLE);
+  }
+
+  void continuePhoto(String savedId, String nextId) throws Exception {
+    if (!savedId.equals(captureId) && !nextId.equals(captureId))
+      throw new Exception("当前拍摄编号已变化，请返回后重试");
+    if (renderer == null || !VideoCaptureTime.sdkPage(renderer.getUrl()))
+      throw new Exception("相机预览暂不可用，请返回后重试");
+    captureId = nextId;
+    getIntent().putExtra(ConfiguredXheyAdapter.CAPTURE_ID, nextId).putExtra(SHOW_EDITOR, false);
+    initialEditorShown = true;
+    savingPhoto = false;
+    continuingPhoto = true;
+    preparation.setText("照片已保存，正在恢复预览…");
+    restartPhotoPreview();
+  }
+
+  private void restartPhotoPreview() {
+    if (isFinishing() || isDestroyed()) return;
+    continuingPhoto = true;
+    photoSaveBlocker.setVisibility(View.VISIBLE);
+    handler.removeCallbacks(continuationTimeout);
+    handler.postDelayed(continuationTimeout, 10000);
+    // The pinned vendor renderer handles startPreview by clearing its previous
+    // image list and resuming its camera. Keep the exact signed URL and assets;
+    // do not modify its Vue model, watermark, time, security code or image bytes.
+    renderer.evaluateJavascript("(() => { if (!window.isVueAppLoaded) return false;"
+        + "window.postMessage({action:'startPreview',url:window.location.href}, '*'); return true; })()", value -> {
+      if (!"true".equals(value)) continuationFailed();
+    });
+  }
+
+  private void continuationFailed() {
+    if (!continuingPhoto || isFinishing() || isDestroyed()) return;
+    continuingPhoto = false;
+    handler.removeCallbacks(continuationTimeout);
+    new android.app.AlertDialog.Builder(this).setTitle("照片已保存")
+        .setMessage("预览尚未恢复，可以重试或返回案件。已保存照片会继续上传。")
+        .setPositiveButton("重试预览", (dialog, which) -> restartPhotoPreview())
+        .setNegativeButton("返回案件", (dialog, which) -> { setResult(RESULT_CANCELED); finish(); })
+        .setCancelable(false).show();
+  }
+
+  // The vendor base is Activity, not ComponentActivity. API 33+ uses the
+  // callback registered above; retain the vendor's legacy path on older phones.
+  @android.annotation.SuppressLint("GestureBackNavigation")
+  @Override public void onBackPressed() { handleCameraBack(); }
+
+  private void handleCameraBack() {
+    if (savingPhoto || changingConfiguration) {
+      Toast.makeText(this, savingPhoto ? "正在保存照片，请稍候" : "正在切换相机，请稍候", Toast.LENGTH_SHORT).show();
+      return;
+    }
+    super.onBackPressed();
   }
 
   @Override public void onResume() {
@@ -228,6 +364,9 @@ public final class EditableCameraActivity extends CameraActivity {
 
   @Override public void onDestroy() {
     handler.removeCallbacksAndMessages(null);
+    if (android.os.Build.VERSION.SDK_INT >= 33 && gestureBack != null)
+      getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(gestureBack);
+    if (videoTime != null) videoTime.close();
     if (editor != null) editor.dismiss();
     try { super.onDestroy(); }
     finally { activeInstances--; }

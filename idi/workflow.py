@@ -10,7 +10,7 @@ from .case_codes import issue_code, unique_prefix
 from .db import audit, dump, now, rowdict, uid
 from .domain import CASE_PLATFORM_COLUMNS, DomainError, PHOTO_GROUPS, WORKFLOW_STAGES, case_filters, clean_date, decode_case
 from .platform_client import unsubmitted_report
-from .platform_photos import attachment_removal_history, online_photo_counts
+from .platform_photos import attachment_removal_history, online_photo_counts, snapshot_version_data
 from .stage_access import FORM_LABELS, STAGE_FORM, stage_access
 
 INTAKE = {'pending_intake', 'insurer_intake', 'insurer_review', 'historical_unverified'}
@@ -63,12 +63,34 @@ def remote_stage(snapshot):
 
 def address_fields(value):
     value = str(value or '').strip()
+    if '/' in value or '／' in value:
+        parts = [part.strip() for part in re.split(r'[/／]', value)]
+        if len(parts) == 4:
+            building = re.search(r'([A-Za-z0-9]+)(?:栋|幢|号楼)$', parts[0])
+            unit = re.fullmatch(r'([A-Za-z0-9]+)单元', parts[1])
+            floor = re.fullmatch(r'(-?\d{1,3})(?:F|层)', parts[2], re.IGNORECASE)
+            room = re.fullmatch(r'(\d{2,5})(?:房|室|号|户)?', parts[3])
+            if building and (unit or parts[1] in ('', '未划分')) and floor and room:
+                return {'building': building[1], 'unit': unit[1] if unit else '',
+                        'floor': floor[1], 'room': room[1], 'location_detail': value}
+        # Public areas and ambiguous slash paths stay as their original address.
+        # Do not reinterpret a trailing range such as 101-102 as building/room.
+        return {'location_detail': value}
     match = re.search(r'([A-Za-z0-9]+)(?:栋|幢|号楼)(?:[-\s]*([A-Za-z0-9]+)单元)?[-\s]*(\d{2,5})(?:房|室|号|户)?', value)
     if not match:
         match = re.search(r'(?<![A-Za-z0-9])([A-Za-z0-9]+)-(?:([A-Za-z0-9]+)-)?(\d{2,5})(?![A-Za-z0-9])', value)
     if match:
         return {'building': match[1], 'unit': match[2] or '', 'room': match[3], 'location_detail': value}
     return {'location_detail': value}
+
+
+def missing_location_fields(previous, location):
+    """Fill a consistent official location without mixing in manual corrections."""
+    keys = ('building', 'unit', 'floor', 'room', 'location_detail')
+    if any(previous.get(key) and key in location and
+           str(previous[key]).strip() != str(location[key]).strip() for key in keys):
+        return {}
+    return {key: value for key, value in location.items() if value and not previous.get(key)}
 
 
 class Workflow:
@@ -167,7 +189,7 @@ class Workflow:
                           'remote_status': dump({k: row.get(k) for k in ('flowStatus', 'passStatus', 'siteSurveyState', 'repairAcceptanceFlowStatus', 'interceptFlag')}),
                           'status': STATUS_LEGACY[stage], 'updated_at': stamp, 'revision': previous['revision'] + 1}
                 fills = {'policy_number': str(row.get('policyNum') or ''), 'report_number': str(row.get('reportNumber') or '') or None,
-                         'insurer': insurer, **location}
+                         'insurer': insurer, **missing_location_fields(previous, location)}
                 for key, value in fills.items():
                     if not previous.get(key) and value:
                         values[key] = value
@@ -190,8 +212,7 @@ class Workflow:
                 if removed:
                     snapshot['removed_attachments'] = removed
             verified_at = read_at if details_read else (link['verified_at'] if link else None)
-            semantic = lambda value: {k: v for k, v in value.items() if k not in ('fetched_at', 'list_verified_at', 'account')}
-            link_changed = not link or semantic(json.loads(link['snapshot'])) != semantic(snapshot)
+            link_changed = not link or snapshot_version_data(json.loads(link['snapshot'])) != snapshot_version_data(snapshot)
             con.execute('''INSERT INTO platform_links VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(case_id) DO UPDATE SET
                 report_receiving_id=excluded.report_receiving_id,platform_report_code=excluded.platform_report_code,
                 insurer_report_number=excluded.insurer_report_number,snapshot=excluded.snapshot,verified_at=excluded.verified_at,
@@ -258,13 +279,13 @@ class Workflow:
         return {'text': f"编号：{case['short_code'] or '待补楼栋房号后生成'}\n施工项目：{case['project_name']}\n施工区域：{area}\n施工内容：查勘打卡",
                 'contents': ['查勘打卡', 'XXX问题', '施工打卡', 'XXX施工', 'XXX完工']}
 
-    def board(self, board='intake', project_id='', building='', query='', status='', archived=False, page=1, page_size=30, source='auto'):
+    def board(self, board='intake', project_id='', building='', query='', status='', archived=False, page=1, page_size=30, source='auto', worker=''):
         # Every nested form/material read shares this request's snapshot. Nothing
         # is cached across requests, so edits are visible on the next refresh.
         with self.db.read_snapshot():
-            return self._board(board, project_id, building, query, status, archived, page, page_size, source)
+            return self._board(board, project_id, building, query, status, archived, page, page_size, source, worker)
 
-    def _board(self, board, project_id, building, query, status, archived, page, page_size, source):
+    def _board(self, board, project_id, building, query, status, archived, page, page_size, source, worker):
         if board not in ('intake', 'work'):
             raise DomainError('看板不存在', 404)
         if source not in ('auto', 'platform', 'local'):
@@ -273,6 +294,13 @@ class Workflow:
             source = 'platform' if self.db.setting('platform_lists') else 'workflow'
         scope = 'intake' if board == 'intake' else 'repair'
         where, values = case_filters(project_id, query)
+        if worker not in ('', 'assigned', 'unassigned'):
+            raise DomainError('工人分配筛选无效')
+        if worker:
+            where.append(('NOT ' if worker == 'unassigned' else '') + '''EXISTS (
+                SELECT 1 FROM case_worker_assignments wa JOIN idi_users wu ON wu.id=wa.user_id
+                JOIN project_members wm ON wm.user_id=wa.user_id AND wm.project_id=wa.project_id
+                WHERE wa.case_id=c.id AND wa.project_id=c.project_id AND wm.role='worker' AND wu.enabled=1)''')
         source_sql = ' FROM cases c JOIN projects pr ON pr.id=c.project_id'
         ordering = 'c.updated_at DESC'
         if building:

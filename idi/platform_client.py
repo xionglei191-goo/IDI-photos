@@ -92,9 +92,24 @@ class PlatformBudgetReached(DomainError):
 
 
 class PlatformLoginError(DomainError):
-    def __init__(self, message, status=502, *, retryable=True):
+    FAILURES = frozenset(('login_rejected', 'credentials_rejected', 'verification_required', 'http_rejected',
+                         'http_failure', 'rate_limited', 'browser_unavailable', 'dependency_missing',
+                         'token_missing', 'timeout', 'ambiguous_login_control', 'invalid_receipt',
+                         'login_response_error', 'login_failed'))
+    PHASES = frozenset(('start', 'browser', 'page', 'account_field', 'login_response', 'token_response'))
+
+    def __init__(self, message, status=502, *, retryable=True, failure='login_failed', phase=None,
+                 http_status=None, business_code=None):
         super().__init__(message, status)
         self.retryable = retryable
+        # Persist only bounded classifications and numbers, never upstream text or credentials.
+        self.diagnostics = {
+            'failure': failure if isinstance(failure, str) and failure in self.FAILURES else 'login_failed',
+            'phase': phase if isinstance(phase, str) and phase in self.PHASES else None,
+            'status': status if type(status) is int and 400 <= status <= 599 else None,
+            'http_status': http_status if type(http_status) is int and 100 <= http_status <= 599 else None,
+            'business_code': business_code if type(business_code) is int and abs(business_code) <= 2 ** 53 - 1 else None,
+        }
 
 
 class PlatformClient:
@@ -279,7 +294,8 @@ class PlatformClient:
             raise DomainError("账号或密码过长")
         node = shutil.which("node")
         if not node or not (ROOT / "frontend/node_modules/playwright/index.mjs").is_file():
-            raise PlatformLoginError("官网登录需要 Node.js 和项目浏览器依赖，请先运行安装脚本", 503, retryable=False)
+            raise PlatformLoginError("官网登录需要 Node.js 和项目浏览器依赖，请先运行安装脚本", 503,
+                                     retryable=False, failure='dependency_missing', phase='start')
         with self._login_lock:
             if self._closing.is_set():
                 raise DomainError('服务正在停止，未继续官网登录。', 409)
@@ -300,11 +316,12 @@ class PlatformClient:
                 if result.returncode or not isinstance(token, str) or not token.strip() or token.strip() in ("undefined", "null"):
                     failure = 'login_failed'
                     phase = response.get("phase")
+                    diagnostic = {}
                     if phase in ("start", "browser", "page", "account_field", "login_response", "token_response"):
                         diagnostic = response.get("diagnostics", {})
                         diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
                         failure = diagnostic.get("failure")
-                        failure = failure if failure in ("login_rejected", "http_rejected", "http_failure", "rate_limited", "browser_unavailable", "token_missing", "timeout", "ambiguous_login_control", "login_failed") else "login_failed"
+                        failure = failure if isinstance(failure, str) and failure in PlatformLoginError.FAILURES else "login_failed"
                         logging.getLogger(__name__).warning("Website login incomplete: phase=%s sent=%s http=%s code=%s script_error=%s failure=%s", phase,
                             bool(diagnostic.get("requestSent")), diagnostic.get("httpStatus") if type(diagnostic.get("httpStatus")) is int else None,
                             diagnostic.get("businessCode") if type(diagnostic.get("businessCode")) is int else None, bool(diagnostic.get("scriptError")), failure)
@@ -313,13 +330,18 @@ class PlatformClient:
                     detail = response.get("error")
                     detail = detail.replace(password, "[已隐藏]")[:400] if isinstance(detail, str) and detail.strip() else "官网登录未完成，请稍后重试或先在官网确认登录要求。"
                     raise PlatformLoginError(detail, status, retryable=status not in (400, 401, 403)
-                                             and failure not in ('token_missing', 'browser_unavailable', 'ambiguous_login_control'))
+                                             and failure not in ('dependency_missing', 'ambiguous_login_control'),
+                                             failure=failure, phase=phase, http_status=diagnostic.get('httpStatus'),
+                                             business_code=diagnostic.get('businessCode'))
             except subprocess.TimeoutExpired as error:
-                raise DomainError("官网登录等待超时，请稍后重试或先打开官网检查网络。", 504) from error
+                raise PlatformLoginError("官网登录等待超时，请稍后重试或先打开官网检查网络。", 504,
+                                         failure='timeout') from error
             except OSError as error:
-                raise PlatformLoginError("官网登录程序未能启动，请检查本机浏览器和运行环境。", 503, retryable=False) from error
+                raise PlatformLoginError("官网登录程序未能启动，请检查本机浏览器和运行环境。", 503,
+                                         failure='browser_unavailable', phase='browser') from error
             except ValueError as error:
-                raise PlatformLoginError("官网登录程序未返回有效结果，请稍后重试。", 502, retryable=False) from error
+                raise PlatformLoginError("官网登录程序未返回有效结果，请稍后重试。", 502,
+                                         failure='invalid_receipt') from error
             with self._lock, self._state_lock:
                 if self._closing.is_set() or generation != self._session_generation:
                     raise DomainError('本次连接已取消，请按当前设置重新连接。', 409)

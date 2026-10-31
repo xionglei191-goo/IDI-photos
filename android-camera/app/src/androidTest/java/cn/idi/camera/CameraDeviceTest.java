@@ -180,7 +180,7 @@ public class CameraDeviceTest {
       assertEquals("queued", after.state);
       shell("svc wifi enable");
       shell("svc data enable");
-      UploadWorker.pending(context);
+      // Network constraints and the application's network callback must resume it without a tap.
       await(() -> store.item(captureId).state.equals("uploaded"), 60000);
       CaptureStore.Item uploaded = store.item(captureId);
       assertEquals(

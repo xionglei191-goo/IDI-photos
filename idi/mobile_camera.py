@@ -57,13 +57,13 @@ def is_local_admin_request(request):
     return bool(local and not request.headers.get('x-forwarded-proto'))
 
 
-def camera_admin():
+def camera_admin(*, project_scope=False):
     """Use the authenticated role on every configured entry, including HTTPS."""
     person = current()
     if person is None:
         raise DomainError('请先登录 IDI', 401)
-    if not person.admin:
-        raise DomainError('手机配对管理需要系统管理员权限', 403)
+    if not person.admin and not (project_scope and 'manager' in person.projects.values()):
+        raise DomainError('手机配对管理需要系统管理员或项目管理员权限' if project_scope else '此操作需要系统管理员权限', 403)
 
 
 class CaptureMetadata(BaseModel):
@@ -89,7 +89,9 @@ class MobileCamera:
         self.access = None
 
     def projects(self):
-        return [{'id': row['id'], 'name': row['name']} for row in self.domain.projects()]
+        person = current()
+        return [{'id': row['id'], 'name': row['name']} for row in self.domain.projects()
+                if person is None or person.allows(row['id'], manage=True)]
 
     def create_pairing(self, data):
         name = str(data.get('name', '')).strip()
@@ -102,14 +104,18 @@ class MobileCamera:
         user_id = data.get('user_id')
         if self.access:
             person = self.access.principal(user_id)
-            if any(not person.allows(p) for p in project_ids):
+            if any(not person.camera_project(p) for p in project_ids):
                 raise DomainError('手机所选项目必须已分配给绑定人员', 403)
         code = ''.join(secrets.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(10))
         expires = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(timespec='milliseconds')
         with self.db.tx() as con:
+            if self.access:
+                from .project_people import require_pairing_scope
+                require_pairing_scope(con, user_id, project_ids)
             con.execute('DELETE FROM camera_pairings WHERE expires_at<?', (now(),))
-            con.execute('INSERT INTO camera_pairings(code_hash,name,project_ids,expires_at,used_at,user_id) VALUES(?,?,?,?,NULL,?)',
-                        (digest(code), name, dump(sorted(set(project_ids))), expires, user_id))
+            actor = current()
+            con.execute('INSERT INTO camera_pairings(code_hash,name,project_ids,expires_at,used_at,user_id,issued_by) VALUES(?,?,?,?,NULL,?,?)',
+                        (digest(code), name, dump(sorted(set(project_ids))), expires, user_id, actor.id if actor else None))
             audit(con, 'camera_pairing', digest(code), 'create', after={'name': name, 'project_ids': project_ids, 'user_id': user_id})
         return {'code': code, 'expires_at': expires, 'expires_in_minutes': 15}
 
@@ -125,8 +131,11 @@ class MobileCamera:
                 raise DomainError('配对码无效、已使用或已过期，请在电脑上重新生成', 401)
             if self.access:
                 person = self.access.principal(pair['user_id'])
-                if not any(person.allows(p) for p in json.loads(pair['project_ids'])):
+                if not all(person.camera_project(p) for p in json.loads(pair['project_ids'])):
                     raise DomainError('绑定人员已无所选项目权限，请重新生成配对码', 403)
+                if pair['issued_by']:
+                    from .project_people import require_pairing_scope
+                    require_pairing_scope(con, pair['user_id'], json.loads(pair['project_ids']), issuer_id=pair['issued_by'])
             con.execute('UPDATE camera_pairings SET used_at=? WHERE code_hash=?', (now(), pair['code_hash']))
             con.execute('INSERT INTO camera_devices(id,name,token_hash,project_ids,created_at,last_seen_at,revoked_at,user_id) VALUES(?,?,?,?,?,NULL,NULL,?)',
                         (device_id, pair['name'], digest(token), pair['project_ids'], now(), pair['user_id']))
@@ -138,13 +147,48 @@ class MobileCamera:
         device = dict(device)
         allowed = json.loads(device['project_ids']) if isinstance(device['project_ids'], str) else device['project_ids']
         if self.access:
+            live = self.db.one('SELECT * FROM camera_devices WHERE id=? AND revoked_at IS NULL', (device['id'],))
+            if (not live or live['user_id'] != device.get('user_id')
+                    or live['token_hash'] != device.get('token_hash')):
+                raise DomainError('设备连接已失效，请重新配对', 401)
+            allowed = json.loads(live['project_ids'])
             person = self.access.principal(device.get('user_id'))
-            allowed = [p for p in allowed if person.allows(p)]
+            allowed = [p for p in allowed if person.camera_project(p)]
             device['user_name'] = person.display_name
         if not allowed:
             raise DomainError('绑定人员已无可用项目权限，请联系管理员', 403)
         device['project_ids'] = allowed
         return device
+
+    def require_case_access(self, device, case, *, connection=None):
+        """Check live device, person, membership and assignment at the commit boundary."""
+        from contextlib import nullcontext
+        with (nullcontext(connection) if connection is not None else self.db.read()) as con:
+            live = con.execute('SELECT * FROM camera_devices WHERE id=? AND revoked_at IS NULL', (device['id'],)).fetchone()
+            if (not live or live['user_id'] != device.get('user_id')
+                    or live['token_hash'] != device.get('token_hash')):
+                raise DomainError('设备连接已失效，请重新配对', 401)
+            actual = con.execute('SELECT project_id FROM cases WHERE id=?', (case['id'],)).fetchone()
+            if not actual or actual['project_id'] != case['project_id']:
+                raise DomainError('案件所属项目已变化，请重新同步', 409)
+            if case['project_id'] not in json.loads(live['project_ids']):
+                raise DomainError('设备无此项目权限', 403)
+            if not self.access:
+                return
+            user = con.execute('SELECT enabled,system_role FROM idi_users WHERE id=?', (live['user_id'],)).fetchone()
+            if not user or not user['enabled']:
+                raise DomainError('人员账号已停用或不存在', 401)
+            if user['system_role'] == 'admin':
+                return
+            member = con.execute('SELECT role FROM project_members WHERE project_id=? AND user_id=?',
+                                 (case['project_id'], live['user_id'])).fetchone()
+            if member and member['role'] in ('manager', 'member'):
+                return
+            if member and member['role'] == 'worker' and con.execute(
+                    'SELECT 1 FROM case_worker_assignments WHERE case_id=? AND user_id=? AND project_id=?',
+                    (case['id'], live['user_id'], case['project_id'])).fetchone():
+                return
+            raise DomainError('此案件未分配给当前人员，请同步案件或联系管理员', 403)
 
     def authenticate(self, request):
         authorization = request.headers.get('Authorization', '')
@@ -156,9 +200,13 @@ class MobileCamera:
         return self.effective_device(device)
 
     def cases(self, device):
+        from .identity import acting_as, current
+        device = self.effective_device(device)
         allowed = set(device['project_ids'])
         items = []
-        for case in self.domain.cases():
+        with acting_as(self.access.principal(device['user_id']) if self.access else current()):
+            cases = self.domain.cases()
+        for case in cases:
             if case['project_id'] not in allowed or not case['followup_eligible'] or case['workflow_stage'] == 'closed':
                 continue
             items.append({'id': case['id'], 'project_id': case['project_id'], 'project_name': case['project_name'],
@@ -208,8 +256,7 @@ class MobileCamera:
             raise DomainError('拍摄环节与照片用途不一致')
         request_hash = digest(dump(meta) + hashlib.sha256(original).hexdigest() + hashlib.sha256(stamped).hexdigest())
         case = self.domain.case(model.case_id)
-        if case['project_id'] not in device['project_ids']:
-            raise DomainError('这台手机没有该项目的上传权限', 403)
+        self.require_case_access(device, case)
         ensure_not_deleted(self.db, device['id'], model.capture_id)
         existing = self.db.one('SELECT * FROM camera_captures WHERE device_id=? AND capture_id=?', (device['id'], model.capture_id))
         if existing:
@@ -236,6 +283,7 @@ class MobileCamera:
                       'time_basis': 'device_capture', 'watermark_order': ['time', 'case_number', 'project', 'location', 'stage', 'content']}
         with self.db.tx() as con:
             # Recheck under the write lock: parallel requests return one receipt.
+            self.require_case_access(device, case, connection=con)
             ensure_not_deleted(self.db, device['id'], model.capture_id, connection=con)
             if con.execute('SELECT 1 FROM camera_official_captures WHERE device_id=? AND capture_id=?', (device['id'], model.capture_id)).fetchone():
                 raise DomainError('拍摄编号已用于官方照片', 409)
@@ -279,7 +327,7 @@ def camera_routes(service):
 
     @router.get('/camera-setup', response_class=HTMLResponse)
     def setup(request: Request):
-        camera_admin()
+        camera_admin(project_scope=True)
         return (Path(__file__).parent / 'camera_setup.html').read_text(encoding='utf-8')
 
     @router.get('/camera/download')
@@ -292,22 +340,31 @@ def camera_routes(service):
 
     @router.get('/api/camera/admin')
     def admin(request: Request):
-        camera_admin()
-        devices = service.db.all('SELECT d.id,d.name,d.project_ids,d.created_at,d.last_seen_at,d.revoked_at,d.user_id,u.display_name AS user_name FROM camera_devices d LEFT JOIN idi_users u ON u.id=d.user_id WHERE d.deleted_at IS NULL ORDER BY d.created_at DESC')
-        for device in devices:
-            device['project_ids'] = json.loads(device['project_ids'])
-        return {'projects': service.projects(), 'devices': devices, 'users': service.access.users() if service.access else [],
+        camera_admin(project_scope=True)
+        from .project_people import can_manage_device, managed_projects
+        with service.db.read_snapshot() as con:
+            scope = managed_projects(con)
+            devices = service.db.all('SELECT d.id,d.name,d.project_ids,d.created_at,d.last_seen_at,d.revoked_at,d.user_id,u.display_name AS user_name FROM camera_devices d LEFT JOIN idi_users u ON u.id=d.user_id WHERE d.deleted_at IS NULL ORDER BY d.created_at DESC')
+            devices = [d for d in devices if can_manage_device(con, d, scope)]
+            for device in devices:
+                device['project_ids'] = json.loads(device['project_ids'])
+            users = service.access.users() if service.access else []
+            projects = service.projects()
+        return {'projects': projects, 'devices': devices, 'users': users,
+                'can_configure': scope is None,
                 'server_urls': list(service.storage.settings.public_origins) or service.storage.settings.lan_urls}
 
     @router.post('/api/camera/admin/pairings')
     def pairing(request: Request, data: dict = Body(...)):
-        camera_admin()
+        camera_admin(project_scope=True)
         return service.create_pairing(data)
 
     @router.delete('/api/camera/admin/devices/{device_id}')
     def revoke(device_id: str, request: Request):
-        camera_admin()
+        camera_admin(project_scope=True)
         with service.db.tx() as con:
+            from .project_people import require_device_scope
+            require_device_scope(con, device_id)
             result = con.execute('UPDATE camera_devices SET revoked_at=? WHERE id=? AND revoked_at IS NULL', (now(), device_id))
             if not result.rowcount:
                 raise DomainError('设备不存在或已停用', 404)
@@ -316,8 +373,10 @@ def camera_routes(service):
 
     @router.delete('/api/camera/admin/devices/{device_id}/record')
     def delete_device(device_id: str, request: Request):
-        camera_admin()
+        camera_admin(project_scope=True)
         with service.db.tx() as con:
+            from .project_people import require_device_scope
+            require_device_scope(con, device_id)
             device = con.execute('SELECT * FROM camera_devices WHERE id=? AND deleted_at IS NULL', (device_id,)).fetchone()
             if not device:
                 raise DomainError('设备不存在或已删除', 404)
@@ -352,9 +411,11 @@ def camera_routes(service):
         item = service.db.one('SELECT * FROM camera_captures WHERE device_id=? AND capture_id=? AND photo_id IS NOT NULL', (device['id'], capture_id))
         if not item:
             raise DomainError('照片不存在', 404)
-        photo = service.domain.photo(item['photo_id'])
-        if photo['project_id'] not in device['project_ids']:
-            raise DomainError('设备无此项目权限', 403)
+        photo = service.db.one('SELECT case_id,project_id FROM photos WHERE id=?', (item['photo_id'],))
+        case = service.domain.case(json.loads(item['metadata'])['case_id'])
+        service.require_case_access(device, case)
+        if not photo or photo['case_id'] != case['id'] or photo['project_id'] != case['project_id']:
+            raise DomainError('归档资料所属案件已变化，请联系管理员', 403)
         blob = service.db.one('SELECT * FROM blobs WHERE hash=?', (item['original_hash'],))
         return FileResponse(service.storage.resolve(blob['stored_path']), media_type='image/jpeg', filename='original.jpg')
 

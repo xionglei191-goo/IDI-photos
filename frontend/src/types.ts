@@ -1,5 +1,6 @@
 export interface Project { id: string; name: string; aliases: string[]; insurer: string; insurer_template_id: string; short_prefix: string; case_count: number; photo_count: number; updated_case_codes?: number }
 export interface Case {
+  workers?: { user_id: string; display_name: string }[]; worker_assignment_revision?: number;
   id: string; project_id: string; project_name: string; report_number: string | null; title: string;
   building: string; unit: string; floor: string; room: string; location_type: string; location_detail: string;
   insurer: string; contact_name: string; contact_phone: string; repair_parts: string[]; description: string;

@@ -8,7 +8,7 @@ import json
 import logging
 import re
 import threading
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -20,6 +20,7 @@ from .db import audit, dump, now, uid
 from .domain import DomainError, PHOTO_GROUPS, ROLES, STAGES, WORKFLOW_STAGES
 from .followup_feedback_policy import FEEDBACK_POLICY_VERSION, case_context, classify_feedback
 from .model_runtime import ModelUnavailable
+from .background import background_work
 
 log = logging.getLogger(__name__)
 PHOTO_STAGE_SCOPE = {'survey': {'survey'}, 'repair': {'survey', 'work'},
@@ -98,24 +99,35 @@ class ProjectFollowup:
 
     def signature(self):
         with self.db.read_snapshot():
-            return self._signature()
+            return self._observation()[0]
 
-    def _signature(self):
+    def _observation(self):
+        """Per-case business inputs, captured before review so concurrent edits remain due."""
         cases = self.followup_cases()
-        photos = [p for p in self.db.all('SELECT id,case_id,revision,updated_at FROM photos ORDER BY id') if p['case_id'] in cases]
-        visits = [v for v in self.db.all('SELECT * FROM visits ORDER BY id') if v['case_id'] in cases]
-        visit_ids = {v['id'] for v in visits}
-        return digest({'version': RULE_VERSION, 'config': self.config(), 'vision': self.db.setting('recognition', {}),
-                       # Official readback advances audit timestamps and the
-                       # optimistic-lock revision even when business data is
-                       # unchanged. Those must not restart a full photo review.
-                       'cases': [{k: v for k, v in c.items() if k not in (
-                           'revision', 'created_at', 'updated_at', 'workflow_verified_at', 'remote_updated_at')}
-                           for c in sorted(cases.values(), key=lambda c: c['id'])],
-                       'photos': photos, 'visits': visits,
-                       'ai_tasks': self.db.all('SELECT id,state,updated_at FROM photo_ai_tasks ORDER BY id'),
-                       'shared': [s for s in self.db.all('SELECT * FROM visit_shared_checkins ORDER BY photo_id,visit_id') if s['visit_id'] in visit_ids],
-                       'templates': self.db.all('SELECT id,requirements FROM templates ORDER BY id')})
+        photos = {p['id']: p for p in self.db.all('SELECT id,case_id,revision,updated_at FROM photos ORDER BY id')}
+        visits = {v['id']: v for v in self.db.all('SELECT * FROM visits ORDER BY id')}
+        grouped = {name: defaultdict(list) for name in ('photos', 'visits', 'ai_tasks', 'shared')}
+        for photo in photos.values():
+            grouped['photos'][photo['case_id']].append(photo)
+        for visit in visits.values():
+            grouped['visits'][visit['case_id']].append(visit)
+        for task in self.db.all('SELECT id,photo_id,state,updated_at FROM photo_ai_tasks ORDER BY id'):
+            grouped['ai_tasks'][photos.get(task['photo_id'], {}).get('case_id')].append(task)
+        for shared in self.db.all('SELECT * FROM visit_shared_checkins ORDER BY photo_id,visit_id'):
+            # A shared source can belong to a different case. Its edits must
+            # also invalidate completeness for the receiving visit's case.
+            grouped['shared'][visits.get(shared['visit_id'], {}).get('case_id')].append(
+                [shared, photos.get(shared['photo_id'])])
+        common = digest({'version': RULE_VERSION, 'config': self.config(),
+                         'vision': self.db.setting('recognition', {}),
+                         'templates': self.db.all('SELECT id,requirements FROM templates ORDER BY id')})
+        signatures = {}
+        for case_id, case in sorted(cases.items()):
+            business = {k: v for k, v in case.items() if k not in (
+                'revision', 'created_at', 'updated_at', 'workflow_verified_at', 'remote_updated_at')}
+            signatures[case_id] = digest([common, business,
+                {name: rows[case_id] for name, rows in grouped.items()}])
+        return digest([common, signatures]), signatures
 
     def request_review(self, automatic=False):
         with self.db.tx() as con:
@@ -253,6 +265,7 @@ class ProjectFollowup:
             finding('association', '照片所属案件待确认', '尚未关联具体案件，上传者身份不会自动决定所属案件。', '请补充完整报修编号或项目、楼栋及房号。')
         return findings, metrics
 
+    @background_work('followup.review')
     def review(self, run_id=None):
         if not self._review_lock.acquire(blocking=False):
             raise DomainError('项目检查正在进行，请等待完成', 409)
@@ -260,10 +273,17 @@ class ProjectFollowup:
         try:
             origin = self.db.one('SELECT automatic FROM followup_run_requests WHERE run_id=?', (run_id,))
             requested = bool(origin and not origin['automatic'])
-            signature, stamp = self.signature(), now()
+            with self.db.read_snapshot():
+                signature, case_signatures = self._observation()
+                previous = self.db.one("SELECT result FROM followup_runs WHERE state IN ('completed','partial') ORDER BY created_at DESC,rowid DESC LIMIT 1")
+            previous_signatures = json.loads(previous['result']).get('case_signatures') if previous else None
+            incremental = bool(origin and origin['automatic'] and isinstance(previous_signatures, dict))
+            selected = {key for key, value in case_signatures.items()
+                        if not incremental or previous_signatures.get(key) != value}
+            stamp = now()
             with self.db.tx() as con:
                 con.execute("UPDATE followup_runs SET state='running',signature=?,error=NULL WHERE id=?", (signature, run_id))
-            cases = self.followup_cases()
+            cases = {key: case for key, case in self.followup_cases().items() if key in selected}
             photos = [p for p in self.db.all('SELECT p.*,b.hash,b.stored_path,b.media_type FROM photos p JOIN blobs b ON b.hash=p.blob_hash WHERE b.media_type=\'image\'') if p['case_id'] in cases]
             observed, failed, rule_failed, ai_states = [], [], set(), Counter()
             ai_reviewed = set()
@@ -294,7 +314,8 @@ class ProjectFollowup:
                 if not applicable:
                     continue
                 template = case.get('insurer_template_id') or self.config()['template_id']
-                quality = self.domain.completeness(case['id'], template)
+                with self.db.read_snapshot():
+                    quality = self.domain.completeness(case['id'], template)
                 for item in quality['items']:
                     if item['stage'] not in applicable or not item['missing']:
                         continue
@@ -333,6 +354,8 @@ class ProjectFollowup:
                     if old['issue_key'] not in seen and old['photo_id'] not in rule_failed and not unreviewed_ai:
                         con.execute("UPDATE followup_issues SET state='resolved',resolution='复查时该问题已不再满足触发条件',changed_at=? WHERE id=?", (stamp, old['id']))
                 result = {'scope': 'repair', 'photos': len(photos), 'cases': len(cases), 'issues': dict(counters), 'failed': failed,
+                          'review_mode': 'incremental' if incremental else 'full',
+                          'eligible_cases': len(case_signatures), 'case_signatures': case_signatures,
                           'rule_failed': len(rule_failed), 'ai_states': dict(ai_states), 'completed_at': now()}
                 incomplete = any(ai_states.get(v) for v in ('queued','running','waiting','failed','stale','not_requested'))
                 con.execute('UPDATE followup_runs SET state=?,result=?,finished_at=? WHERE id=?', ('partial' if failed or incomplete else 'completed', dump(result), now(), run_id))
@@ -634,24 +657,38 @@ class ProjectFollowup:
         if self._thread:
             self._thread.join(timeout=10)
 
-    def _loop(self):
-        while not self._stop.is_set():
-            try:
-                pending = self.db.one("SELECT * FROM followup_runs WHERE state='queued' ORDER BY created_at LIMIT 1")
-                latest = self.db.one("SELECT signature FROM followup_runs WHERE state IN ('completed','partial') ORDER BY created_at DESC LIMIT 1")
+    @background_work('followup.scan')
+    def run_once(self):
+        pending = self.db.one("SELECT f.*,COALESCE(r.automatic,0) AS automatic FROM followup_runs f LEFT JOIN followup_run_requests r ON r.run_id=f.id WHERE f.state='queued' ORDER BY automatic,f.created_at LIMIT 1")
+        if pending and not pending['automatic']:
+            # A requested check retains its full review and does not wait for
+            # the background work slot.
+            self.review(pending['id'])
+        else:
+            with self.db.runtime.slot('followup.review') as acquired:
+                if not acquired:
+                    return 1
+                latest = self.db.one("SELECT signature FROM followup_runs WHERE state IN ('completed','partial') ORDER BY created_at DESC,rowid DESC LIMIT 1")
                 if not pending and self.config().get('auto_review') and (not latest or latest['signature'] != self.signature()):
                     pending = self.request_review(automatic=True)
                 if pending:
                     self.review(pending['id'])
-                for contact in self.db.all('SELECT project_id FROM followup_contacts WHERE auto_feedback=1'):
-                    try:
-                        self.queue_feedback(contact['project_id'], automatic=True)
-                    except DomainError:
-                        pass
-                for delivery in self.db.all("SELECT id FROM followup_feedback WHERE state='queued' ORDER BY created_at"):
-                    if self._stop.is_set():
-                        break
-                    self.deliver(delivery['id'])
+        for contact in self.db.all('SELECT project_id FROM followup_contacts WHERE auto_feedback=1'):
+            try:
+                self.queue_feedback(contact['project_id'], automatic=True)
+            except DomainError:
+                pass
+        for delivery in self.db.all("SELECT id FROM followup_feedback WHERE state='queued' ORDER BY created_at"):
+            if self._stop.is_set():
+                break
+            self.deliver(delivery['id'])
+        return 30
+
+    def _loop(self):
+        while not self._stop.is_set():
+            delay = 30
+            try:
+                delay = self.run_once()
             except Exception:
                 log.exception('Project follow-up check failed')
-            self._stop.wait(30)
+            self._stop.wait(delay)

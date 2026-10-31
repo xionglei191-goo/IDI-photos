@@ -35,12 +35,14 @@ public final class MainActivity extends ComponentActivity {
       checkinRole = "",
       status = "";
   boolean demo, repeat = true, busy, syncing;
+  long nextBackgroundSync;
   JSONObject selected;
   LinearLayout root;
   CameraScreen cameraScreen;
   OfficialCameraScreen officialScreen;
   RecordsScreen recordsScreen;
   ActivityResultLauncher<String> permission;
+  ActivityResultLauncher<String> notifications;
   ActivityResultLauncher<Intent> officialCapture;
   ActivityResultLauncher<String[]> sdkPermissions;
   final Runnable ticker =
@@ -48,6 +50,7 @@ public final class MainActivity extends ComponentActivity {
         public void run() {
           if (cameraScreen != null) cameraScreen.tick();
           if (recordsScreen != null) recordsScreen.tick();
+          maybeSync();
           handler.postDelayed(this, 1000);
         }
       };
@@ -67,6 +70,13 @@ public final class MainActivity extends ComponentActivity {
     store = CaptureStore.get(this);
     demo = store.prefs.getBoolean("demo", false);
     WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+    notifications = registerForActivityResult(new ActivityResultContracts.RequestPermission(), granted -> {});
+    if (android.os.Build.VERSION.SDK_INT >= 33
+        && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        && !store.prefs.getBoolean("upload_notification_asked", false)) {
+      store.prefs.edit().putBoolean("upload_notification_asked", true).apply();
+      notifications.launch(android.Manifest.permission.POST_NOTIFICATIONS);
+    }
     permission =
         registerForActivityResult(
             new ActivityResultContracts.RequestPermission(),
@@ -83,7 +93,8 @@ public final class MainActivity extends ComponentActivity {
                   && Boolean.TRUE.equals(
                       permissions.get(android.Manifest.permission.ACCESS_FINE_LOCATION))) {
                 if (officialScreen != null) officialScreen.start();
-              } else toast("今日官方拍摄需要相机和精确位置权限，请允许后再拍摄");
+              } else if (officialScreen != null) officialScreen.permissionDenied();
+              else toast("今日官方拍摄需要相机和精确位置权限，请允许后再拍摄");
             });
     officialCapture =
         registerForActivityResult(
@@ -171,6 +182,7 @@ public final class MainActivity extends ComponentActivity {
   protected void onResume() {
     super.onResume();
     if (officialScreen != null) officialScreen.maybeStart();
+    maybeSync();
     handler.removeCallbacks(ticker);
     handler.post(ticker);
   }
@@ -184,6 +196,7 @@ public final class MainActivity extends ComponentActivity {
   @Override
   protected void onDestroy() {
     handler.removeCallbacksAndMessages(null);
+    if (officialScreen != null) officialScreen.close();
     if (cameraScreen != null) cameraScreen.close();
     super.onDestroy();
   }
@@ -279,11 +292,24 @@ public final class MainActivity extends ComponentActivity {
 
   void show(String next) {
     if (next.equals("camera") && selected == null) next = "cases";
+    if (next.equals("camera") && !demo) {
+      // Keep the current page until the SDK owns the screen. There is no
+      // separate camera preparation page on the normal cached-authorization path.
+      if (root == null || cameraScreen != null) show("cases");
+      if (busy) return;
+      if (officialScreen != null) officialScreen.close();
+      recordsScreen = null;
+      screen = "camera";
+      officialScreen = new OfficialCameraScreen(this);
+      officialScreen.check();
+      return;
+    }
     if (cameraScreen != null) {
       cameraScreen.close();
       cameraScreen = null;
     }
     recordsScreen = null;
+    if (officialScreen != null) officialScreen.close();
     officialScreen = null;
     screen = next;
     boolean dark = screen.equals("camera");
@@ -309,9 +335,6 @@ public final class MainActivity extends ComponentActivity {
         root.post(() -> {
           if (!isFinishing() && !isDestroyed() && cameraScreen == opened) WatermarkEditor.show(this);
         });
-      } else {
-        officialScreen = new OfficialCameraScreen(this);
-        root.addView(officialScreen.view(), new LinearLayout.LayoutParams(-1, 0, 1));
       }
     } else {
       View page;
@@ -358,34 +381,71 @@ public final class MainActivity extends ComponentActivity {
   }
 
   void sync() {
+    sync(false);
+  }
+
+  private void maybeSync() {
+    if (store == null || demo || busy || syncing || !screen.equals("cases") || !store.connected()) return;
+    if (android.os.SystemClock.elapsedRealtime() < nextBackgroundSync) return;
+    sync(true);
+  }
+
+  private void sync(boolean background) {
     if (syncing) return;
     if (!store.connected()) {
       connect();
       return;
     }
     syncing = true;
-    status = "正在同步案件…";
-    if (screen.equals("cases")) show("cases");
+    nextBackgroundSync = android.os.SystemClock.elapsedRealtime() + 5 * 60 * 1000;
+    String server = store.server(), device = store.device(), token = store.token(device);
+    String expectedScope = NativeAuthorization.scope(store);
+    if (!background) {
+      status = "正在同步案件…";
+      if (screen.equals("cases")) show("cases");
+    }
     io.execute(
         () -> {
           String message;
           try {
             JSONObject response =
                 CameraApi.request(
-                    store.server(), "/api/camera/cases", store.token(store.device()), null);
-            store.replaceCases(response.getJSONArray("items"));
+                    server, "/api/camera/cases", token, null);
+            if (expectedScope.equals(NativeAuthorization.scope(store))) {
+              store.replaceCases(response.getJSONArray("items"));
+              if (!background || NativeAuthorization.refreshDue(store)) {
+                JSONObject authorization = CameraApi.request(server, "/api/camera/native-authorization", token, null);
+                NativeAuthorization.save(store, expectedScope, authorization);
+              }
+            }
             message = "已同步 " + response.optInt("total") + " 个案件";
           } catch (Exception error) {
-            message = "同步失败，保留上次案件：" + UploadWorker.safeMessage(error);
+            if (error instanceof CameraApi.Failure failure && (failure.status == 401 || failure.status == 403)) {
+              NativeAuthorization.denied(store, expectedScope);
+              message = "当前连接无法继续拍摄：" + UploadWorker.safeMessage(error);
+            } else if (error instanceof CameraApi.Failure failure && failure.status == 404) {
+              if (expectedScope.equals(NativeAuthorization.scope(store))) NativeAuthorization.clear(store);
+              message = "请先更新电脑端工作台，再同步拍摄准备信息";
+            } else message = "同步未完成，已有资料仍保留：" + UploadWorker.safeMessage(error);
           }
           String result = message;
           runOnUiThread(
               () -> {
                 syncing = false;
+                if (isDestroyed()) return;
+                if (!expectedScope.equals(NativeAuthorization.scope(store))) {
+                  if (!demo && store.connected()) sync(true);
+                  return;
+                }
                 status = result;
                 restoreSelection();
                 if (screen.equals("cases")) show("cases");
-                else toast(result);
+                else if (screen.equals("camera") && selected == null) {
+                  show("cases");
+                  toast("当前案件已不在可拍摄列表，请重新选择");
+                }
+                else if (officialScreen != null) officialScreen.synchronizedCases(result);
+                else if (!background) toast(result);
               });
         });
   }
@@ -398,6 +458,21 @@ public final class MainActivity extends ComponentActivity {
   }
 
   void retry(CaptureStore.Item item) {
+    item = store.item(item.id);
+    if (item == null) return;
+    if (RecordsScreen.deleting(item)) {
+      toast("这份资料已申请删除，不再上传");
+      return;
+    }
+    if (UploadWorker.active(item.id) || item.state.equals("uploading")) {
+      toast("这份资料正在上传，请等待服务器确认");
+      return;
+    }
+    retrySaved(item);
+  }
+
+  private void retrySaved(CaptureStore.Item item) {
+    if (item.state.equals("uploaded")) return;
     if (item.demo()) {
       toast("示例照片只保存在手机，可预览或导出");
       return;

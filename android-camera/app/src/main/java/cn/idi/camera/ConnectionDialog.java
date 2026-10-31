@@ -64,6 +64,7 @@ final class ConnectionDialog {
                           "",
                           new JSONObject().put("code", pairCode));
                   a.store.connect(normalized, pair);
+                  NativeAuthorization.clear(a.store);
                   a.runOnUiThread(
                       () -> {
                         a.demo = false;

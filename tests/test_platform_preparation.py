@@ -354,11 +354,22 @@ def test_login_failure_preserves_reason_without_logging_credentials(monkeypatch,
         with pytest.raises(DomainError) as caught:
             client.login("user-example", "password-example")
         assert caught.value.status == status and str(caught.value) == detail
+        assert caught.value.retryable is (status not in (400, 401, 403))
+        assert caught.value.diagnostics == {'failure': failure, 'phase': 'token_response', 'status': status,
+                                           'http_status': 200, 'business_code': 1}
         assert not client.status()["connected"]
         assert "http=200 code=1" in caplog.text
         assert all(secret not in caplog.text for secret in ("password-example", "secret-token", "previous-token", "user-example"))
     finally:
         client.close()
+
+
+def test_login_diagnostics_only_keep_known_classifications_and_valid_numbers():
+    from idi.platform_client import PlatformLoginError
+    error = PlatformLoginError('private-password', 502, failure='private-token', phase={'secret': 'password'},
+                               http_status=True, business_code='private-account')
+    assert error.diagnostics == {'failure': 'login_failed', 'phase': None, 'status': 502,
+                                 'http_status': None, 'business_code': None}
 
 
 @pytest.mark.parametrize("output", ["not-json", "[]", "null", '{"token":"undefined"}', '{"token":"null"}'])

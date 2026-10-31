@@ -16,6 +16,7 @@ from pathlib import Path
 from ..db import Database, audit, dump, now, uid
 from ..domain import DomainError
 from ..storage import ALLOWED_EXTS, IMAGE_EXTS, VIDEO_EXTS
+from ..background import background_work
 
 log = logging.getLogger(__name__)
 
@@ -29,16 +30,32 @@ class ConnectorService:
         self._observed_files = {}
         self._restart_after = {}
         self._process_lock = threading.RLock()
+        self._config_signal = db.runtime.watch('connector-config', {'connectors': {'enabled', 'kind', 'config', 'name'}})
+        self._capture_signal = db.runtime.watch('feishu-capture', {
+            'feishu_inbox': {'state', 'retry_at'}, 'connectors': {'enabled', 'kind', 'config'}})
+        self._config_token, self._config_at, self._configs = None, 0, []
 
-    def get(self, connector_id):
+    @staticmethod
+    def _config(row):
+        row['config'] = json.loads(row['config'])
+        row['enabled'] = bool(row['enabled'])
+        if row['kind'] == 'feed' and row['config'].get('adapter') == 'feishu':
+            row['kind'] = 'feishu'
+        return row
+
+    def config(self, connector_id):
         row = self.db.one("SELECT * FROM connectors WHERE id=?", (connector_id,))
         if not row:
             raise DomainError("采集入口不存在", 404)
-        row["config"] = json.loads(row["config"])
-        row["enabled"] = bool(row["enabled"])
-        if row['kind'] == 'feed' and row['config'].get('adapter') == 'feishu':
+        return self._config(row)
+
+    def configs(self):
+        return [self._config(row) for row in self.db.all('SELECT * FROM connectors ORDER BY created_at')]
+
+    def get(self, connector_id):
+        row = self.config(connector_id)
+        if row['kind'] == 'feishu':
             from .secret_store import SecretStore
-            row['kind'] = 'feishu'
             row['secret_configured'] = SecretStore(self.settings.data_dir).exists(connector_id)
             row['capture'] = self.db.one('SELECT * FROM feishu_state WHERE connector_id=?', (connector_id,))
             row['queue'] = self.db.one("SELECT COUNT(*) AS total,SUM(state='completed') AS completed,SUM(state IN ('pending','processing')) AS pending,SUM(state='failed') AS failed FROM feishu_inbox WHERE connector_id=?", (connector_id,))
@@ -133,7 +150,7 @@ class ConnectorService:
             client.close()
 
     def ingest(self, connector_id, event):
-        connector = self.get(connector_id)
+        connector = self.config(connector_id)
         if not connector["enabled"]:
             raise DomainError("该入口未启用")
         source_key = str(event.get("source_key", "")).strip()
@@ -237,8 +254,9 @@ class ConnectorService:
             count = con.execute("UPDATE feishu_inbox SET state='pending',attempts=0,retry_at=0,error=NULL WHERE connector_id=? AND state='failed'" + where, values).rowcount
         return {'media_state': 'pending', 'queued': count}
 
-    def scan_once(self):
-        for connector in self.list():
+    @background_work('connectors.scan')
+    def scan_once(self, connectors=None):
+        for connector in self.configs() if connectors is None else connectors:
             if not connector["enabled"] or connector["kind"] != "folder":
                 continue
             try:
@@ -272,7 +290,7 @@ class ConnectorService:
             return self._start_collector(connector_id)
 
     def _start_collector(self, connector_id):
-        connector = self.get(connector_id)
+        connector = self.config(connector_id)
         if connector['kind'] == 'feishu':
             if not connector['enabled']:
                 raise DomainError('请先启用飞书入口')
@@ -324,26 +342,36 @@ class ConnectorService:
         self._thread = threading.Thread(target=self._loop, name="idi-inbox", daemon=True)
         self._thread.start()
 
+    @background_work('connectors.supervise')
+    def supervise_once(self):
+        observed = self._config_signal.token()
+        if observed != self._config_token or time.monotonic() - self._config_at >= 15:
+            self._configs = self.configs()
+            self._config_token, self._config_at = observed, time.monotonic()
+        self.scan_once(self._configs)
+        for connector_id, process in list(self._collectors.items()):
+            if process.poll() is not None:
+                with self.db.tx() as con:
+                    con.execute("UPDATE connectors SET status='error',error=? WHERE id=?", (f"采集进程已退出：{process.returncode}，请查看日志", connector_id))
+                    con.execute("UPDATE feishu_state SET phase='error',error='接收进程已退出，30 秒后自动重启' WHERE connector_id=?", (connector_id,))
+                self._collectors.pop(connector_id, None)
+                self._restart_after[connector_id] = time.monotonic() + 30
+        for connector in self._configs:
+            if connector['kind'] == 'feishu' and connector['enabled'] and connector['id'] not in self._collectors and time.monotonic() >= self._restart_after.get(connector['id'], 0):
+                self.start_collector(connector['id'])
+
     def _loop(self):
         while not self._stop.is_set():
+            observed = self._config_signal.token()
             try:
-                self.scan_once()
-                for connector_id, process in list(self._collectors.items()):
-                    if process.poll() is not None:
-                        with self.db.tx() as con:
-                            con.execute("UPDATE connectors SET status='error',error=? WHERE id=?", (f"采集进程已退出：{process.returncode}，请查看日志", connector_id))
-                            con.execute("UPDATE feishu_state SET phase='error',error='接收进程已退出，30 秒后自动重启' WHERE connector_id=?", (connector_id,))
-                        self._collectors.pop(connector_id, None)
-                        self._restart_after[connector_id] = time.monotonic() + 30
-                for connector in self.list():
-                    if connector['kind'] == 'feishu' and connector['enabled'] and connector['id'] not in self._collectors and time.monotonic() >= self._restart_after.get(connector['id'], 0):
-                        self.start_collector(connector['id'])
+                self.supervise_once()
             except Exception:
                 log.exception("Collection scan failed")
-            self._stop.wait(5)
+            self.db.runtime.wait('connectors.supervise', self._config_signal, observed, 5, self._stop)
 
     def stop(self):
         self._stop.set()
+        self._config_signal.wake(False)
         if self._thread:
             self._thread.join(5)
         for connector_id in list(self._collectors):

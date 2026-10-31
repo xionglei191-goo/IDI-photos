@@ -13,9 +13,16 @@ from .db import audit, dump, now, uid
 from .domain import DomainError
 from .project_followup import plain
 from .review_requirements import pending_checkins
+from .automatic_uploads import UPLOAD_INPUTS
+from .background import background_work
 
 log = logging.getLogger(__name__)
 QUEUE_RECHECK_SECONDS = 60
+NOTIFICATION_INPUTS = {**UPLOAD_INPUTS, **{name: None for name in (
+    'platform_review_batches', 'followup_contacts', 'feishu_identity_bindings', 'feishu_review_actions')},
+    'review_notifications': {'id', 'case_id', 'review_id', 'proposal_key', 'dedupe_key', 'state', 'purpose',
+        'recipient_id', 'connector_id', 'chat_id', 'card_token', 'card_view', 'card_dirty', 'card_retry_at',
+        'pending_action_id', 'retry_at', 'remote_message_id', 'content'}}
 
 
 def digest(value):
@@ -41,6 +48,8 @@ class ReviewNotifications:
         self._lock, self._stop, self._thread = threading.RLock(), threading.Event(), None
         self.cards = None
         self._queue_checks = {}
+        self._signal = self.db.runtime.watch('notifications', NOTIFICATION_INPUTS)
+        self._poll_token, self._poll_at, self._retry_at = None, 0.0, 0.0
 
     def enabled(self):
         policy = self.automatic.policy()
@@ -83,7 +92,11 @@ class ReviewNotifications:
         """Cheap inputs for background polling, never authority to send/submit."""
         with self.db.read_snapshot():
             case = self.automatic.domain.case(case_id)
+            case = {k: v for k, v in case.items() if k not in (
+                'revision', 'created_at', 'updated_at', 'workflow_verified_at', 'remote_updated_at')}
             upload = self.db.one('SELECT * FROM automatic_upload_cases WHERE case_id=?', (case_id,))
+            if not upload:
+                raise DomainError('案件已移出自动处理范围', 409)
             review = self.db.one('SELECT id,state,fingerprint,save_only FROM platform_review_batches WHERE id=?',
                                  (upload['review_id'],))
             deliveries = self.db.all(
@@ -339,6 +352,7 @@ class ReviewNotifications:
                 audit(con, 'review_notification', delivery_id, 'confirm_delivery', after={'received': received})
         return {'state': state}
 
+    @background_work('notifications.scan')
     def run_once(self):
         if self.cards and not self._stop.is_set():
             self.cards.run_once()
@@ -351,20 +365,26 @@ class ReviewNotifications:
                     with self.db.tx() as con:
                         con.execute("UPDATE review_notifications SET state='cancelled',error='飞书核对提醒已暂停' WHERE state='queued'")
                 return 0
-            candidates = self.db.all("SELECT case_id FROM automatic_upload_cases WHERE enabled=1 AND state='awaiting_confirmation'")
-            case_ids = {row['case_id'] for row in candidates}
-            self._queue_checks = {key: value for key, value in self._queue_checks.items() if key in case_ids}
-            for row in candidates:
-                try:
-                    self._queue_if_changed(row['case_id'])
-                except DomainError:
-                    # Missing bindings/readiness are visible beside the proposal and retried after changes.
-                    continue
+            observed, stamp = self._signal.token(), time.monotonic()
+            due = not self._queue_checks or any(stamp - checked >= QUEUE_RECHECK_SECONDS for _, checked in self._queue_checks.values())
+            if observed != self._poll_token or stamp - self._poll_at >= 15 or due:
+                self._poll_token, self._poll_at = observed, stamp
+                candidates = self.db.all("SELECT case_id FROM automatic_upload_cases WHERE enabled=1 AND state='awaiting_confirmation'")
+                case_ids = {row['case_id'] for row in candidates}
+                self._queue_checks = {key: value for key, value in self._queue_checks.items() if key in case_ids}
+                for row in candidates:
+                    try:
+                        self._queue_if_changed(row['case_id'])
+                    except DomainError:
+                        continue
+            else:
+                self.db.runtime.count('notifications.scan', 'idle_skips')
             deliveries = self.db.all("SELECT id FROM review_notifications WHERE state='queued' AND retry_at<=? ORDER BY created_at LIMIT 10", (time.time(),))
             for row in deliveries:
                 if self._stop.is_set():
                     break
                 self.deliver(row['id'])
+            self._retry_at = self.db.one("SELECT MIN(retry_at) due FROM review_notifications WHERE state='queued'")['due'] or 0
             return len(deliveries)
         finally:
             self._lock.release()
@@ -386,14 +406,19 @@ class ReviewNotifications:
 
     def stop(self):
         self._stop.set()
+        self._signal.wake(persist=False)
         if self._thread:
             self._thread.join(timeout=1)
         self._thread = None
 
     def _loop(self):
         while not self._stop.is_set():
+            observed = self._signal.token()
             try:
                 self.run_once()
             except Exception:
                 log.exception('Proposal notification queue failed')
-            self._stop.wait(2)
+            delay = min(15, self._retry_at - time.time() if self._retry_at else 15)
+            if self.cards:
+                delay = min(delay, self.cards.next_delay())
+            self._signal.wait(observed, max(.1, delay), self._stop)

@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import time
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -14,6 +15,7 @@ from PIL import Image
 
 from ..db import dump, now
 from ..domain import DomainError
+from ..background import background_work
 from ..storage import ALLOWED_EXTS, IMAGE_EXTS, VIDEO_EXTS, safe_name
 
 TOKEN_ERRORS = {99991661, 99991663, 99991664, 99991668}
@@ -201,7 +203,16 @@ class FeishuCapture:
     def __init__(self, service, connector_id, client):
         self.service, self.db, self.client = service, service.db, client
         self.connector_id = connector_id
-        self.connector = service.get(connector_id)
+        self.connector = service.config(connector_id)
+        self._signal = service._capture_signal
+        self._heartbeat_at, self._heartbeat_lock = 0, threading.Lock()
+
+    def heartbeat(self):
+        with self._heartbeat_lock:
+            current = time.monotonic()
+            if not self._heartbeat_at or current - self._heartbeat_at >= 15:
+                self.state(heartbeat_at=now())
+                self._heartbeat_at = current
 
     def state(self, **values):
         allowed = {"phase", "connected_at", "last_event_at", "last_history_at", "heartbeat_at", "error", "history_error", "cursor"}
@@ -210,6 +221,7 @@ class FeishuCapture:
         with self.db.tx() as con:
             con.execute("UPDATE feishu_state SET " + ",".join(key + "=?" for key in values) + " WHERE connector_id=?", (*values.values(), self.connector_id))
 
+    @background_work('capture.receive')
     def receive(self, payload, *, live=False):
         if payload.get("chat_id") != self.connector["config"]["chat_id"] or payload.get("deleted"):
             return False
@@ -229,6 +241,7 @@ class FeishuCapture:
                 con.execute("UPDATE feishu_state SET last_event_at=? WHERE connector_id=?", (now(), self.connector_id))
         return bool(result.rowcount)
 
+    @background_work('capture.history')
     def catch_up(self, end=None):
         state = self.db.one("SELECT * FROM feishu_state WHERE connector_id=?", (self.connector_id,))
         # Freeze each window; page through all results before advancing the cursor.
@@ -238,7 +251,7 @@ class FeishuCapture:
             if end > start:
                 for payload in self.client.history(self.connector["config"]["chat_id"], start, end):
                     self.receive(payload)
-                    self.state(heartbeat_at=now())
+                    self.heartbeat()
                 self.state(cursor=end)
             self.state(last_history_at=now(), history_error=None)
             return True
@@ -250,13 +263,23 @@ class FeishuCapture:
         with self.db.tx() as con:
             con.execute("UPDATE feishu_inbox SET state='pending',retry_at=0 WHERE connector_id=? AND state='processing'", (self.connector_id,))
 
+    def next_delay(self):
+        row = self.db.one("SELECT MIN(retry_at) AS due FROM feishu_inbox WHERE connector_id=? AND state='failed' AND attempts<8", (self.connector_id,))
+        return min(15, max(.05, row['due'] - time.time())) if row['due'] else 15
+
+    @background_work('capture.process')
     def process_one(self):
+        sql = "SELECT * FROM feishu_inbox WHERE connector_id=? AND (state='pending' OR (state='failed' AND attempts<8 AND retry_at<=?)) ORDER BY CAST(json_extract(payload,'$.create_time') AS INTEGER),received_at,message_id LIMIT 1"
+        if not self.db.one(sql, (self.connector_id, time.time())):
+            self.db.runtime.count('capture.process', 'empty_polls')
+            return False
         with self.db.tx() as con:
-            row = con.execute("SELECT * FROM feishu_inbox WHERE connector_id=? AND (state='pending' OR (state='failed' AND attempts<8 AND retry_at<=?)) ORDER BY CAST(json_extract(payload,'$.create_time') AS INTEGER),received_at,message_id LIMIT 1", (self.connector_id, time.time())).fetchone()
+            row = con.execute(sql, (self.connector_id, time.time())).fetchone()
             if not row:
                 return False
             row = dict(row)
             con.execute("UPDATE feishu_inbox SET state='processing',attempts=attempts+1,updated_at=? WHERE connector_id=? AND message_id=?", (now(), self.connector_id, row["message_id"]))
+        self.db.runtime.queue_delay('capture.process', row['received_at'])
         try:
             self.archive(json.loads(row["payload"]), captured_at=row['received_at'])
             result, error, retry = "completed", None, 0

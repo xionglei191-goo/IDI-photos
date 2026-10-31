@@ -2,6 +2,7 @@
 node_modules/
 frontend/dist/
 frontend/dist-test/
+frontend/dist-*/
 data/
 tmp/
 artifacts/

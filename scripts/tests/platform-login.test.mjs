@@ -1,10 +1,10 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chromium } from '../../frontend/node_modules/playwright/index.mjs';
-import { loginThroughWebsite, WebsiteLoginError } from '../platform-login.mjs';
+import { browserLaunchOptions, loginThroughWebsite, WebsiteLoginError } from '../platform-login.mjs';
 
 let browser;
-before(async () => { browser = await chromium.launch({ channel: 'chrome', headless: true }); });
+before(async () => { browser = await chromium.launch(browserLaunchOptions()); });
 after(async () => { await browser?.close(); });
 
 // Every browser request is intercepted. These tests never contact the real site.
@@ -83,5 +83,24 @@ test('missing or literal undefined tokens never establish a connection', async t
 
 test('only a short sanitized rejection message escapes the browser helper', async t => {
   const f = await fixture(t, { body: { code: 1, msg: '<b>private-test-password</b> ' + 'x'.repeat(100), data: { token: 'must-not-be-returned' } } });
-  await assert.rejects(f.run(), error => error.status === 401 && !error.message.includes('private-test-password') && !error.message.includes('must-not-be-returned') && !error.message.includes('x'.repeat(48)) && !error.message.includes('<b>'));
+  await assert.rejects(f.run(), error => error.status === 502 && !error.message.includes('private-test-password') && !error.message.includes('must-not-be-returned') && !error.message.includes('x'.repeat(48)) && !error.message.includes('<b>'));
 });
+
+for (const msg of ['系统繁忙，请稍后重试', '登录暂未完成', '']) {
+  test(`business error without credential evidence remains retryable: ${msg || 'empty'}`, async t => {
+    const f = await fixture(t, { body: { code: 500, msg } });
+    await assert.rejects(f.run(), error => error.status === 502 && error.failure === 'login_response_error');
+    assert.equal(f.requests.length, 1);
+  });
+}
+
+for (const [msg, failure] of [
+  ['账号或密码错误', 'credentials_rejected'], ['用户名不存在', 'credentials_rejected'],
+  ['验证码错误，请重新输入', 'verification_required'], ['账号已锁定', 'verification_required'],
+  ['账户已停用，请联系管理员', 'verification_required'], ['密码已过期，请修改密码', 'verification_required'],
+]) {
+  test(`explicit refusal stops automatic attempts: ${msg}`, async t => {
+    const f = await fixture(t, { body: { code: 500, msg } });
+    await assert.rejects(f.run(), error => error.status === 401 && error.failure === failure);
+  });
+}

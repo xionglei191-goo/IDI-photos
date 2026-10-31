@@ -7,7 +7,7 @@ from datetime import datetime
 
 from .db import Database, audit, dump, now, rowdict, uid
 from .case_codes import issue_code, normalize_code, sync_project_codes, unique_prefix
-from .identity import current, project_filter, require_admin, require_project
+from .identity import current, project_filter, require_admin, require_project, case_filter, require_case
 
 STAGES = {"unknown": "待分类", "survey": "查勘", "work": "施工", "acceptance": "验收照片"}
 ROLES = {"unknown": "待分类", "building_checkin": "楼栋打卡", "door_checkin": "入户门打卡", "problem": "问题照片", "construction": "施工过程", "finished": "完工效果", "other": "其他资料"}
@@ -36,7 +36,11 @@ CASE_FIELDS = {"project_id", "report_number", "platform_report_code", "policy_nu
 PHOTO_FIELDS = {"case_id", "project_id", "visit_id", "stage", "role", "photo_group", "part", "process", "watermark_time", "notes"}
 CASE_PLATFORM_COLUMNS = """,(SELECT json_group_array(scope) FROM platform_list_entries e WHERE e.case_id=c.id) AS platform_lists,
     (SELECT json_group_array(code) FROM case_code_aliases a WHERE a.case_id=c.id AND a.code<>c.short_code) AS short_code_aliases,
-    EXISTS(SELECT 1 FROM platform_links l WHERE l.case_id=c.id AND l.verified_at IS NOT NULL) AS platform_linked"""
+    EXISTS(SELECT 1 FROM platform_links l WHERE l.case_id=c.id AND l.verified_at IS NOT NULL) AS platform_linked,
+    (SELECT json_group_array(json_object('user_id',wa.user_id,'display_name',wu.display_name))
+       FROM case_worker_assignments wa JOIN idi_users wu ON wu.id=wa.user_id
+       JOIN project_members wm ON wm.project_id=wa.project_id AND wm.user_id=wa.user_id
+       WHERE wa.case_id=c.id AND wa.project_id=c.project_id AND wm.role='worker' AND wu.enabled=1) AS workers"""
 PHOTO_SELECT = """SELECT p.*, b.media_type,b.mime_type,b.size_bytes,b.width,b.height,b.extension,b.thumbnail_path,
     c.title AS case_title,c.report_number,c.platform_report_code,c.short_code,c.building,c.unit,c.floor,c.room,c.location_type,c.location_detail,c.insurer,
     pr.name AS project_name,(SELECT display_name FROM idi_users u WHERE u.id=p.uploaded_by) AS uploaded_by_name,
@@ -60,16 +64,16 @@ class DomainError(Exception):
         self.status = status
 
 
-def case_filters(project_id=None, query=None, status=None):
-    scope, values = project_filter('c.project_id')
+def case_filters(project_id=None, query=None, status=None, *, assigned=False):
+    scope, values = case_filter() if assigned else project_filter('c.project_id')
     where = [scope]
     for col, val in (("c.project_id", project_id), ("c.status", status)):
         if val:
             where.append(col + "=?")
             values.append(val)
     if query:
-        where.append("(c.title LIKE ? OR c.report_number LIKE ? OR c.room LIKE ? OR pr.name LIKE ? OR c.building||'-'||c.room LIKE ? OR c.short_code LIKE ? OR c.platform_report_code LIKE ? OR c.policy_number LIKE ? OR EXISTS(SELECT 1 FROM case_code_aliases a WHERE a.case_id=c.id AND a.code LIKE ?))")
-        values.extend([f"%{query}%"] * 9)
+        where.append("(c.title LIKE ? OR c.report_number LIKE ? OR c.room LIKE ? OR c.location_detail LIKE ? OR pr.name LIKE ? OR c.building||'-'||c.room LIKE ? OR c.short_code LIKE ? OR c.platform_report_code LIKE ? OR c.policy_number LIKE ? OR EXISTS(SELECT 1 FROM case_code_aliases a WHERE a.case_id=c.id AND a.code LIKE ?))")
+        values.extend([f"%{query}%"] * 10)
     return where, values
 
 
@@ -79,6 +83,7 @@ def decode_case(row):
         row["platform_lists"] = json.loads(row.get("platform_lists") or '[]')
         row["short_code_aliases"] = json.loads(row.get("short_code_aliases") or '[]')
         row["platform_linked"] = bool(row.get("platform_linked"))
+        row['workers'] = json.loads(row.get('workers') or '[]')
         # Official cases follow the actual repair list, not an inferred stage.
         row["followup_eligible"] = 'repair' in row["platform_lists"] or (
             not row["platform_linked"] and row.get("workflow_source") != 'platform'
@@ -113,7 +118,17 @@ class Domain:
 
     def projects(self):
         scope, args = project_filter('pr.id')
-        rows = self.db.all("SELECT pr.*,(SELECT COUNT(*) FROM cases c WHERE c.project_id=pr.id) AS case_count,(SELECT COUNT(*) FROM photos p WHERE p.project_id=pr.id) AS photo_count FROM projects pr WHERE " + scope + " ORDER BY pr.name", args)
+        person = current()
+        worker_projects = [p for p, role in person.projects.items() if role == 'worker'] if person and not person.admin else []
+        if worker_projects:
+            scope = '(' + scope + ' OR pr.id IN (' + ','.join('?' for _ in worker_projects) + '))'
+            args.extend(worker_projects)
+        case_scope, case_args = case_filter()
+        photo_scope, photo_args = case_filter('p.project_id', 'p.case_id')
+        rows = self.db.all("SELECT pr.*,(SELECT COUNT(*) FROM cases c WHERE c.project_id=pr.id AND " + case_scope + ") AS case_count,"
+            "(SELECT COUNT(*) FROM photos p LEFT JOIN cases c ON c.id=p.case_id WHERE p.project_id=pr.id AND "
+            + (photo_scope if worker_projects else '1=1') + ") AS photo_count FROM projects pr WHERE " + scope + " ORDER BY pr.name",
+            [*case_args, *(photo_args if worker_projects else []), *args])
         for row in rows:
             row["aliases"] = json.loads(row["aliases"])
         return rows
@@ -145,7 +160,7 @@ class Domain:
         return {**next(p for p in self.projects() if p["id"] == project_id), 'updated_case_codes': updated_codes}
 
     def cases(self, project_id=None, query=None, status=None):
-        where, values = case_filters(project_id, query, status)
+        where, values = case_filters(project_id, query, status, assigned=True)
         rows = self.db.all("SELECT c.*,pr.name AS project_name,(SELECT COUNT(*) FROM photos p WHERE p.case_id=c.id) AS photo_count" + CASE_PLATFORM_COLUMNS + " FROM cases c JOIN projects pr ON pr.id=c.project_id" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY c.updated_at DESC", values)
         return [decode_case(row) for row in rows]
 
@@ -153,7 +168,7 @@ class Domain:
         row = self.db.one("SELECT c.*,pr.name AS project_name" + CASE_PLATFORM_COLUMNS + " FROM cases c JOIN projects pr ON pr.id=c.project_id WHERE c.id=?", (case_id,))
         if not row:
             raise DomainError("案件不存在", 404)
-        require_project(row['project_id'])
+        require_case(row['project_id'], case_id)
         return decode_case(row)
 
     def _case_values(self, data, existing=None):

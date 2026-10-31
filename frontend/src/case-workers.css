@@ -1,0 +1,15 @@
+.case-workers-bar { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:12px 18px; border:1px solid var(--border, #e0e5ec); border-radius:8px; background:var(--surface, #fff); margin:12px 0; }
+.case-workers-bar > span { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.worker-names { color:var(--text, #26364a); line-height:1.6; }
+.worker-options { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px; margin:18px 0; }
+.worker-options > label { display:flex; align-items:center; gap:10px; padding:12px; border:1px solid var(--border, #dce3ec); border-radius:8px; cursor:pointer; }
+.worker-options > label:has(input:checked) { background:#eef5ff; border-color:#95b8e4; }
+.worker-options input { width:17px; height:17px; }
+.worker-options small, .worker-history small { display:block; color:var(--muted, #68798c); margin-top:3px; }
+.worker-history > div { border-top:1px solid var(--border, #e1e6ed); padding:10px 0; }
+.worker-history p { margin:4px 0; font-size:13px; }
+.worker-batch-bar { display:flex; align-items:center; gap:12px; padding:10px 16px; background:#eef5ff; border-bottom:1px solid #d9e5f4; }
+.worker-table-cell { min-width:115px; max-width:180px; }
+.worker-table-cell button { display:block; margin-top:5px; }
+.worker-select-cell { width:36px; text-align:center; }
+.worker-select-cell input { width:16px; height:16px; }

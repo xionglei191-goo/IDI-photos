@@ -7,4 +7,17 @@
         <item name="android:windowBackground">#F7F8FA</item>
         <item name="android:navigationBarColor">#FFFFFF</item>
     </style>
+    <!-- Android 8 rejects a fixed orientation on translucent activities. -->
+    <style name="CameraCoordinatorTheme" parent="AppTheme">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
+    <style name="CameraPreviewTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
 </resources>

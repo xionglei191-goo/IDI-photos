@@ -55,7 +55,7 @@ from .official_camera import OfficialCamera, official_camera_routes
 from .camera_timing import CameraTimingMiddleware
 from .photo_dedup import PhotoDedup
 from .access import Access, access_routes
-from .identity import acting_as, current
+from .identity import acting_as, current, require_admin
 from .project_accounts import ProjectAccounts, project_account_routes
 
 
@@ -128,6 +128,7 @@ def create_app(settings: Settings | None = None):
         with db.tx() as con:
             con.execute("UPDATE agent_maintenance_actions SET state='interrupted',error='服务中断；未自动重放，请查询当前状态后另行请求',updated_at=? WHERE state='running'", (now(),))
         if settings.worker_enabled:
+            db.runtime.start()
             official_camera.start()
             project_accounts.start()
             jobs.start()
@@ -162,10 +163,12 @@ def create_app(settings: Settings | None = None):
         jobs.stop()
         archive_tree.stop()
         platform.client.close()
+        db.runtime.stop()
 
     app = FastAPI(title="IDI 资料管理", version=__version__, lifespan=lifespan, docs_url="/api/docs", redoc_url=None)
     app.state.services = {"settings": settings, "db": db, "domain": domain, "storage": storage, "importer": importer, "recognizer": recognizer, "reporter": reporter, "jobs": jobs, "connectors": connectors, "archive_tree": archive_tree, "platform": platform, "workflow": workflow, "reviews": reviews}
     app.state.services['followup'] = followup
+    app.state.services['background'] = db.runtime
     app.state.services['platform_account'] = platform.account
     app.state.services['project_accounts'] = platform.project_accounts
     app.include_router(project_account_routes(platform.project_accounts))
@@ -290,6 +293,11 @@ def create_app(settings: Settings | None = None):
     def health():
         db.one("SELECT 1 AS ok")
         return {"status": "ok", "application": "IDI", "version": __version__, "time": now()}
+
+    @app.get('/api/diagnostics/background')
+    def background_diagnostics():
+        require_admin()
+        return db.runtime.diagnostics()
 
     @app.get("/api/system")
     def system():
